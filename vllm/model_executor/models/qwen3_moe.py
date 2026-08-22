@@ -467,6 +467,15 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             lambda prefix: decoder_layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        if vllm_config.parallel_config.predictive_expert_replication_config.enabled:
+            sparse_moes = [
+                layer.mlp
+                for layer in self.layers
+                if isinstance(layer, Qwen3MoeDecoderLayer)
+                and isinstance(layer.mlp, Qwen3MoeSparseMoeBlock)
+            ]
+            for source, target in zip(sparse_moes, sparse_moes[1:]):
+                source.experts.set_predictive_target(target.experts)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size

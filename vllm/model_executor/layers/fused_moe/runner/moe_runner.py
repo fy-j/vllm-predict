@@ -15,6 +15,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.distributed.eplb.predictive import PredictiveLoadSnapshot
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,
@@ -271,6 +272,8 @@ class MoERunner(MoERunnerInterface):
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
         self.enable_dbo = enable_dbo
+        self.predictive_load: PredictiveLoadSnapshot | None = None
+        self.predicted_load_snapshot: torch.Tensor | None = None
 
         # When both gates are present and FSE is enabled, fuse their
         # weight matrices into [num_experts + num_shared, hidden] so one
@@ -884,6 +887,10 @@ class MoERunner(MoERunnerInterface):
             else:
                 router_logits, _ = self.gate(hidden_states)
 
+        predicted_counts = None
+        if self.predictive_load is not None:
+            predicted_counts = self.predictive_load.predict(hidden_states)
+
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
@@ -892,6 +899,8 @@ class MoERunner(MoERunnerInterface):
                 hidden_states,
                 router_logits,
             )
+            if predicted_counts is not None:
+                self.predictive_load.start(predicted_counts)
 
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
@@ -900,10 +909,19 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
+            if self.predictive_load is not None:
+                self.predicted_load_snapshot = self.predictive_load.finish()
             return self._maybe_combine(
                 shared_output,
                 hidden_states,
             )
+
+    def set_predictive_target(self, target: "MoERunner") -> None:
+        """Bind the adjacent MoE's gate and logical router for prediction."""
+        assert target.gate is not None
+        self.predictive_load = PredictiveLoadSnapshot(
+            target.gate, target.router, target.moe_config.num_experts
+        )
 
     #########################################################
     #

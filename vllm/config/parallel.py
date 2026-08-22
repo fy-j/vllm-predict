@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import os
+from pathlib import Path
 import socket
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, overload
@@ -116,6 +118,50 @@ class EPLBConfig:
 
 
 @config
+class PredictiveExpertReplicationConfig:
+    """Configuration for predictive expert replication."""
+
+    enabled: bool = False
+    cost_profile_path: str | None = None
+    replica_slots_per_rank: int = Field(default=1, ge=1)
+    hot_stable_steps: int = Field(default=2, ge=1)
+    min_residency_steps: int = Field(default=4, ge=1)
+    hot_load_ratio: float = Field(default=1.0, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_predictive_config(self) -> Self:
+        if not self.enabled:
+            return self
+        if self.replica_slots_per_rank != 1:
+            raise ValueError(
+                "Predictive expert replication supports one slot per rank."
+            )
+        if self.hot_stable_steps != 2:
+            raise ValueError(
+                "Predictive expert replication requires hot_stable_steps=2."
+            )
+        if self.min_residency_steps != 4:
+            raise ValueError(
+                "Predictive expert replication requires min_residency_steps=4."
+            )
+        if not self.cost_profile_path:
+            raise ValueError(
+                "Predictive expert replication requires cost_profile_path."
+            )
+        try:
+            profile = json.loads(Path(self.cost_profile_path).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "Predictive expert replication cost profile must be readable JSON."
+            ) from exc
+        if not isinstance(profile, dict):
+            raise ValueError(
+                "Predictive expert replication cost profile must be a JSON object."
+            )
+        return self
+
+
+@config
 class ParallelConfig:
     """Configuration for the distributed execution."""
 
@@ -175,6 +221,10 @@ class ParallelConfig:
     """Enable expert parallelism load balancing for MoE layers."""
     eplb_config: EPLBConfig = Field(default_factory=EPLBConfig)
     """Expert parallelism configuration."""
+    predictive_expert_replication_config: PredictiveExpertReplicationConfig = Field(
+        default_factory=PredictiveExpertReplicationConfig
+    )
+    """Predictive expert replication configuration derived from additional_config."""
     expert_placement_strategy: ExpertPlacementStrategy = "linear"
     """The expert placement strategy for MoE layers:
 

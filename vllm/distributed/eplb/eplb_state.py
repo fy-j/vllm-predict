@@ -493,6 +493,42 @@ class EplbState:
         )
         self.model_states[model_config.compute_hash()] = model_state
 
+    def normalize_predictive_layout(self, model_config: ModelConfig) -> float:
+        """Synchronously install canonical rows and one inactive row per rank."""
+        model_state = self.model_states[model_config.compute_hash()]
+        model = model_state.model
+        ep_group = get_ep_group().device_group
+        num_local_experts = model.num_local_physical_experts
+        canonical_per_rank = model.num_logical_experts // ep_group.size()
+        assert model.num_logical_experts % ep_group.size() == 0
+        assert num_local_experts == canonical_per_rank + 1
+
+        layout = torch.full_like(model_state.physical_to_logical_map, -1)
+        for rank in range(ep_group.size()):
+            start = rank * num_local_experts
+            layout[:, start : start + canonical_per_rank] = torch.arange(
+                rank * canonical_per_rank,
+                (rank + 1) * canonical_per_rank,
+                device=self.device,
+                dtype=layout.dtype,
+            )
+
+        start_time = time.perf_counter()
+        rearrange_expert_weights_inplace(
+            model_state.physical_to_logical_map,
+            layout,
+            model.expert_weights,
+            model_state.expert_buffer,
+            ep_group,
+            model_state.communicator,
+        )
+        local_slot = canonical_per_rank
+        for layer_weights in model.expert_weights:
+            for weight in layer_weights:
+                weight[local_slot].zero_()
+        self.update_mapping(model_config, layout)
+        return (time.perf_counter() - start_time) * 1000
+
     def prepare_forward(
         self,
         model_config: ModelConfig,

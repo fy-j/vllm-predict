@@ -43,7 +43,7 @@ from .mamba import MambaBackendEnum, MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
 from .offload import OffloadConfig
-from .parallel import ParallelConfig
+from .parallel import ParallelConfig, PredictiveExpertReplicationConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
@@ -453,6 +453,63 @@ class VllmConfig:
     up to this amount of time to allow already-running requests to complete. Any
     remaining requests are aborted once the timeout is reached.
     """
+
+    @model_validator(mode="after")
+    def configure_predictive_expert_replication(self) -> "VllmConfig":
+        if not isinstance(self.additional_config, dict):
+            return self
+        raw_config = self.additional_config.get("predictive_expert_replication")
+        if raw_config is None:
+            return self
+        if not isinstance(raw_config, dict):
+            raise ValueError("predictive_expert_replication must be a JSON object.")
+
+        predictive_config = PredictiveExpertReplicationConfig(**raw_config)
+        self.parallel_config.predictive_expert_replication_config = predictive_config
+        if not predictive_config.enabled:
+            return self
+        if self.parallel_config.enable_eplb:
+            raise ValueError(
+                "Native EPLB and Predictive expert replication are mutually exclusive."
+            )
+        if self.parallel_config.eplb_config.num_redundant_experts:
+            raise ValueError(
+                "Predictive expert replication manages redundant expert slots."
+            )
+
+        ep_size = (
+            self.parallel_config.tensor_parallel_size
+            * self.parallel_config.prefill_context_parallel_size
+            * self.parallel_config.data_parallel_size
+        )
+        if (
+            self.parallel_config.tensor_parallel_size != 1
+            or self.parallel_config.prefill_context_parallel_size != 1
+            or self.parallel_config.data_parallel_size != 8
+            or not self.parallel_config.enable_expert_parallel
+            or self.parallel_config.enable_dbo
+            or self.parallel_config.all2all_backend != "allgather_reducescatter"
+        ):
+            raise ValueError(
+                "Predictive expert replication requires TP=1, PCP=1, DP=8, "
+                "expert parallelism, DBO disabled, and allgather_reducescatter."
+            )
+        if self.model_config is not None:
+            if (
+                "Qwen3MoeForCausalLM" not in self.model_config.architectures
+                or self.model_config.dtype != torch.bfloat16
+                or self.model_config.get_num_experts() != 128
+                or not self.model_config.enforce_eager
+            ):
+                raise ValueError(
+                    "Predictive expert replication supports Qwen3-30B-A3B BF16 only."
+                )
+
+        self.parallel_config.enable_eplb = True
+        self.parallel_config.eplb_config.num_redundant_experts = ep_size
+        self.parallel_config.eplb_config.use_async = False
+        self.parallel_config.eplb_config.communicator = "pynccl"
+        return self
 
     def compute_hash(self) -> str:
         """
