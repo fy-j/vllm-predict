@@ -98,32 +98,48 @@ def _time_p2p_us(src: int, dst: int, nbytes: int, iters: int = 50) -> float:
         torch.accelerator.empty_cache()
 
 
-# PCIe Gen5 x16 tops out near 63 GB/s per direction; anything above this means
-# the measurement did not actually wait for the transfer.
+# The guard exists because `torch.accelerator.synchronize()` waits only on the current
+# device, so timing a copy between two *other* devices measures launch overhead and
+# reads as impossible bandwidth. The ceiling must follow the fabric actually installed,
+# not a constant: pinned at PCIe's 70 it rejects every correct NVLink measurement, and
+# raised to NVLink's on a PCIe node it stops catching the bug it was written for.
 PCIE_GEN5_X16_CEILING_GB_PER_S = 70.0
+# NVLink 4 on H100 SXM is 18 links x 25 GB/s = 450 GB/s per direction, and NVSwitch
+# lets one pair use all of them. Above 500 the measurement is not waiting.
+NVLINK4_CEILING_GB_PER_S = 500.0
 
 
-def probe_expert_transfer(shape: ModelShape, pairs: list[tuple[int, int]]) -> dict:
+def probe_expert_transfer(
+    shape: ModelShape, pairs: list[tuple[int, int]], has_nvlink: bool = False
+) -> dict:
     """Point-to-point cost of moving one expert, idle.
 
     This is the *optimistic* figure. The usable bandwidth the cost profile needs
     is lower, because token dispatch and combine share the same fabric; see
     `probe_interconnect_under_load.py`.
+
+    Args:
+        shape: The model shape, for one expert's byte size.
+        pairs: Rank pairs to time.
+        has_nvlink: From `probe_interconnect`. Selects which plausibility ceiling
+            applies, since the two fabrics differ by more than 6x.
     """
     nbytes = shape.bytes_per_expert
+    ceiling = NVLINK4_CEILING_GB_PER_S if has_nvlink else PCIE_GEN5_X16_CEILING_GB_PER_S
+    fabric = "NVLink 4" if has_nvlink else "PCIe Gen5 x16"
     results = {}
     implausible = []
     for src, dst in pairs:
         us = _time_p2p_us(src, dst, nbytes)
         gb_per_s = nbytes / us / 1e3
         results[f"{src}->{dst}"] = {"us": round(us, 1), "gb_per_s": round(gb_per_s, 2)}
-        if gb_per_s > PCIE_GEN5_X16_CEILING_GB_PER_S:
+        if gb_per_s > ceiling:
             implausible.append(f"{src}->{dst} at {gb_per_s:.0f} GB/s")
     if implausible:
         raise RuntimeError(
-            f"Implausible P2P bandwidth, above the PCIe Gen5 x16 ceiling: "
-            f"{implausible}. The measurement is not waiting for the transfer; "
-            f"do not seed a cost profile from it."
+            f"Implausible P2P bandwidth, above the {fabric} ceiling of "
+            f"{ceiling:.0f} GB/s: {implausible}. The measurement is not waiting for "
+            f"the transfer; do not seed a cost profile from it."
         )
     idle = [r["us"] for r in results.values()]
     return {
@@ -288,11 +304,14 @@ def main() -> None:
     n = torch.accelerator.device_count()
     pairs = [(0, 1), (0, n // 2), (n - 2, n - 1), (0, n - 1)] if n > 1 else []
 
+    interconnect = probe_interconnect()
     result = {
         "model": shape.name,
         "ep_size": args.ep_size,
-        "interconnect": probe_interconnect(),
-        "expert_transfer": probe_expert_transfer(shape, pairs),
+        "interconnect": interconnect,
+        "expert_transfer": probe_expert_transfer(
+            shape, pairs, has_nvlink=interconnect["has_nvlink"]
+        ),
         "layer_budget": probe_layer_budget(
             shape, args.ep_size, [1, 8, 32, 64, 128, 256, 512]
         ),

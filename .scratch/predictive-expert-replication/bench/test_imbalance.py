@@ -395,3 +395,95 @@ class TestPlanningIsSeparableFromEvaluation:
         assert len(moves) == 1
         scored = imbalance.apply_moves([self._skewed()], moves)
         assert scored[0].moves == 1, "the move must be applied, not skipped"
+
+
+class TestAllocationOrderIsWhatTheOnlinePlannerSpends:
+    """The online planner cannot rank across layers, so it spends by layer index.
+
+    `PlacementCoordinator.plan_and_launch` plans one target layer at a time —
+    when layer L+1 plans for L+2, no later layer's prediction exists. The budget
+    is therefore first-come-first-served, and these tests pin what that costs so
+    it is not mistaken for a prediction-accuracy problem.
+    """
+
+    def _skewed_model(self, num_layers=43):
+        """Layers shaped like the measured ones, with the hottest placed last.
+
+        Two properties of real data matter here and a naive synthetic has neither.
+
+        **Within a layer the peak rank's load is concentrated in one expert** —
+        measured at 33.6% for the hottest against 6.2% for an even split. That is
+        what makes a layer's *second* placement worth much less than its first, and
+        therefore what gives global ranking a reason to spend elsewhere. With load
+        split evenly between two experts instead, both placements gain the same
+        amount, global ranking also fills 2 per layer, and the control measures
+        nothing — which is how this test first failed.
+
+        **Per-layer excess varies several-fold across the model.** Here the peak
+        rank climbs while the others stay flat, and the hottest layers are the last
+        ones, so layer-order allocation cannot reach them.
+        """
+        layers = []
+        for i in range(num_layers):
+            peak = 20.0 + i  # later layers are hotter
+            layers.append(
+                imbalance.Layer(
+                    rank_load=[peak, 10.0, 10.0, 10.0],
+                    expert_load=[
+                        [0.55 * peak, 0.20 * peak, 0.15 * peak, 0.10 * peak],
+                        [2.5, 2.5, 2.5, 2.5],
+                        [2.5, 2.5, 2.5, 2.5],
+                        [2.5, 2.5, 2.5, 2.5],
+                    ],
+                )
+            )
+        return layers
+
+    def test_layer_order_covers_budget_over_cap_layers_and_no_more(self):
+        layers = self._skewed_model()
+        moves = imbalance.plan_moves_in_layer_order(layers, budget=43, per_layer_cap=2)
+
+        covered = sorted({m[0] for m in moves})
+        assert len(moves) == 43, "the whole budget must be spent"
+        assert len(covered) == 22, (
+            f"43 placements at 2 per layer must cover ceil(43/2)=22 layers, got "
+            f"{len(covered)}. This is the measured 'coverage steady at 22 layers'."
+        )
+        assert covered == list(range(22)), (
+            "coverage must be the lowest-indexed layers, which is the defect: the "
+            "most skewed layers here are the last ones and never receive anything"
+        )
+
+    def test_global_ranking_reaches_more_layers_at_the_same_budget(self):
+        layers = self._skewed_model()
+        by_order = imbalance.plan_moves_in_layer_order(
+            layers, budget=43, per_layer_cap=2
+        )
+        global_ranked = imbalance.plan_moves(layers, budget=43, per_layer_cap=2)
+
+        order_cov = len({m[0] for m in by_order})
+        global_cov = len({m[0] for m in global_ranked})
+        assert global_cov > order_cov, (
+            f"global ranking must spread wider at equal budget: {global_cov} layers "
+            f"against {order_cov}. Anything else means this control is not measuring "
+            f"allocation order."
+        )
+        order_cp = imbalance.critical_path_imbalance(
+            imbalance.apply_moves(layers, by_order)
+        )
+        global_cp = imbalance.critical_path_imbalance(
+            imbalance.apply_moves(layers, global_ranked)
+        )
+        assert global_cp < order_cp, (
+            f"and it must convert into a lower critical path: {global_cp:.4f} against "
+            f"{order_cp:.4f}"
+        )
+
+    def test_a_cap_of_one_covers_every_layer_at_the_same_budget(self):
+        """The cheapest candidate fix, priced against the same budget."""
+        layers = self._skewed_model()
+        moves = imbalance.plan_moves_in_layer_order(layers, budget=43, per_layer_cap=1)
+
+        assert len({m[0] for m in moves}) == 43, (
+            "one per layer at budget 43 must reach all 43 reachable layers"
+        )

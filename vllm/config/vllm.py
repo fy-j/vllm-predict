@@ -518,6 +518,26 @@ class VllmConfig:
             raise ValueError(
                 "Predictive expert replication requires a CUDA or ROCm platform."
             )
+        predictive = parallel_config.predictive_expert_replication_config
+        if predictive.prediction_lookahead_layers == 1:
+            # The launch and the wait are adjacent statements at the head of the MoE
+            # forward, so at a lookahead of 1 the transfer is issued and immediately
+            # waited
+            # for: the overlap window is **zero**, not one Attention block, and the
+            # whole
+            # transfer is exposed plus a host synchronisation. The value that looks most
+            # attractive is currently the worst one, and nothing else rejects it. Lifted
+            # by
+            # ticket 07, which moves the launch to the predicting layer's MoE tail once
+            # the
+            # plan and the transfer are both device-side.
+            raise ValueError(
+                "Predictive expert replication does not yet support "
+                "prediction_lookahead_layers=1: the transfer is launched and awaited "
+                "at the same point in the forward, so the overlap window is zero and "
+                "the whole transfer is exposed. Use 2 until the launch point moves."
+            )
+
         unsupported = []
         if parallel_config.tensor_parallel_size != 1:
             unsupported.append(f"TP={parallel_config.tensor_parallel_size} (need 1)")

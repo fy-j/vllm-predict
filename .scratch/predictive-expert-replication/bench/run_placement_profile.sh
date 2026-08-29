@@ -25,6 +25,15 @@ MODEL="${MODEL:-/models/preset/Qwen/Qwen3-30B-A3B/v1.0}"
 PORT="${PORT:-8181}"
 CONC="${CONC:-8}"
 OUT_LEN="${OUT_LEN:-4}"
+# Separate from CONC: attribution needs many prefill windows, and tying the prompt
+# count to the concurrency gave one window per rank, where NCCL time is dominated by
+# arrival skew on an almost-idle server and MoE's share is understated.
+NUM_PROMPTS="${NUM_PROMPTS:-64}"
+# Source layers are `[skip_first, num_moe_layers - lookahead)`, so raising this shrinks
+# how many layers predict at all. It is the only way to vary prediction's per-layer cost
+# without writing a kernel: at 3 there are 43 source layers, at 35 there are 11. Used to
+# test whether the collectives' extra waiting scales with prediction's launch count.
+SKIP_FIRST="${SKIP_FIRST:-3}"
 BUDGETS="${BUDGETS:-0 43}"
 
 export PYTHONPATH="$REPO_ROOT"
@@ -47,7 +56,9 @@ p = json.load(open(src)); p["fingerprint"]["model"] = model
 json.dump(p, open(dst, "w"), indent=2)
 PY
 
-PROMPTS="$HERE/results/prompts-code-p1024.jsonl"
+DOMAIN="${DOMAIN:-ko}"
+PROMPTS="$HERE/results/prompts-$DOMAIN-p1024.jsonl"
+echo "[prof] domain=$DOMAIN"
 [[ -s "$PROMPTS" ]] || { echo "[prof] missing $PROMPTS" >&2; exit 1; }
 
 for budget in $BUDGETS; do
@@ -57,12 +68,27 @@ for budget in $BUDGETS; do
   LOG="$OUT_DIR/server-$tag.log"
   echo "[prof] budget=$budget: starting server"
 
-  ADDITIONAL=$(python3 -c "
+  # `budget=off` is a stock server with no predictive config at all. It exists so a
+  # profile of it can be diffed against the `budget=0` profile: `0` still predicts, so
+  # the difference between the two isolates what prediction's own 43 gate GEMMs, top-k
+  # selections and counting kernels cost, separately from the EPLB load recording and
+  # the 17-row layout that both non-`off` arms also carry.
+  FEATURE_ARGS=()
+  if [[ "$budget" == "off" ]]; then
+    echo "[prof] arm=off: stock server, feature fully disabled"
+  else
+    ADDITIONAL=$(python3 -c "
 import json,sys
-cfg={'enabled': True, 'cost_profile_path': sys.argv[1]}
+cfg={'enabled': True, 'cost_profile_path': sys.argv[1],
+     'prediction_skip_first_layers': int(sys.argv[3])}
 if int(sys.argv[2]) > 0:
     cfg['max_transfers_per_forward'] = int(sys.argv[2])
-print(json.dumps({'predictive_expert_replication': cfg}))" "$PROFILE" "$budget")
+print(json.dumps({'predictive_expert_replication': cfg}))" "$PROFILE" "$budget" "$SKIP_FIRST")
+    FEATURE_ARGS=(
+      --additional-config "$ADDITIONAL"
+      --eplb-config '{"log_balancedness":true,"log_balancedness_interval":1,"step_interval":1000000000,"window_size":1000,"use_async":false}'
+    )
+  fi
 
   PROFILER_CFG=$(python3 -c "
 import json,sys
@@ -70,16 +96,15 @@ print(json.dumps({'profiler':'torch','torch_profiler_dir':sys.argv[1],
  'torch_profiler_with_stack':False,'torch_profiler_record_shapes':False,
  'torch_profiler_with_flops':False,'ignore_frontend':True}))" "$TRACE_DIR")
 
-  VLLM_PREDICTIVE_PLACE_PER_FORWARD="$budget" \
+  VLLM_PREDICTIVE_PLACE_PER_FORWARD="${budget/off/0}" \
   python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" --port "$PORT" \
     --data-parallel-size 8 --enable-expert-parallel \
     --all2all-backend allgather_reducescatter --enforce-eager \
     --max-model-len 3072 --gpu-memory-utilization 0.88 \
     --max-num-seqs 64 --seed 0 --uvicorn-log-level warning \
-    --additional-config "$ADDITIONAL" \
     --profiler-config "$PROFILER_CFG" \
-    --eplb-config '{"log_balancedness":true,"log_balancedness_interval":1,"step_interval":1000000000,"window_size":1000,"use_async":false}' \
+    "${FEATURE_ARGS[@]}" \
     >"$LOG" 2>&1 &
   PID=$!
 
@@ -110,7 +135,7 @@ print(json.dumps({'profiler':'torch','torch_profiler_dir':sys.argv[1],
     --model "$MODEL" --port "$PORT" \
     --dataset-name custom --dataset-path "$PROMPTS" \
     --custom-output-len "$OUT_LEN" --ignore-eos \
-    --num-prompts "$CONC" --max-concurrency "$CONC" \
+    --num-prompts "$NUM_PROMPTS" --max-concurrency "$CONC" \
     --percentile-metrics ttft --metric-percentiles 99 \
     >"$OUT_DIR/bench-$tag.log" 2>&1 || echo "[prof] $tag bench failed" >&2
   curl -sf -X POST "http://127.0.0.1:$PORT/stop_profile" >/dev/null \

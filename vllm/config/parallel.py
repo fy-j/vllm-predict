@@ -203,12 +203,24 @@ class PredictiveExpertReplicationConfig:
     This, not a per-forward count, is the binding interconnect constraint: two
     approved transfers can otherwise overlap the same layer's token dispatch.
     """
-    max_replicas_per_layer: int = Field(default=2, ge=1)
+    max_replicas_per_layer: int = Field(default=1, ge=1)
     """Distinct logical experts a layer may replicate, each to its own target rank.
 
     Replicating one expert onto several ranks cannot help beyond that expert's own
-    share of the peak rank, so the policy places several *different* experts
-    instead. Measured concentration puts the median need at two.
+    share of the peak rank, so when a layer does place more than one, the policy
+    places several *different* experts instead.
+
+    **Default 1, lowered from 2 on measurement.** This is not the per-layer allowance
+    the name suggests: the online planner sees one layer at a time — when layer `L+1`
+    plans for `L+2`, no later layer's prediction exists — so layers are visited in
+    index order and each fills to this cap until the forward's transfer budget is
+    gone. At 2 with a budget of 43 that covers `43/2 = 22` layers and always the
+    lowest-indexed 22, leaving the rest of the model untouched on every forward.
+    Coverage is what drives benefit, because a layer's second replica chases a much
+    smaller expert than its first: offline at equal budget, 1 removes 48.0% of
+    critical-path excess against a global-ranking oracle's 48.3%, where 2 removes
+    23.5%. Raise it only together with `max_transfers_per_forward`, so that
+    `budget / cap` still covers the reachable layers.
     """
     max_transfers_per_forward: int = Field(default=4, ge=1)
     """Cap on expert transfers per forward, counted across all layers.
@@ -216,6 +228,10 @@ class PredictiveExpertReplicationConfig:
     Counts transfers, not layers: a layer placing `max_replicas_per_layer`
     replicas costs that many transfers, and the interconnect budget binds on
     transfers.
+
+    In practice it counts *planned placements*, before `reconcile` drops the ones
+    already resident, so it bounds coverage rather than bytes. The byte bound is
+    `max_concurrent_transfer_bytes`, which is not implemented.
     """
     static_replica_placement: str | None = None
     """Install a fixed replica at startup, as `"<logical expert>:<target rank>"`.

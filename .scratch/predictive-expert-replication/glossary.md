@@ -63,11 +63,20 @@ _Avoid_: Native EPLB, predictive controller
 **Cross-layer gate**：用当前 MoE 的 hidden states 评估目标 MoE 的 routing gate，以预测目标 logical expert 选择的推理机制；它不是目标 MoE 实际执行时的 gate 结果。目标 MoE 不一定是相邻层，距离由 prediction lookahead 决定。
 _Avoid_: next-layer execution, cached router logits, next-layer gate
 
+**Host-planned placement**：plan 在 host 上计算的安排。snapshot 必须先 D2H 落地、host 再读它,所以"snapshot 就绪"和"plan 可用"之间**必须隔一个 layer 边界**去吸收这次拷贝——这一层就是 lookahead 被迫大于 1 的原因。当前实现是这一种,lookahead=2,窗口是中间那层的 MoE 加目标层的 Attention。
+
+**Device-planned placement**：plan 在 device 上计算(确定性 argmax),传输用单边 put,host 全程不读 plan。不需要那个 layer 边界,于是预测、规划、发起可以都在第 `L` 层内完成,窗口就是第 `L+1` 层的 Attention。它需要 NVLink 与 NVSHMEM(已在本节点验证通过,9 MiB put 33 us)。
+
+**lookahead 不是一个独立旋钮,而是上面这个选择的后果。** 把 `prediction_lookahead_layers` 当作可自由调节的参数是本项目的一处概念错误:在 host-planned 安排下 lookahead=1 的**窗口是 0**(发起与等待是 MoE forward 开头相邻的两行),而配置校验目前接受它。lookahead=1 只有在 device-planned 安排下才有意义。
+_Avoid_: 把 lookahead 与 overlap window 当作同一个量(见 Overlap window)
+
 **Prediction lookahead**：预测层与被预测层之间相隔的 sparse MoE 层数。lookahead 越小预测越准，但可用于隐藏 expert 权重传输的 overlap window 越短；它是可配置的，因为这个取舍取决于实际互联带宽。
 _Avoid_: adjacent layer, prediction depth
 
-**Overlap window**：从 expert 权重传输发起到目标层 MoE 必须读到该权重之间的可用时间，等于中间各层的执行时间。"传输被 overlap"同时要求两件事：传输与计算在时间上并行，**且**传输没有使这段时间内的互联成为新瓶颈。
-_Avoid_: attention window（除非特指单层 Attention 这一项成本）
+**Overlap window**：从 expert 权重传输发起到目标层 MoE 必须读到该权重之间的可用时间。"传输被 overlap"同时要求两件事：传输与计算在时间上并行，**且**传输没有使这段时间内的互联成为新瓶颈。
+
+它**不等于** `lookahead` 乘以一层的时间——它由发起点和等待点这两个 hook 的位置决定，而 lookahead 只决定预测跨越几层。当前实现两个 hook 都在 MoE module forward 的开头，所以 lookahead=2 的窗口是"中间那层的整个 MoE + 目标层的 Attention"，而 lookahead=1 的窗口是 **0**。把这两个量当作同一个东西是本项目的一处已记录偏差（`CURRENT-STATUS.md` 2026-08-29 code audit 第 1 条）。
+_Avoid_: attention window（除非特指单层 Attention 这一项成本）；prediction lookahead（它是层距，不是时间窗口）
 
 **Exposed transfer**：expert 权重传输超出 overlap window、必须由目标层等待的那部分时间。它是 replica 的真实一次性成本，也是推导最小驻留步数的分子。
 _Avoid_: transfer latency, hidden transfer
@@ -95,6 +104,15 @@ _Avoid_: routing plan
 
 **Hot logical expert**：被 policy 判定为"值得创建 replica"的 logical expert。唯一权威判据是 policy 的正收益检验（预测收益扣除摊销后的传输成本仍为正）；`hot_load_ratio` 只是避免逐层评估全部专家的**候选预筛选**，不构成独立判据。生命周期中的"连续两次 hot 观测"意为 policy 会再次选中同一个 `(logical expert, target rank)` 放置。
 _Avoid_: high-load expert（作为独立阈值概念）, hot threshold
+
+**Block-quantization bar**：`M x topk / num_logical_experts > BLOCK_SIZE_M` 这条线。低于它，MoE kernel 把每个被碰到的专家都补齐到同样的 block 数，于是不均衡**本来就不花时间**，任何放置都不可能有收益。它是 decode 被判负的唯一原因，也是 `min_tokens_per_expert` 与 planner 的 `min_tokens` 共用的那个常数（当前硬编码 `_MOE_BLOCK_SIZE_M = 128`）。
+_Avoid_: gate（本项目 gate 专指 MoE 路由 gate）, threshold（不加限定时不知道指哪条线）
+
+**Placement suppression**：某个 forward 低于 block-quantization bar 时，跳过规划、传输与发布，把各层的 map 原样留给下一个够大的 forward。它**不是**预测结果，也不是"预测失败"——预测在同一根线上就已经被跳过了。代码里叫 `_gated`，与上面的 _Avoid_ 冲突，且当前实现不可达（`CURRENT-STATUS.md` 2026-08-29 code audit 第 3 条）。
+_Avoid_: gate, gating, prediction failure
+
+**Transfer budget**：`max_transfers_per_forward`，**一次 forward** 内允许的放置总数，跨全部层共享。一个单位 = 一层里的一个 logical expert 复制到一个 target rank = 最多一次 9.00 MiB 传输。它按**放置数**计（`_spent += len(plan)`，在 `reconcile` 之前），所以已经常驻、不需要重传的放置也占额度——名字说的是传输，管的是覆盖度。逐层上限是另一个量：`max_replicas_per_layer`。
+_Avoid_: max_transfers_per_forward 的字面含义（"传输数"）, per-layer budget, per-request budget
 
 **Cost profile**：通过离线 microbenchmark 获得的静态成本数据，用于把预测负载收益、expert weight transfer 时间和 Attention overlap window 统一换算为时间；没有 cost profile 时不创建新 replica。一次性 transfer cost 按 replica 的 guaranteed minimum residency 摊销。
 _Avoid_: online calibration, runtime load history

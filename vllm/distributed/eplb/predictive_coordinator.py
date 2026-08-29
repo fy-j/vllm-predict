@@ -67,12 +67,16 @@ class _TransferEvent(Protocol):
     """The slice of `torch.cuda.Event` this path uses.
 
     Declared so a test can substitute a recorder without a CUDA context, and so the
-    two calls that matter — record and the *unconditional* wait — are named.
+    three calls that matter are named. `synchronize` blocks the host and is used only
+    where the host must read the data; `wait` orders a stream and is used everywhere
+    else. Neither is ever conditional — see the collective-safety rule.
     """
 
     def record(self, stream: torch.cuda.Stream | None = ...) -> None: ...
 
     def synchronize(self) -> None: ...
+
+    def wait(self, stream: torch.cuda.Stream | None = ...) -> None: ...
 
 
 class PlacementCoordinator:
@@ -117,7 +121,7 @@ class PlacementCoordinator:
         self._last_target = -1
         self.max_per_layer = max_per_layer
         self.min_tokens_per_expert = min_tokens_per_expert
-        self._gated = False
+        self._suppressed = False
         self._active: dict[int, set[tuple[int, int, int]]] = {}
         self.stream = stream
         self._publish = publish
@@ -141,6 +145,32 @@ class PlacementCoordinator:
                 size, dtype=torch.int64, pin_memory=torch.cuda.is_available()
             )
         return self._host_buffer[:size]
+
+    def note_forward_token_load(self, tokens_per_expert: float) -> None:
+        """Open a forward and decide whether it may change placement at all.
+
+        Call once per forward, before its first `plan_and_launch`, with a token count
+        **every rank agrees on** — `num_tokens_across_dp_cpu` is the result of the DP
+        coordination all-reduce and is already on the host, so this costs nothing and
+        cannot diverge by rank.
+
+        This exists because suppression cannot be decided from the snapshot alone. On a
+        decode forward the runner skips prediction on this same bar, so nothing is ever
+        recorded, so `plan_and_launch` returns at its `_recorded is None` guard *before*
+        reaching the snapshot check — and suppression stayed at whatever the last
+        prefill forward left it. `activate_and_publish` then published an empty set on
+        every layer, which is the revert path, on every decode and every
+        `execute_dummy_batch`. That silently undid `reconcile`'s "transfer only the
+        difference": with `_active` emptied between them, consecutive prefill forwards
+        re-sent the whole set.
+
+        Args:
+            tokens_per_expert: This forward's tokens per logical expert, after the
+                allgather. Below `min_tokens_per_expert` the MoE kernel pads every
+                expert to the same block count, so no placement can save time.
+        """
+        self._spent = 0
+        self._suppressed = tokens_per_expert <= self.min_tokens_per_expert
 
     def record_prediction(self, source_layer: int, predicted: torch.Tensor) -> None:
         """Start copying a source layer's predicted load to the host. No planning.
@@ -202,7 +232,7 @@ class PlacementCoordinator:
         # target that does not advance means a new forward has begun.
         if target <= self._last_target:
             self._spent = 0
-            self._gated = False
+            self._suppressed = False
         self._last_target = target
         # Below one block per expert the MoE kernel pads every expert to the same
         # number of blocks, so the imbalance costs nothing and balancing it saves
@@ -216,20 +246,28 @@ class PlacementCoordinator:
         # branch has already hit twice.
         tokens_per_expert = float(host.sum()) / host.numel()
         if tokens_per_expert <= self.min_tokens_per_expert:
-            self._gated = True
+            self._suppressed = True
             return []
         remaining = self.budget - self._spent
         if remaining <= 0:
             return []
-        # Capped per layer, not just per forward. Each layer plans on its own, so
-        # handing it the whole remaining budget let the earliest layers spend it all:
-        # a measured run covered 6-7 layers at ~5 replicas each and removed 5.0% of
-        # prefill excess, where the same budget spread over ~31 layers removes 35.0%
-        # offline. The critical path is the sum of every layer's peak, so a layer is
-        # worth at most 1/num_layers of it, and within one layer the second and later
-        # replicas chase progressively smaller experts. Breadth beats depth, and
-        # `max_replicas_per_layer` is what buys it — offline, a cap of 2 keeps 34.9%
-        # of the 35.0% while reaching 31.8 layers instead of 6.
+        # One layer's row, because that is all that exists yet: when this layer plans
+        # for `target`, no later layer's prediction has been computed. So the
+        # cross-layer ranking `plan_replicas` implements never has a second candidate
+        # here, and the
+        # forward's budget is spent **first-come-first-served by layer index**. That
+        # makes `max_per_layer` the allocation target rather than a safety cap, and it
+        # decides coverage: at cap `k` a budget of `b` reaches `b/k` layers, always the
+        # lowest-indexed ones.
+        #
+        # Coverage is what drives benefit, because a layer's second replica chases a
+        # much smaller expert than its first. Handing each layer the whole remaining
+        # budget covered 6-7 layers at ~5 replicas each and removed 5.0% of prefill
+        # excess; a cap of 2 covers 22 and removes 16.9%. Offline at equal budget, a cap
+        # of 1 covers all 43 reachable layers and removes 48.0% against a global-ranking
+        # oracle's 48.3% — which is why the default is 1. See `bench/RESULTS.md`,
+        # 2026-08-29, and `imbalance.plan_moves_in_layer_order`, which is this
+        # allocation reproduced offline so the oracle has a fair control.
         plan = plan_replicas(
             host.unsqueeze(0),
             self.ep_size,
@@ -279,7 +317,17 @@ class PlacementCoordinator:
             self.communicator.set_stream(None)
         self.last_event = event
         self._pending[target] = (plan, event)
-        self._spent += len(plan)
+        # Charged for what actually moved, not for what was planned. Counting the whole
+        # plan
+        # made a knob named for transfers bound *coverage* instead: a replica already
+        # resident
+        # needs no transfer, because its row still holds that expert's weights and
+        # nothing
+        # else writes a replica row, so in a steady state the honest charge is zero.
+        # Bytes in
+        # flight are bounded separately, which is what `max_concurrent_transfer_bytes`
+        # is for.
+        self._spent += len(to_transfer)
         return plan
 
     def activate_and_publish(self, layer: int) -> list[Placement]:
@@ -296,8 +344,8 @@ class PlacementCoordinator:
         Returns:
             The placements activated, for the caller's own accounting.
         """
-        if self._gated:
-            # Leave this layer exactly as the last prefill forward left it.
+        if self._suppressed:
+            # Leave this layer exactly as the last unsuppressed forward left it.
             return []
         placements = self.activate(layer)
         self.publish(layer, placements)
@@ -327,14 +375,30 @@ class PlacementCoordinator:
         return None if entry is None else entry[0]
 
     def activate(self, layer: int) -> list[Placement]:
-        """Wait for `layer`'s transfer and hand back what it should activate.
+        """Order `layer`'s transfer ahead of its use and hand back what to activate.
 
         The wait is unconditional. Whether a transfer has landed is per-rank timing, and
         two ranks disagreeing would leave them routing against different maps.
+
+        It is a *stream* wait, not a host one. Everything that consumes the weights —
+        the map writes here, then this layer's MoE kernel — is enqueued on the current
+        stream afterwards, so stream ordering is the whole requirement and blocking the
+        host bought nothing.
         """
         entry = self._pending.pop(layer, None)
         if entry is None:
             return []
         placements, event = entry
-        event.synchronize()
+        # `wait()` with no argument orders the *current* stream behind the event.
+        # `synchronize()` would block the host instead, which this site never needed:
+        # everything that consumes the weights — the map writes below, then this
+        # layer's MoE kernel — is enqueued on the current stream afterwards, so stream
+        # ordering is the whole requirement. Blocking the CPU only threw away its
+        # run-ahead, and a placed run made 126 `cudaEventSynchronize` calls with GPU
+        # occupancy falling 86.8% -> 52.9%. About half of those were here.
+        #
+        # The host copy in `plan_and_launch` is not this and must stay a real
+        # `synchronize()`: the planner reads that buffer on the host. Only a
+        # device-side plan removes that one, which is the rest of ticket 13.
+        event.wait()
         return placements

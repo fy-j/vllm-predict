@@ -1193,3 +1193,853 @@ Eight full prefill steps out of 263. The comparison is consistent across all thr
 and cross-validates an independent offline figure, but eight forwards is thin. A run
 sized from the prefill-forward count — about 800 requests, or a decode length of 1 — is
 what the payoff figure needs before it sizes anything.
+
+---
+
+# 2026-08-29 — 8x H100 80GB SXM, NVSwitch. First measurements on the new node.
+
+Hardware, established rather than assumed (`HANDOFF-2026-08-29-H100.md` step 0):
+
+    Product Name : NVIDIA H100 80GB HBM3   -> SXM, not a PCIe card
+    nvidia-smi topo -m : NV18 between all 8 pairs -> full NVSwitch fabric
+    nvidia-nvshmem-cu13 3.4.5 present; deep_ep 2.0.0+local importable
+
+**Build.** `uv venv --python 3.12` then `VLLM_USE_PRECOMPILED=1 uv pip install -e .
+--torch-backend=auto` succeeded first try on torch 2.13.0+cu130. `.venv/bin/python -c
+"import vllm"` resolves to `/mnt/yhong/vllm-predict/vllm/__init__.py`, version
+`0.1.dev20306+gfed29c4f8`, and `vllm/distributed/eplb/predictive.py` imports. This is a
+genuine build of this tree, unlike the 5090 node's symlinked kernels, so ticket 05's
+precondition is met here.
+
+Installing `nvshmem4py-cu13` upgraded `cuda-python` 12.9.7 -> 13.3.1 in the venv.
+`import vllm` still works after it; noted because it is the kind of change that breaks a
+build silently.
+
+## `probe_hardware.py`
+
+One harness fix was needed first, and it is the kind that would have produced a wrong
+number rather than an error. The plausibility guard on P2P bandwidth was a **constant**
+pinned to PCIe Gen5's 70 GB/s, so it rejected every correct NVLink measurement as
+"implausible". It now selects the ceiling from `probe_interconnect()`'s `has_nvlink`
+(NVLink 4: 18 links x 25 GB/s = 450 GB/s per direction, guard at 500). The guard itself
+was not removed — it exists because `torch.accelerator.synchronize()` waits only on the
+current device, and timing a copy between two *other* devices measures launch overhead.
+
+| | 5090 / PCIe Gen5 x16 | H100 SXM / NV18 |
+| --- | --- | --- |
+| one 9.00 MiB expert, idle P2P | 176-177 us at 53.5 GB/s | **39.9-41.0 us at 230-237 GB/s** |
+| uniform across rank pairs | yes | yes (39.9 to 41.0) |
+| one layer's Attention projections | 23-31 us at <=128 tok/rank, 98 us at 512 | **20.5-23.2 us at <=128, 37.5 us at 512** |
+| one layer's MoE (bmm proxy) | 102 us at 32 tok/rank | 69.3 us at 32, 107.4 at 512 |
+| MoE over expert-weight read floor | 1.02 at 8 tok/rank, 1.87 at 128 | 1.02 at 8, 1.17 at 128, **1.65 at 512** |
+| KV per rank | ~150-170k tokens (32 GB card) | **643,873 tokens** (79.1 GiB card, 59.0 GiB KV) |
+
+**Transfer got 4.4x cheaper; the Attention window did not shrink proportionally.** At
+512 tokens per rank one layer's Attention projections alone are 37.5 us against a 40.6 us
+transfer — 92% of an expert now fits inside a **single** Attention block, where on PCIe a
+single block hid 18%. And these projection figures exclude the attention kernel itself,
+so the real window is wider. This is the measurement that makes the operator's intended
+pipeline shape (predict at layer `i`, transfer during layer `i+1`'s Attention) feasible
+at all; see `CURRENT-STATUS.md`'s 2026-08-29 code audit finding 1 for why the current
+hook positions still cannot express it.
+
+**The decode verdict is no longer settled by KV capacity.** Ticket 00 closed decode
+because clearing the MoE kernel's one-block-per-expert bar needs more than 2048
+concurrent decode tokens and the 5090 could serve about 464. Recomputing from the
+measured KV ceiling, at `M x topk / num_logical > BLOCK_SIZE_M`:
+
+| context | sequences per rank | total decode tokens | tokens per expert | clears 128? |
+| --- | --- | --- | --- | --- |
+| 1024 | 628 | 5024 | 314 | **yes, 2.45x** |
+| 2048 | 314 | 2512 | 157 | **yes, 1.23x** |
+| 3072 | 209 | 1672 | 104 | no |
+| 4096 | 157 | 1256 | 79 | no |
+
+So decode clears the bar at contexts up to roughly 2400 tokens and fails above it.
+Ticket 00's own estimate for 8x H100 was "about 1800, still under the threshold"; that
+was low by 2.8x at 1024 context. **This does not reopen decode by itself.** Three things
+gate it: `max_num_seqs` must be raised to reach 628 per rank; the real `BLOCK_SIZE_M`
+for `E=128,N=768` on H100 is unknown and the 128 in the table is the hardcoded
+`_MOE_BLOCK_SIZE_M` (audit finding 5), so the whole column moves if the tuned config
+picks 64; and clearing the bar removes the *reason* imbalance was free, it does not show
+that imbalance then converts into time. Treat this as "the constraint that closed decode
+is no longer binding at short contexts", not as a positive result.
+
+## `probe_nvshmem.py` — passes, 5 of 5
+
+Ticket 13's gate. It needed the three API corrections the ticket predicted ("expect to
+correct them on first contact"), all three now in the script:
+
+- **Python bindings are not on public PyPI.** `nvidia-nvshmem-cu13` ships only the C
+  library — `libnvshmem_host.so.3` and the UID bootstrap, no Python module. The bindings
+  are `uv pip install --extra-index-url https://pypi.nvidia.com nvshmem4py-cu13`
+  (installed 0.3.1, which pulled `nvidia-nvshmem-cu13` 3.7.2).
+- **Init is UID-bootstrapped, not implicit.** `nvshmem.core.init(device=Device(),
+  uid=..., rank=..., nranks=..., initializer_method="uid")`, with the UID broadcast over
+  the existing torch process group. MPI bootstrap is the other option and was not used:
+  vLLM is not launched under `mpirun` and `mpi4py` must be built against the same MPI.
+- **`Device` moved.** `cuda.core.Device` since cuda-python 13; nvshmem4py's own docs
+  still say `cuda.core.experimental`.
+- **Allocation is `nvshmem.core.tensor(shape, dtype)`**, not `empty`.
+- **There is no `put_on_stream`.** `nvshmem.core.put(dst, src, pe, stream=)` *is* the
+  stream-ordered entry point and raises `NotImplementedError` when `stream` is None.
+
+Results:
+
+    [PASS] NCCL up before NVSHMEM
+    [PASS] NVSHMEM importable — nvshmem.core
+    [PASS] symmetric heap after NCCL — 8 PEs
+    [PASS] stream-ordered put — nvshmem.core.put(..., stream=)
+    [PASS] wait_event orders the put — expected 8, got 8
+
+    9.00 MiB put: p50 33.0 us (285.9 GB/s), min 31.6, max 35.0
+
+Every one of the three things ticket 13 said would invalidate its design on their own is
+answered in its favour. In particular **a plain CUDA event is sufficient to order the
+consumer**, so the design needs no NVSHMEM fence and no flag polling — polling being the
+per-rank-timing divergence class that deadlocked this branch twice.
+
+**33.0 us, against 289 us on PCIe: 8.8x.** 43 puts per forward is 1.4 ms of fabric time
+here against 12.4 ms there. The probe's own threshold for "the planning delay can stay at
+one layer and the lookahead need not rise" is 50 us, and 33 clears it.
+
+Note what this does and does not buy. A put at 33 us is *not* faster than the NCCL P2P
+copy measured above at 40 us — the two are the same order. The entire value of the put is
+that **the host never reads the plan**, which is the 11.02 ms `cudaEventSynchronize` and
+the 86.8% -> 52.9% occupancy drop. This is worth stating because the obvious reading of
+"8.8x" is a bandwidth win, and it is not one.
+
+Two API facts found while correcting the probe, both of which simplify ticket 13 and are
+recorded in it: `nvshmem.core.register_external_tensor` exists, so the model's own
+`expert_weights` allocation can be registered with NVSHMEM and put into directly, which
+removes the symmetric staging buffer and its extra 9 MiB device-to-device copy from the
+design; and `cuda.core.VirtualMemoryResource` exists, which is the allocator ticket 12's
+VMM aliasing needs.
+
+## Step 1 — the number that sets the prefill ceiling
+
+`run_placement_profile.sh`, `DOMAIN=ko CONC=8 NUM_PROMPTS=64 OUT_LEN=4 BUDGETS=0`, one
+baseline arm with no placement. Attributed with `parse_profile.py --phase prefill`, so
+only `execute_context_*` windows carrying prefill tokens are counted — trap 2 of the
+handoff. Results in `results/h100/step1-prefill-64.json`.
+
+Two harness gaps had to be closed first, and both would have produced a wrong number
+rather than an error:
+
+- **`parse_profile.py` was decode-only.** It kept windows with no prefill token, which
+  is what the decode question needs and the opposite of what the ceiling needs. It now
+  takes `--phase {decode,prefill}` and refuses to mix them.
+- **The runner tied the prompt count to the concurrency.** `--num-prompts "$CONC"` gave
+  8 requests and **one prefill window per rank**. `NUM_PROMPTS` is now separate. The
+  handoff's own Step 1 command already passed `DOMAIN` and `NUM_PROMPTS`, neither of
+  which the script read; both are wired now.
+
+| rank | windows | attributed ms/step | expert GEMM | nccl | attention | other |
+| --- | --- | --- | --- | --- | --- | --- |
+| dp0 | 8 | 24.3 | 15.56% | 42.35% | 5.28% | 36.81% |
+| dp1 | 8 | 113.9 | 10.79% | 72.79% | 1.12% | 15.30% |
+| dp2 | 8 | 106.8 | 11.44% | 71.06% | 1.20% | 16.30% |
+| dp3 | 8 | 102.4 | 12.12% | 69.61% | 1.25% | 17.02% |
+| dp4 | 8 | 124.6 | 9.34% | 75.24% | 1.06% | 14.36% |
+| dp5 | 8 | 136.0 | 8.75% | 77.16% | 0.98% | 13.12% |
+| dp6 | 8 | 136.0 | 9.34% | 76.72% | 0.95% | 12.99% |
+| dp7 | 8 | 136.2 | 8.74% | 77.67% | 0.93% | 12.67% |
+
+**Mean expert GEMM share of attributed prefill GPU time: 10.76%.** The thin 8-request
+run gave 10.77% from a single window per rank, so the figure is not sample-limited.
+MoE 231.35 us per layer, nccl 1690.56 us per layer. Baseline mean TTFT 303.61 ms,
+median 236.68, p99 801.35 over 64 requests at concurrency 8.
+
+| | 5090 / PCIe | H100 SXM / NV18 |
+| --- | --- | --- |
+| collectives | 66.0% | **77.0%** |
+| expert GEMM | 3.67% | **10.76%** |
+| attention / norm | 4.9% | ~1.0% |
+| ceiling = expert GEMM x 47% perfect balance | 1.37%-1.73% | **~5.1%** |
+
+**The ceiling rose about 3x, to roughly 5% of a prefill step.** Against the handoff's
+own decision rule — "low single digits means stop; 15% means the ceiling is ~7% and
+there is something to win" — 10.76% lands between the two, at a ceiling near 5%.
+
+**Read the collective share carefully, because the obvious reading is wrong.** NCCL's
+share went *up* on the faster fabric, 66% to 77%. That is not a bandwidth statement: at
+concurrency 8 over DP=8 each rank holds about one request, so the ranks are unevenly
+loaded and most of that time is ranks waiting at a collective for the slowest one. dp0
+shows it directly — 24.3 ms of attributed work against dp7's 136.2 ms, 42% nccl against
+78%. This is the same conclusion as the 5090's, that the collectives are arrival skew
+and latency rather than bytes, and a faster fabric does not shrink skew.
+
+The consequence for the ceiling is that **10.76% is a floor, not a ceiling estimate**.
+An evenly loaded operating point would shrink the waiting and raise expert GEMM's share
+further. A concurrency sweep is what would pin it; this run does not.
+
+Also measured, and **not** to be read as the recoverable imbalance: MoE *time* per rank
+spread `max_over_mean` 1.144. That is the summed-across-layers view, which the glossary
+records as understating the per-layer critical path by about 3.7x on this workload. It
+is reported because the parser emits it, not because it sizes anything.
+
+## Allocation order priced offline (audit finding 2)
+
+`imbalance.plan_moves_in_layer_order` is new: it reproduces what the online planner
+does — one layer at a time, in increasing layer index, each taking
+`min(remaining, per_layer_cap)` — so the oracle `plan_moves` has a control differing
+*only* in which layer receives the next placement. Both use the same greedy and the
+same positive-benefit test.
+
+On a synthetic model shaped like the measured one (43 layers, peak-rank load
+concentrated 55/20/15/10 across its experts, hottest layers placed last), at budget 43:
+
+| allocation | layers covered | critical path | excess removed |
+| --- | --- | --- | --- |
+| baseline | — | 2.3099 | — |
+| layer order, cap 2 (**what runs today**) | 22 | 2.0023 | 23.5% |
+| layer order, cap 1 | 43 | 1.6768 | 48.0% |
+| global ranking, cap 2 (oracle) | 40 | 1.6734 | 48.3% |
+
+Two things follow. **`max_replicas_per_layer=1` captures 99.4% of the oracle's benefit
+at the same budget**, as a one-line configuration change, because coverage is what
+drives benefit and a layer's second placement chases a much smaller expert than its
+first. And the ratio today's allocation achieves against the oracle, 23.5/48.3 = 0.486,
+is close to the measured 16.9/34.9 = 0.484 — which is corroboration that allocation
+order is the 15%-versus-33% gap, not prediction accuracy.
+
+This is synthetic data, so the ratio agreement is suggestive rather than proof. The
+intra-layer concentration is what makes it behave like the real thing: a first attempt
+split each peak rank's load evenly between two experts, and then both placements gained
+the same amount, global ranking also filled 2 per layer, and the control measured
+nothing. That failure is recorded in the test's docstring so it is not repeated.
+
+## Ticket 14 — the third arm, and two harness defects it exposed
+
+`run_e2e_placement.sh` grew a `budget=off` arm: no predictive config at all, so no
+`enable_eplb`, no redundant experts, no replica slots. That is the denominator every
+TTFT number in this branch has been missing, because both existing arms pass
+`enabled = True` and differ only in the transfer budget. Default is now
+`BUDGETS="off 0 43"`.
+
+**First stock-server TTFT on this node**, `ko`, 400 requests, CONC=8, OUT_LEN=1:
+
+| arm | mean TTFT | median | p99 | vs `off` |
+| --- | --- | --- | --- | --- |
+| `off` — feature fully disabled | **184.70 ms** | 132.04 | 739.17 | — |
+| `0` — prediction on, placement withheld | **198.81 ms** | 177.39 | 676.16 | **+7.6%** |
+| `43` — placing | **242.79 ms** | 174.47 | 2820.04 | **+31.5%** |
+
+`max_replicas_per_layer=1` (lowered from 2 this session) did what the offline pricing
+said it would: **344 placement log lines = 43 layers x 8 ranks, one replica each**, so
+coverage went from 22 layers to all 43 reachable ones. `connected: true`, 400 requests
+completed, 0 failed.
+
+Imbalance recovered, arm `0` against arm `43`, per-layer critical path:
+
+| band | forwards | critical path | excess removed |
+| --- | --- | --- | --- |
+| full prefill | 15 / 13 | 1.8836 -> 1.6715 | **24.0%** |
+| partial prefill | 71 / 74 | 1.8851 -> 1.7061 | **20.2%** |
+| decode | 14 / 13 | 1.9688 -> 1.9500 | 1.9% (gated, correctly) |
+
+That is up from the 5090's 15-17%, as the coverage fix predicted, and is now about 69%
+of the offline oracle's ~35% rather than half of it.
+
+### The decisive arithmetic
+
+    expert GEMM share of an attributed prefill step        10.76%
+    recoverable excess as a share of MoE time              46.9%   (cp 1.8836)
+    -> perfect balance is worth                             5.05% of a prefill step
+    -> 24.0% of the excess, as measured, is worth           1.21% of a prefill step
+
+    measured cost: prediction alone                        +7.6% mean TTFT
+                   prediction + placement                 +31.5% mean TTFT
+
+**Prediction alone costs 1.51x the entire perfect-balance ceiling.** Before a single
+replica moves, the mechanism that creates the transfer window has already spent more
+than perfect expert balance could ever return. The full feature costs 6.2x the ceiling
+and 26x what it actually delivered.
+
+**This is a conclusion about the mechanism, not about the interconnect, and that is what
+makes it different from the 5090 result.** Ticket 13 removes the host synchronisation,
+which is most of the +22.1% that placement adds on top. It does **not** touch the +7.6%:
+that is 43 extra gate matmuls and 43 extra AllGathers per forward, one per source layer,
+and a device-side plan leaves every one of them in place. So the ceiling stays below the
+floor even with ticket 13 built, on the fastest interconnect NVIDIA currently ships. The
+finding transfers to the Ascend port, where the same 43 collectives would be paid.
+
+The one thing that could change it is making prediction itself much cheaper — a single
+batched cross-layer snapshot instead of 43 per-layer AllGathers, which
+`CURRENT-STATUS.md` lists as not designed. That would have to bring 7.6% under about 2%
+to leave room, and it does not address the gate matmuls.
+
+Two caveats, stated because they are the ones that could move the number and neither
+rescues it. `OUT_LEN=1` prices TTFT only, so TPOT reads 0.00 in every arm and the decode
+cost is not in these figures. And 10.76% is a floor on the expert GEMM share (the
+collectives are inflated by arrival skew at concurrency 8), so an evenly loaded operating
+point would raise the ceiling — but it would have to raise it about 1.6x just to reach
+prediction's own cost, and prediction's cost would rise with it, since more concurrency
+does not reduce the number of collectives.
+
+
+TPOT reads 0.00 in all arms because `OUT_LEN=1` produces no inter-token interval; this
+shape prices TTFT only.
+
+Two defects in the runner, both of which wasted a full arm's worth of GPU time and
+neither of which failed loudly:
+
+1. **`[[ "$budget" -eq 0 ]]` on a non-numeric arm.** With `budget=off`, the arithmetic
+   test treats `off` as a variable name and `set -u` aborts — *after* that arm had
+   served its entire 400-request benchmark. Now a string comparison.
+2. **`kill -TERM "$PID"` followed by a bare `wait`.** The DP=8 server did not die on
+   SIGTERM, so `wait` blocked forever: the `off` arm's server sat idle for 26 minutes
+   with its result already on disk, the remaining two arms never started, and nothing in
+   any log said why. The teardown now escalates — TERM, a bounded 60 s poll, then KILL —
+   because the orphan-reap loop that follows it never ran either. Reaping matters: the
+   engine cores reparent to init and hold 73 GiB per GPU until killed.
+
+Worth stating as a pattern, since this is now five harness defects in two sessions
+(these two, the PCIe-pinned bandwidth guard, the decode-only trace parser, and the
+prompt count tied to concurrency): **this harness fails by producing a wrong number or
+by silently doing nothing, not by erroring.** Check that an arm actually ran before
+reading its output, and that a run's exit code 0 means all its arms completed.
+
+## The prediction AllGather, measured on H100 — and the batching idea is dead
+
+I proposed batching the 43 per-layer AllGathers into one cross-layer snapshot as the only
+remaining escape. **Measured, it is not worth doing**, and the reasoning that motivated
+it was inherited from the 5090 and does not hold here.
+
+From the `budget=0` arm's trace (prediction on, placement off), prefill windows only,
+NCCL kernels grouped by stream — `dp0`, 8 windows:
+
+| kernel | stream | calls | total | p50 | max |
+| --- | --- | --- | --- | --- | --- |
+| `ncclDevKernel_AllGatherV_RING_LL` — token dispatch | 23 | 1152 | 53.74 ms | 58.0 us | 85.5 us |
+| `ncclDevKernel_Reduce_Sum_bf16_RING_LL` — combine | 23 | 384 | 25.24 ms | 72.9 us | 75.4 us |
+| **`ncclDevKernel_AllGather_RING_LL` — prediction snapshot** | **31** | **344** | **3.21 ms** | **9.3 us** | **9.8 us** |
+
+344 calls over 8 windows is exactly **43 per forward**, one per source layer, which
+identifies it beyond doubt.
+
+Three things follow:
+
+1. **It is on its own stream (31)**, distinct from the token collectives' stream 23 and
+   from the default compute stream. Confirmed empirically rather than from the spec's
+   intent. The EPLB group being a separate process group is what buys this.
+2. **It costs 0.40 ms per forward**, 9.3 us per layer. Its window is that layer's local
+   expert GEMM, measured at 231 us per layer, so the collective occupies **4% of the
+   window it is hidden in**. There is nothing left to hide; it is already overlapped
+   about as completely as a collective can be.
+3. **There is no arrival skew here.** p50 9.3 us against a max of 9.8 us — a 5% spread on
+   344 samples. The 5090 recorded 5 us to 11181 us on the same 4 KiB payload, p50 493 us,
+   and that two-thousand-fold spread is what made "43 barriers" look expensive. On this
+   node the ranks arrive together, because token dispatch has just synchronised them and
+   the snapshot is enqueued immediately after it.
+
+So collapsing 43 collectives into 1 would save at most 0.40 ms per forward against a
+measured cost of +7.6% TTFT and a ceiling of 5.05%. **That direction is closed.** It cost
+one trace read to find out, which is the right order to do it in.
+
+### Where the cost actually is, and one correction to the previous section
+
+Not the collective. A prefill window on this node holds about **1910 kernels**, and
+prediction contributes roughly 15 per source layer — a gate GEMM, the router's top-k, and
+about a dozen elementwise ops in `predict_local_counts` — so about **645 of those 1910
+launches, a third of the window**, exist only to predict. Each is also a Python-level
+dispatch on the host, 43 times per forward, in an eager engine.
+
+Occupancy in those windows, same trace: `dp0` 12.9%, `dp4` 106.2%, `dp7` 116.1% (over
+100% because kernels on separate streams overlap and the sum double-counts). `dp0` is the
+rank that finishes early and waits, which is the same arrival-skew picture the Step 1
+attribution showed.
+
+**Correction to the three-arm table above.** Arm `0` differs from arm `off` by more than
+prediction: it also enables EPLB *actual-load* recording every forward (the dump and the
+balancedness log at interval 1) and it carries the 17-row physical layout instead of 16.
+So **+7.6% is an upper bound on prediction's own cost, not a measurement of it.** The
+verdict is unchanged, since even the upper bound exceeds the 5.05% ceiling, but the
+attribution is not settled and the earlier wording "prediction alone" overstated what was
+measured.
+
+What would settle it: one profiled `off` arm, diffed against this trace on kernel count
+and GPU busy time per prefill window. That separates prediction's compute from the
+recording and the layout, and it is the measurement that decides whether a fused counting
+kernel — replacing those dozen elementwise ops with one — is worth writing.
+
+## The measurement that undermines the mechanism: expert load is static across forwards
+
+Asked because the redesign question is "can we get the transfer window without paying 43
+gate evaluations", and the answer turns on how fast expert load actually changes.
+
+Method: the `budget=0` dump (105 forwards, no placement, so every forward's load is
+unperturbed canonical). Take the prefill-sized forwards (>= 16384 assignments per layer,
+46 of them). Plan `budget=43, per_layer_cap=1` on the load of forward `N - lag` and score
+it on forward `N`'s load. Lag 0 is the oracle: it plans on the load it is scored against.
+
+| lag (forwards) | pairs | excess removed, mean | median | vs oracle |
+| --- | --- | --- | --- | --- |
+| 0 — oracle | 46 | 31.7% | 31.6% | 1.00 |
+| 1 | 45 | 31.2% | 31.1% | **0.98** |
+| 2 | 44 | 31.2% | 31.2% | 0.98 |
+| 4 | 42 | 31.2% | 31.2% | 0.99 |
+| 8 | 38 | 31.3% | 31.2% | 0.99 |
+| 16 | 30 | 31.3% | 31.3% | 0.99 |
+
+**A placement computed from load measured sixteen forwards ago is 99% as good as one
+computed from the load it will actually meet.** Per-layer expert load on this workload is
+not merely predictable, it is close to static.
+
+This is not circular: the `budget=0` arm places nothing, so both the planning load and the
+scoring load are unperturbed, and no placement's effect leaks into either.
+
+### What it implies for the design
+
+Cross-layer prediction exists for exactly one reason — routing maps logical to physical
+*before* dispatch, so a placement decided from a layer's own measured load has no window
+to transfer in. That reasoning is correct and it is not the only escape. **Actual load
+from the previous forward is a second source of the same information, and it is already
+recorded and already reduced** by EPLB's `expert_load_pass`, at zero marginal cost.
+
+Planning between forwards rather than inside one collapses both measured cost centres at
+once:
+
+| | in-forward prediction (today) | plan from last forward's recorded load |
+| --- | --- | --- |
+| extra gate GEMMs per forward | 43 | **0** |
+| extra AllGathers per forward | 43 | **0** (EPLB's reduction already exists) |
+| transfer window | one layer, ~231 us | the inter-forward gap plus all 48 layers |
+| host sync inside the forward | yes, 11.02 ms measured | **none** — the plan is known before the forward starts |
+| adaptation lag | 1 forward (lookahead 2) | 1 forward |
+| accuracy against oracle | 0.98 offline, 24.0% of 31.7% online | **0.98** |
+
+The +7.6% and the +22.1% both trace to work that this arrangement does not do. NVSHMEM
+also stops being necessary: with the plan on the host before the forward begins, `ncclSend`
+taking a host `c_int` peer is no longer a constraint, which was the entire reason ticket 13
+existed.
+
+**The honest consequence is that the design converges on Native EPLB with a short
+interval**, plus source-rank routing. The project's premise was that Native EPLB's
+historical window reacts too slowly for bursty or phase-changing traffic; on this workload
+there is nothing to react to. What would still be genuinely new is re-planning every
+forward at negligible cost, which Native EPLB does not offer because its `step_interval`
+is thousands of steps.
+
+### The caveat that decides whether this generalises
+
+**This is one domain.** All 400 prompts are `ko`, at concurrency 8, so consecutive forwards
+are similar partly by construction of the benchmark. Ticket 00 measured a placement carried
+*across domains* at **-20.0%**, so the stability above is a within-mix property and must not
+be read as a workload-independent one. A mixed-domain dump is the measurement that decides
+whether the redesign holds, and it is cheap: interleave two prompt sets in one run and
+repeat this table.
+
+## Where prediction's cost actually goes: it desynchronises the ranks
+
+The `off`-arm profile was captured with parameters identical to the `budget=0` one
+(`DOMAIN=ko CONC=8 NUM_PROMPTS=64 OUT_LEN=4`) so the two can be diffed. `run_placement_profile.sh`
+gained the same `budget=off` arm as the e2e runner. Per prefill window, mean over 8 ranks,
+classified with `parse_profile.classify_kernel`:
+
+| class | off | b0 (prediction on) | delta | off count | b0 count | delta count |
+| --- | --- | --- | --- | --- | --- | --- |
+| nccl | 40.85 ms | 81.15 ms | **+40.30** | 192 | 235 | **+43** |
+| moe_expert | 11.09 ms | 11.10 ms | +0.02 | 96 | 96 | 0 |
+| attention | 1.28 ms | 1.29 ms | +0.01 | 53 | 53 | 0 |
+| other | 14.65 ms | 16.48 ms | **+1.83** | 830 | 1525 | **+695** |
+| total | 67.87 ms | 110.02 ms | +42.15 | | | +738 |
+
+**Prediction's own compute is 1.83 ms** across 695 extra kernels, 2.6 us each — the gate
+GEMM, the top-k, and the dozen elementwise ops in `predict_local_counts`. **Its AllGathers
+are 0.40 ms** (the +43 nccl kernels are exactly the 43 source layers, at the 9.3 us already
+measured). Both are cheap.
+
+**The token collectives grew by ~39.9 ms with no extra kernels and no extra bytes.** Same
+192 dispatch and combine calls, same volume, roughly double the duration. That is pure
+waiting.
+
+    prediction's own compute      1.83 ms  ┐ cause
+    prediction's AllGathers       0.40 ms  ┘
+    token dispatch/combine       +39.9 ms  <- effect, ~18x amplification
+
+So the cost mechanism is **desynchronisation**: the 695 extra launches and 43 extra
+collectives push each rank's arrival at the next token collective apart, and dispatch and
+combine absorb that as duration. It is uneven because each rank predicts over its own token
+count, so the busy spread across ranks widens from 3.6x on `off` (22.1-80.6 ms) to 5.6x on
+`b0` (24.3-136.2 ms).
+
+### Three consequences, two of which overturn earlier reasoning here
+
+1. **The earlier claim that "the cost is 645 launches" had the right lever and the wrong
+   mechanism.** The launches are not expensive in themselves (1.83 ms); what they cause is.
+2. **Ticket 13 does not fix this on its own.** A device-side plan and a one-sided put remove
+   the host synchronisation and the D2H copy. They leave all 695 launches and all 43
+   collectives in place, so the desynchronisation is untouched. Anyone reasoning that
+   "device-side planning removes the to-host transfer, therefore the design becomes viable"
+   is right about the sync and wrong about this.
+3. **Operator fusion moves from routine optimisation to the highest-leverage item.** Of the
+   695, about 43 are the gate GEMM and 43-86 the top-k; the remaining ~560-610 are the
+   elementwise tail of `predict_local_counts`. Fusing those into one counting kernel per
+   layer takes 695 to about 130. If the desynchronisation scales with launch count, the
+   +40 ms follows it down.
+
+And a fourth lever that had not been considered: **make prediction's cost uniform across
+ranks.** Each rank currently predicts over its own token count, so the expensive ranks get
+more expensive and the skew compounds. Work done on a fixed padded shape would cost the same
+in total while removing the *variance*, and it is the variance the collectives charge for.
+
+### Caveat on the timings
+
+The two traces come from separate server launches, so the millisecond column carries
+run-to-run variation and there is no repeat measurement. The kernel-count column is solid:
+all 8 ranks agree to within 732-744. This profile is `OUT_LEN=4` over 64 prompts while the
++7.6% TTFT figure is `OUT_LEN=1` over 400, so **do not convert +42 ms into a percentage**.
+What this establishes is the *composition* of the cost — prediction's own work is 4% of what
+it adds, the collectives' waiting is 96% — not its magnitude.
+
+## Does balancing shrink the collectives? No — tested, and the ceiling stands
+
+The 5.05% ceiling assumes balancing touches only the expert GEMM. The obvious way it could
+be too pessimistic: a rank with a hot expert finishes MoE late, arrives late at the next
+collective, and every rank waits — so balancing might pay at the collectives' 77% share
+instead. Tested by profiling the placed arm with parameters identical to the other two.
+
+`parse_profile.py --phase prefill`, 8 windows per rank each arm:
+
+| arm | MoE us/layer, mean | max across ranks | MoE share | nccl us/layer |
+| --- | --- | --- | --- | --- |
+| `b0` predict only | 231.3 | 264.7 | 10.76% | 1690.6 |
+| `b43` placed | 124.6 | **247.6 (-6.5%)** | 5.83% | **2155.7 (+27.5%)** |
+
+**The peak fell 6.5% and the collectives rose 27.5%.** The hypothesis has no support: the
+machinery's cost dominates any second-order gain in arrival alignment. The ceiling stays at
+~5% of a prefill step.
+
+Two cautions on this comparison, both of which say "weak evidence" rather than "wrong
+direction". The two runs chunked differently — the per-layer *mean* halved (231.3 -> 124.6),
+which cannot be a balancing effect since balancing conserves total expert work and only
+moves it between ranks, so the windows are not strictly comparable. And `max_over_mean`
+rising 1.144 -> 1.987 is the *aggregated* imbalance view, which this project has twice
+recorded as the wrong metric. The peak and the nccl figures are the ones worth reading, and
+both point the same way as every other measurement this session.
+
+**Method note for anyone repeating this:** summing MoE time per rank and averaging over
+ranks cannot show balance improving, because balancing is conservative in that sum by
+construction. The quantity that sets the step is the per-layer max across ranks. That trap
+caught me here and it is the same aggregation error the glossary warns about, in a new form.
+
+# 2026-08-29 (later) — DeepSeek-V4-Flash-FP8, and the model-shape lever does not work
+
+Measured because the model shape looked like the biggest available lever: DSV4-Flash does
+302 MFLOP of expert work per token against Qwen3-30B-A3B's 75.5, and FP8 halves the time,
+so expert GEMM should have been about 2x the share and the ceiling should have roughly
+doubled. **It did not. The share is the same and so is the ceiling.**
+
+## Bring-up: four failures, none of them the feature
+
+Recorded because each cost a run and none is documented anywhere.
+
+1. **The `sgl-project` FP8 conversion does not load in this tree.** `_load_w13` dies with
+   "size of tensor a (2048) must match tensor b (4096)" — its gate/up fusion layout differs.
+   The official `deepseek-ai/DeepSeek-V4-Flash-Base` loads fine. The working invocations on
+   this machine (`/mnt/ytji/bench_dsv4_*.sh`) are **SGLang**, not vLLM, so they do not
+   transfer.
+2. **`--kv-cache-dtype fp8` is required.** DSV4's sparse MLA uses the `fp8_ds_mla` layout
+   and asserts on `auto`: every worker dies with "only supports fp8 kv-cache, got auto".
+3. **FlashInfer's JIT needs two things this image lacks.** First `nvrtc.h`, which *is* in
+   the venv (`nvidia/cuda_nvrtc/include/`) but not on FlashInfer's `-isystem
+   /usr/local/cuda/include`; then `-lnvrtc`, whose unversioned dev symlink is missing even
+   though `libnvrtc.so.13` is present. Two symlinks fix both. Verify by running `ninja`
+   directly in `/root/.cache/flashinfer/*/cached_ops/fused_moe_90` — seconds, instead of
+   discovering it after a 13-minute weight load.
+4. **A base checkpoint has no chat template**, so `--backend openai-chat` raises inside
+   the dataset sampler and **not one request is sent**. The run still reported "8 rank
+   traces" and "done": the traces held 54 events and zero annotations. Use
+   `--backend openai --endpoint /v1/completions --skip-chat-template`.
+
+Failure 4 is the third time this harness has reported success on a run that measured
+nothing, so `run_dsv4_baseline.sh` now fails with `MEASURED NOTHING` (exit 5) unless the
+bench log carries a TTFT *and* `check_trace_nonempty.py` finds a step annotation.
+
+## The operating point is degenerate, and that is itself the finding
+
+At `CONC=32 NUM_PROMPTS=256`, per prefill window:
+
+| rank | ms/step | expert GEMM | nccl | attention | other |
+| --- | --- | --- | --- | --- | --- |
+| dp0 | 57.6 | 10.86% | 51.73% | 12.88% | 24.53% |
+| dp4 | 55.3 | 12.99% | 49.25% | 12.21% | 25.55% |
+| dp1 | 71.6 | 8.94% | 62.45% | 9.54% | 19.07% |
+| dp3 | 78.5 | 9.54% | 61.56% | 9.39% | 19.51% |
+| dp2 | 475.3 | 1.54% | **93.02%** | 1.85% | 3.58% |
+| dp5 | 466.9 | 1.41% | **93.47%** | 1.80% | 3.32% |
+| dp6 | 388.7 | 1.63% | **92.85%** | 1.91% | 3.61% |
+| dp7 | 339.9 | 1.82% | **92.76%** | 1.80% | 3.62% |
+
+**Half the ranks spend 93% of the window waiting in collectives**, taking 340-475 ms per
+step against the working ranks' 55-79 ms. Mean TTFT 5293 ms, p99 28369 ms over 256
+requests. At `CONC=8` it was worse still — 19 ms against 1100 ms, a 58x spread.
+
+So the naive mean of the MoE share, 6.09%, is meaningless: it averages ranks that did no
+work. The defensible figure is from the four compute-bound ranks, and it is **10.58%
+mean, 10.20% median**.
+
+## The comparison, and the correction
+
+| | Qwen3-30B-A3B | DSV4-Flash FP8 |
+| --- | --- | --- |
+| experts / top-k | 128 / 8 | 256 / 6 |
+| expert FLOP per token | 75.5 MFLOP | 302 MFLOP |
+| **expert GEMM share** (compute-bound ranks) | **10.76%** | **10.58%** |
+| attention share | ~1% | **9-13%** |
+| other share | ~13% | 19-25% |
+| per-layer critical path, prefill | 1.8852 | **1.9622** |
+| aggregate imbalance | 1.2356 | 1.1090 |
+| aggregate understates by | 1.53x | **1.77x** |
+| recoverable excess of MoE time | 46.9% | 49.0% |
+| **ceiling** | **5.05%** | **≈5.19%** |
+
+**The 2x estimate from FLOPs was wrong**, and the reason is worth keeping: the rest of the
+model grew with the experts. DSV4's attention is sparse MLA plus hash compression, 64
+heads and lora projections — 9-13% of a step against Qwen's ~1%. Numerator and
+denominator moved together, so the ratio did not move. **Changing model shape between
+these two does not change the economics.**
+
+What *is* worse on DSV4 is the imbalance itself: per-layer peak/mean reaches **3.077**,
+and one rank holds **38.46%** of a layer's tokens against a uniform 12.50%, with a
+multinomial noise floor of 1.1491. The aggregate view reads 1.1090 and hides essentially
+all of it — a 1.77x understatement, worse than Qwen's 1.53x. More reason never to size a
+placement from it.
+
+## Tooling
+
+- `run_dsv4_baseline.sh`, and `check_trace_nonempty.py` as its measured-nothing guard.
+- `figures/make_imbalance_data.py` — the dump-to-figure step, which did not exist; the old
+  `rank-imbalance-data.json` was hand-made, so the figure could not be rebuilt for another
+  model. Cross-validates on the Qwen dump: critical path 1.8852 against the 1.8836
+  `analyse_e2e.py` reports, aggregate 1.2356 against the recorded 1.24.
+- `figures/build_rank_imbalance.py` now takes `--data/--out/--model` and reads shape from
+  the data instead of hardcoding 8x48. `figures/dsv4-rank-imbalance.html` is the DSV4
+  report, 43x8.
+- `parse_profile.classify_kernel` learned DeepGEMM: a **grouped** scheduler
+  (`GroupedWithOffsetScheduler`) is the tell for the expert GEMM — `<4096,4096,...>` is w13
+  and `<4096,2048,...>` is w2. Matching "gemm" would have been wrong: the attention
+  projections are `sm90_fp8_gemm_1d2d_impl` and dense. Without this the share reads ~0%.
+
+## The load-bearing assumption, tested: cost is linear in source-layer count
+
+Every projection about fusion rested on "the collectives' extra waiting scales with
+prediction's launch count", which was an assumption. Tested with a config-only arm:
+`prediction_skip_first_layers` raised from 3 to 35 takes the source-layer range
+`[skip_first, num_moe_layers - lookahead)` from 43 layers to 11. Same model, same prompts,
+same `budget=0`, so only the number of predicting layers changes.
+`run_placement_profile.sh` gained a `SKIP_FIRST` passthrough.
+
+Per prefill window, summed over 8 ranks:
+
+| arm | source layers | +kernels | +nccl | +total | per source layer |
+| --- | --- | --- | --- | --- | --- |
+| `off` | 0 | — | — | — | — |
+| `skip=35` | 11 | +1778 | +76.98 ms | +96.03 ms | 161.6 kernels, **7.00 ms** |
+| `skip=3` | 43 | +5904 | +322.41 ms | +337.24 ms | 137.3 kernels, **7.50 ms** |
+
+**7.00 against 7.50 ms of extra collective waiting per source layer — within 7%.** The
+scaling is linear, so the assumption holds and projections built on it are now grounded.
+
+Three consequences.
+
+**Fusion is quantifiable.** The kernels prediction introduces, per source layer (`dp0`,
+diffed against `off`; note this is 17.2 per layer, not the 137 above — that figure divides
+an 8-rank sum by the layer count and is wrong by a factor of 8):
+
+| per layer | us/window | kernel | fusable |
+| --- | --- | --- | --- |
+| 3.0 | 309 | `unrolled_elementwise_kernel` | yes |
+| 3.0 | 189 | `vectorized_elementwise_kernel<8>` | yes |
+| 2.0 | 107 | `vectorized_elementwise_kernel<4>` | yes |
+| 1.0 | 185 | `_scatter_gather_elementwise_kernel` (`scatter_add_`) | yes |
+| 1.0 | 142 | `elementwise_kernel<128,4>` | yes |
+| 1.0 | 72 | `elementwise_kernel<128,2>` | yes |
+| 1.0 | 65 | `vectorized_elementwise_kernel<2>` | yes |
+| 1.0 | 401 | `ncclDevKernel_AllGather` — the snapshot | batch only |
+| 1.0 | 182 | `topkGating` — the router's top-k | **no** |
+| 0.8 | 183 | `nvjet_tst_64x24...` — the gate GEMM | **no** |
+| 1.1 | 239 | `_eplb_map_and_record_i32_kernel` | not prediction — EPLB *recording* |
+
+About **11-12 of the 17 are the elementwise tail of `predict_local_counts`**, so fusing
+them into one counting kernel removes roughly **473 of the 738 added launches, 64%**. At
+linear scaling that takes the added cost down by about the same fraction.
+
+**"Predict fewer layers" is ruled out, now by measurement rather than by guess.** Cost is
+7.25 ms per source layer and benefit is about 0.65 points of prefill excess per covered
+layer (ticket 12, a straight line with no knee). Both linear, so the ratio does not move.
+Only a change to the cost *per layer* improves the economics.
+
+**And `+7.6%` includes work ticket 13 removes.** `plan_and_launch` calls
+`copy_event.synchronize()` at line 226, *before* the budget check at 239, so the
+`budget=0` arm pays a host D2H synchronisation on **every** predicted layer — 43 per
+forward — on top of prediction's compute and its AllGathers. So that arm is not
+"prediction alone" in the sense used earlier in this file, and the floor for a
+device-planned design is below 7.6%.
+
+### Where this leaves the arithmetic
+
+    measured today, prediction + infra + 43 host syncs        +7.6% mean TTFT
+    fusion removes 64% of added launches, cost linear         -> about +2.7%   (extrapolated)
+    a device-side plan removes the 43 host syncs              -> lower, share unknown
+    measured ceiling                                          about 5.05%
+
+**For the first time in this project the arithmetic can close.** Every earlier verdict
+here — including the "break-even at best" written above — assumed the launch-count scaling
+that had not been tested, and did not account for the host syncs sitting inside the
+prediction-only arm.
+
+Three things keep this a projection rather than a result. The 7.6% -> 2.7% step is a linear
+extrapolation and has to be re-measured after fusion. This experiment **cannot** separate
+the host sync from the launches, because both scale with source-layer count; only
+implementing the device-side plan separates them. And the 5.05% ceiling carries a couple of
+points of uncertainty depending on whether it is attributed from the mean rank or the peak
+rank.
+
+## Option (a), putting straight into the model's own weights, is ruled out
+
+The operator chose to skip the staging buffer and `register_external_tensor` the expert
+weight tensors directly, so registration became a load-bearing premise. Probed before
+writing any spec around it (`probe_nvshmem_register.py`, 8 GPUs, no vLLM, no weights).
+
+**It is not available on this stack**, and the reason is a closed loop rather than a
+missing setting. Four checks deep:
+
+| # | requirement | fix | result |
+| --- | --- | --- | --- |
+| 1 | NVSHMEM's per-device memory resource must exist | one `nvshmem.core.tensor((1,), uint8)` | cleared |
+| 2 | size must be a multiple of heap granularity (512 MiB default) | `NVSHMEM_CUMEM_GRANULARITY=2097152` + one padding row | cleared |
+| 3 | buffer must be CUDA VMM allocated | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | cleared |
+| 4 | the VMM handle must be mappable by NVSHMEM | none available | **`CUDA_ERROR_NOT_SUPPORTED`** |
+
+`NVSHMEM_DISABLE_CUDA_VMM=1` removes check 4 and registration then *reports* success for
+all 48 layers — 7.59 GiB per rank, and the tensors still work for local compute. But the
+first real put fails with **"Buffer registration requires dynamic VMM heap"**: that
+registration was not symmetric. Registration needs the VMM heap; the VMM heap needs a
+mappable user handle PyTorch does not create. The two settings exclude each other.
+
+Two by-products worth keeping. Check 1's error message ("device that is not initialized
+with NVSHMEM") reads like a device-binding bug and is not one — the fix is an allocation,
+not a `set_current`. And a **row-granular** put must go through
+`nvshmem.bindings.putmem_on_stream(dst_ptr, src_ptr, bytes, pe, stream)`:
+`nvshmem.core.put` resolves arguments through nvshmem's tracking table, which holds whole
+allocations, so a row slice raises "Tensor not tracked by nvshmem". A device-side
+implementation would emit the pointer form anyway.
+
+**So the transfer lands through a symmetric-heap staging buffer**, and its extra local copy
+costs 6.3 us for Qwen's 9 MiB, 16.8 us for DSV4's 24 MiB at the measured 3.00 TB/s —
+0.01% of a 67.87 ms prefill step. A third route exists: allocate the expert weights *from*
+the symmetric heap with `nvshmem.core.tensor()` instead of registering torch memory, which
+`probe_nvshmem.py` proves works mechanically. It puts NVSHMEM's allocator underneath the
+model's own weights, which weight loading and EPLB's `rearrange` share, so it is a deeper
+intrusion than registration would have been and should only be considered if the staging
+copy ever shows up in a measurement.
+
+## PyTorch symmetric memory also works, and is what option (a) was reaching for
+
+Probed after NVSHMEM registration was ruled out, because this repository already uses
+PyTorch symmetric memory for custom all-reduce
+(`vllm/distributed/device_communicators/symm_mem.py`). `probe_symm_mem.py`, 8 GPUs, 6 of 6:
+
+    [PASS] allocate weights in the symmetric pool — 153 MiB per layer, ordinary torch.zeros
+    [PASS] rendezvous — world 8, is_symm_mem_tensor True
+    [PASS] still usable for local compute — matmul on a canonical row is finite
+    [PASS] row-granular write into a peer's replica row — holds 8.0, expected 8.0
+    [PASS] all 48 layers — 7.17 GiB per rank
+    6.00 MiB row -> peer replica row: p50 25.0 us (252 GB/s)
+    buffer_ptrs_dev present: True
+
+It clears the exact obstacle NVSHMEM could not. `get_mem_pool(device)` returns a
+`torch.cuda.MemPool`, so the expert weights are allocated by **ordinary `torch.zeros`**
+inside `torch.cuda.use_mem_pool(...)` and stay ordinary tensors afterwards — weight loading
+and EPLB's `rearrange` keep plain semantics, which the matmul check confirms. `rendezvous`
+then makes them addressable, `get_buffer(peer, shape, dtype)` hands back **a torch tensor
+view of the peer's memory**, and writing one expert is `peer_view[row].copy_(my_row)` — a
+*slice*, which NVSHMEM's tracking table refuses. `buffer_ptrs_dev` is a device-resident
+peer-pointer table, so a Triton kernel could compute the destination with no host at all.
+
+| | NVSHMEM register (a) | NVSHMEM staged (b) | PyTorch symm-mem (d) |
+| --- | --- | --- | --- |
+| weight allocation | **impossible** | untouched | ordinary torch inside a MemPool |
+| staging buffer | — | one expert | none |
+| extra local copy | — | +6.3 us | none |
+| destination may be a slice | — | — | yes |
+| one 9 MiB expert | — | 33.0 + 6.3 = **39.3 us** | about **37.5 us** |
+| dependencies | nvshmem4py + 2 env vars | nvshmem4py | PyTorch only, already used here |
+| device-side pointer table | — | — | `buffer_ptrs_dev` |
+
+The 252 GB/s is below NVSHMEM's 285 because `copy_` launches a generic copy kernel rather
+than a tuned path; a Triton kernel over `buffer_ptrs_dev` would likely close that, and the
+design wants such a kernel anyway.
+
+### Decision: (b), the staged NVSHMEM route
+
+Chosen 2026-08-29. **(b) does not touch how vLLM allocates expert weights at all**, where
+(d) needs a `use_mem_pool` context around weight creation inside `FusedMoE` and the quant
+methods. The staged route's price is one expert-sized symmetric buffer and a 6.3 us local
+copy — 0.06% of a 67.87 ms prefill step once the 33.0 us put is added — bought against zero
+intrusion into the weight-loading path.
+
+**(b) needs no environment variables.** `NVSHMEM_CUMEM_GRANULARITY` and
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` were only ever attempts to make
+registration work for (a); the staged path is what `probe_nvshmem.py` validated 5 of 5 with
+a stock configuration.
+
+(d) stays on the record because it is the better shape if the staging copy or the buffer
+ever matters, and because it needs no NVSHMEM at all.
+
+# 2026-08-29 (ticket 03) — the fused counting kernel, and what it revealed
+
+Implemented and measured. The elementwise tail of the predicted-count path is now one
+Triton kernel, tested by equality against the retained reference over 200 randomised cases
+plus padding boundaries, out-of-range ids, both router id widths and an empty batch.
+
+Profiled at the parameters the earlier arms used (`DOMAIN=ko CONC=8 NUM_PROMPTS=64
+OUT_LEN=4 BUDGETS=0`), per prefill window summed over 8 ranks:
+
+| arm | nccl | other | total | kernels | kernels/layer/rank |
+| --- | --- | --- | --- | --- | --- |
+| `off`, no prediction | 326.8 ms | 117.2 | 542.9 | 9366 | — |
+| prediction, 12 elementwise ops | 649.2 ms | 131.9 | 880.2 | 15270 | **17.2** |
+| prediction, fused kernel | 593.3 ms | 130.3 | 825.9 | 11812 | **7.1** |
+
+**Launches per source layer fell 17.2 to 7.1, a 59% cut — and the extra collective waiting
+fell only 17%, 322.4 ms to 266.5 ms.** That is not proportional, and the gap is the finding.
+
+### The per-layer cost decomposes, and the launch-driven part is the smaller one
+
+The earlier linearity test varied the *number of predicting layers*, which moved launches,
+host synchronisations and AllGathers together — it could not separate them, and this file
+said so at the time. Fusion moves only the launches, so the two components separate:
+
+    per-layer extra collective waiting  =  A (scales with launches)  +  B (fixed per layer)
+
+    before fusion   7.50 ms/layer          launches at 1.00x
+    after  fusion   6.20 ms/layer          launches at 0.41x
+    -> A = 2.21 ms/layer  (30%)
+       B = 5.28 ms/layer  (70%)
+
+**B is essentially the host synchronisation.** The other per-layer fixed cost, the snapshot
+AllGather, measures 0.40 ms per forward per rank, which is 0.074 ms per layer summed over
+ranks — under 2% of B. So the 5.28 ms is the D2H synchronisation that `plan_and_launch`
+performs once per predicted layer, consistent with the 11.02 ms single
+`cudaEventSynchronize` measured earlier.
+
+### The projection this corrects
+
+This file previously extrapolated the prediction arm from +7.6% to about +2.7% mean TTFT on
+the assumption that cost scaled with launch count. Measured, fusion takes it to about
+**+6.3%**, because 70% of the per-layer cost does not scale with launches at all.
+
+**So ticket 06 matters more than ticket 03**, which reverses the ordering intuition this
+ticket set was built on. Removing the host synchronisation attacks 70% of prediction's added
+cost; fusing the counting attacks 30% and has now delivered its share. Both are still worth
+having — 17% is real and the kernel is written — but the arithmetic closes or fails on the
+device-side plan, not on the kernel.
+
+Against the 5.05% ceiling: +6.3% is still above it, and only ticket 06 can bring it below.
+If removing the host sync recovers most of B, the floor lands near 1% and the feature is net
+positive for the first time. That remains an extrapolation, and the lesson from this ticket
+is precisely that a per-layer cost can have a large component the obvious lever does not
+touch.

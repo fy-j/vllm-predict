@@ -169,6 +169,60 @@ def place_uniformly(layers: Sequence[Layer], per_layer: int) -> list[Layer]:
     return out
 
 
+def plan_moves_in_layer_order(
+    layers: Sequence[Layer],
+    budget: int,
+    per_layer_cap: int,
+    eligible: set[int] | None = None,
+) -> list[tuple[int, int, int, int]]:
+    """What the **online** planner actually does, so the oracle has a fair control.
+
+    `PlacementCoordinator.plan_and_launch` hands `plan_replicas` a single row — one
+    target layer — because when layer `L+1` plans for layer `L+2` no later layer's
+    prediction exists yet. Layers are then visited in increasing index order, each
+    taking `min(remaining budget, per_layer_cap)`. So the global budget is spent
+    first-come-first-served by layer index, and the layers that happen to be late in
+    the model get nothing at all:
+
+        budget 43, cap 2  ->  targets 5..25 take 2 each (42), target 26 takes 1,
+                             targets 27..47 get nothing, on every forward
+
+    That is 22 covered layers, always the lowest-indexed 22 — which is exactly the
+    "coverage steady at 22 layers, removes 16.9%" already on record, and it is
+    `43 / 2` rather than anything about the workload.
+
+    Use this to price the allocation order itself: `plan_moves` with the same budget
+    and cap is the same policy differing *only* in which layer gets the next
+    placement. Any gap between them is allocation, not prediction accuracy, and not
+    the greedy's choice of expert.
+
+    Args:
+        layers: The forward's layers.
+        budget: Total placements allowed, across all layers.
+        per_layer_cap: Most placements one layer may take. Unlike in `plan_moves`
+            this is required, because it is what bounds the earliest layers.
+        eligible: Layers that have a replica slot at all. `None` means every layer.
+
+    Returns:
+        `(layer index, expert index within its rank, source rank, target rank)` in
+        the order chosen, the same shape `apply_moves` replays.
+    """
+    out = [x.copy() for x in layers]
+    moves: list[tuple[int, int, int, int]] = []
+    for index, layer in enumerate(out):
+        if len(moves) >= budget:
+            break
+        if not layer.live or (eligible is not None and index not in eligible):
+            continue
+        for _ in range(min(budget - len(moves), per_layer_cap)):
+            move = _best_move(layer)
+            if move is None:
+                break
+            _apply(layer, move)
+            moves.append((index, move[1], move[2], move[3]))
+    return moves
+
+
 def plan_moves(
     layers: Sequence[Layer],
     budget: int,

@@ -10,30 +10,36 @@ Before working on this feature, read in order:
 4. `.scratch/predictive-expert-replication/glossary.md`
 5. `.scratch/predictive-expert-replication/reference/ascend-prior-art.md` (read-only timing prior art; the spec overrides it)
 
-Implement only vLLM CUDA tickets `00`–`09` in this repository. Do not implement vLLM-Ascend here.
+The spec was **rewritten on 2026-08-29** around Device-planned placement, and the ticket
+set replaced. Work `issues/01`–`10`; the previous `00`–`14` are in `issues/superseded/`
+with a note on why, because their measurements are still cited by the spec. Do not
+implement vLLM-Ascend here.
 
 Ticket order is set by each ticket's `Blocked by` field, not by its filename number:
 
 ```
-01 infra + layout          blocks 02, 03
-02 prediction              blocks 06, 08     (needs 01)
-03 source-rank routing     blocks 08         (needs 01)
-00 feasibility checkpoint  blocks 07, 04, 05
-06 accuracy study          blocks 04         (needs 02)
-07 weight transfer         blocks 08         (needs 00)
-08 activation              blocks 04         (needs 02, 03, 07)
-09 serving baseline        blocks 05, and 04 for the under-load bandwidth item
-10 prefill accuracy        blocks 07, 04, 08, 11 (needs 02)
-11 quota routing eval     terminal          (needs 10) — evaluation only, may close 03's contract
-12 replica slot memory    terminal          deferred; sized and priced, not on the critical path
-13 device-side plan       terminal          needs NVLink + probe_nvshmem.py; removes the host sync
-04 planner + lifecycle     blocks 05         (needs 00, 02, 06, 08, 09, 10)
-05 validation + benchmark  terminal          (needs 04, 09)
+01 harness fails on empty runs   blocks 03, 04     no blockers; every later ticket measures
+02 config and accounting         terminal          no blockers; removes the lookahead=1 trap
+03 fused Triton counting kernel  blocks 08         (needs 01)  DONE 2026-08-29
+04 device-side plan              blocks 05         (needs 01)
+05 transfer lands in the slot    blocks 06         (needs 04)
+06 no host sync on the path      blocks 07         (needs 05)  ← the one that decides it
+07 window = target's Attention   blocks 08         (needs 06)
+08 three-arm verdict + stop gate blocks 10         (needs 03, 07)
+09 CUDA graph feasibility        terminal          no blockers; exploratory, off the mainline
+10 DeepSeek-V4-Flash             terminal          (needs 08)
 ```
 
-Edges are listed rather than drawn: an ASCII diagram of this silently misaligned
-its `06` and `04` edges into neighbouring labels, and each ticket's `Blocked by`
-field is authoritative anyway.
+Edges are listed rather than drawn: an ASCII diagram of this silently misaligned its
+edges into neighbouring labels once, and each ticket's `Blocked by` field is
+authoritative anyway.
+
+**`06` is the ticket the arithmetic turns on, not `03`.** Measured on 2026-08-29: of the
+per-source-layer cost, 2.21 ms scales with launch count and 5.28 ms does not, and the
+fixed part is essentially the host synchronisation. `03` cut launches 59% and recovered
+17% of the cost, which is its whole share. Do not re-derive the ordering from the earlier
+note in this file that projected +2.7% from fusion alone; that projection is corrected in
+`CURRENT-STATUS.md`.
 
 Each ticket's own `Status` line is authoritative; do not restate it here, because
 a copy goes stale and this file is read first.
@@ -63,6 +69,30 @@ of 35%, confirmed on 50 prefill forwards. It costs **+13% to +29% mean TTFT** ac
 four configurations. The ceiling on this node is 3.3%, so the cost exceeds the best
 possible benefit by roughly five times — a decode-shaped conclusion arrived at for
 prefill, and not something tuning closes.
+
+**VERDICT (2026-08-29, 8x H100 SXM): negative, and about the mechanism rather than the
+interconnect.** Ticket 14's third arm finally measured the feature against a stock
+server: prediction and its infrastructure cost **+7.6% mean TTFT** against a
+perfect-balance ceiling of
+**5.05% of a prefill step**, so the mechanism that creates the transfer window spends
+1.51x what perfect expert balance could ever return, before a replica moves. The whole
+feature costs **+31.5%**. Ticket 13's device-side transfer removes the host sync and most
+of placement's share, but not prediction's 43 gate matmuls and 43 AllGathers per forward,
+so the ceiling stays under the floor on the fastest interconnect NVIDIA ships — and the
+conclusion transfers to the Ascend port. Batching those AllGathers is **not** the escape:
+traced here they are 9.3 us each, 0.40 ms per forward, 4% of the window they hide in. The
+cost is prediction's ~645 kernel launches per forward, and +7.6% is an upper bound because
+arm `0` also records expert load. The mechanics are sound and improved this
+session (coverage 22 -> all 43 layers, recovered excess 15-17% -> 24.0%); the arithmetic
+does not close. Read `CURRENT-STATUS.md`'s verdict section before planning work.
+
+**A 2026-08-29 code audit found six disagreements between the code and these
+documents.** Read `CURRENT-STATUS.md`'s "Code audit, 2026-08-29" before touching the
+feature or believing a number in this file. In particular: the overlap window is one
+whole MoE layer wider than the design describes and `lookahead=1` silently has **no**
+window at all; the online planner is per layer, which is arithmetically the 15%-versus-
+33% gap; decode and dummy forwards are suspected to revert every replica, which would
+defeat the transfer reuse; and `max_concurrent_transfer_bytes` is never read.
 
 **Before optimising anything, read `CURRENT-STATUS.md`'s "What today's profiling
 settled".** Four rounds of design chased the transfers, which measure **0.32% of GPU

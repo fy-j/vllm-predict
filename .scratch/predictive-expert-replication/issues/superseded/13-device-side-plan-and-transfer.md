@@ -3,9 +3,40 @@
 **What to build:** Move the placement decision and the weight transfer entirely onto
 the device, so no host synchronisation is needed anywhere on the per-forward path.
 
-**Blocked by:** NVLink hardware, and `bench/probe_nvshmem.py` passing on it.
+**Blocked by:** ~~NVLink hardware, and `bench/probe_nvshmem.py` passing on it.~~ Nothing.
 
-**Status:** designed, not started. The design is settled; the probe gates it.
+**Status:** **unblocked 2026-08-29** — 8x H100 SXM with NV18 across all pairs, and
+`probe_nvshmem.py` passes 5 of 5 with a 9.00 MiB put at **33.0 us p50** against PCIe's
+289 us. All three things this design said would invalidate it on their own are answered
+in its favour, including that **a plain CUDA event orders the consumer**, so no fence and
+no flag polling is needed. Numbers and the API corrections in `bench/RESULTS.md`,
+2026-08-29. Not started.
+
+**Two API facts change the design as written below.** Both were found while correcting
+the probe:
+
+1. `nvshmem.core.register_external_tensor` exists. The model's own `expert_weights`
+   allocation can be registered with NVSHMEM and put into **directly**, so point 3's
+   symmetric staging buffer and its extra 9.00 MiB device-to-device copy are avoidable.
+   Registration is a collective, which is fine at startup. Point 3's warning still
+   stands — do not *move* `expert_weights` into the symmetric heap, since that
+   allocation path is shared with EPLB's `rearrange` — but registering in place is not
+   moving.
+2. `nvshmem.core.put(dst, src, pe, stream=)` is the stream-ordered entry point; there is
+   no `put_on_stream`. Point 4's requirement is met by the ordinary `put`.
+
+**This ticket is the operator's intended pipeline shape** (stated 2026-08-29): predict
+layer `i + 1` at layer `i`, complete the transfer and the map update during layer
+`i + 1`'s Attention, so that layer's MoE runs with the replica live. That shape needs
+the launch at the *predicting* layer's MoE tail, which needs no host read of the plan,
+which is only true here. See `CURRENT-STATUS.md`'s 2026-08-29 code audit finding 1 for
+what the current hook positions do instead, and why `prediction_lookahead_layers=1`
+today has a window of zero rather than one Attention block.
+
+Note the consequence for ticket 12: `N` there is the planning delay in layers, so this
+ticket's one-layer pipeline makes the aliasing pool `N + 1 = 2` blocks, 18 MiB, instead
+of 5 blocks and 45 MiB. Shortening the pipeline is also the cheapest way to shrink that
+memory.
 
 ## Why
 
@@ -80,7 +111,8 @@ stay at one layer and the lookahead need not rise, so prediction accuracy costs
 nothing** and several open questions close. Its API names are inferred from semantics
 and probed with `getattr`; expect to correct them on first contact.
 
-- [ ] `probe_nvshmem.py` passes on the target hardware, with the put latency recorded.
+- [x] `probe_nvshmem.py` passes on the target hardware, with the put latency recorded.
+      8x H100 SXM, 5 of 5, 9.00 MiB put 33.0 us p50 (31.6 min, 35.0 max, 285.9 GB/s).
 - [ ] `activate()` waits with `current_stream().wait_event(event)` rather than
       `event.synchronize()`. This one needs no NVSHMEM and can be done first: it wants
       only the stream ordering "map writes follow the transfer", not any host

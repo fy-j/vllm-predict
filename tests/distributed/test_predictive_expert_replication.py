@@ -6,6 +6,7 @@ These are the CPU/single-GPU proofs for vLLM tickets 01 and 02. Distributed
 replica transfer and output equivalence belong to the multi-GPU suites.
 """
 
+import importlib
 import json
 from types import SimpleNamespace
 
@@ -959,12 +960,24 @@ def test_a_layer_cannot_replicate_onto_every_rank(tmp_path):
         _build(tmp_path, max_replicas_per_layer=8)
 
 
-def test_replicas_per_layer_defaults_to_the_measured_median_need(tmp_path):
-    """Measured concentration puts the median need at two distinct experts."""
+def test_replicas_per_layer_defaults_to_one_so_the_budget_buys_coverage(tmp_path):
+    """The cap is the online planner's allocation target, not a safety limit.
+
+    The planner sees one layer at a time, so layers fill to this cap in index order
+    until the forward's budget is gone: at cap `k` a budget of `b` reaches `b/k`
+    layers and no more. Coverage is what drives benefit, so 1 is the default —
+    offline at equal budget it removes 48.0% of critical-path excess against a
+    global-ranking oracle's 48.3%, where 2 removes 23.5%.
+
+    An earlier default of 2 came from per-layer concentration, which measured how
+    many experts a layer would need to *equalize* it. That is the wrong question
+    under a global budget, and it is why this test changed rather than the reasoning
+    being reversed.
+    """
     config = _build(tmp_path)
 
     predictive = config.parallel_config.predictive_expert_replication_config
-    assert predictive.max_replicas_per_layer == 2
+    assert predictive.max_replicas_per_layer == 1
     assert predictive.max_transfers_per_forward >= predictive.max_replicas_per_layer, (
         "a single layer's placements must fit inside the per-forward budget, "
         "or no layer could ever be approved"
@@ -1591,6 +1604,16 @@ class TestPredictionIsSkippedWhenNoPlacementCanFollow:
                 experts_per_token=experts_per_token, num_logical_experts=logical
             ),
         )
+        # The token count lives in its own method because the placement path needs the
+        # number itself, not just the boolean: the coordinator must be told the load to
+        # decide suppression before anything is recorded. Bound here so this fixture
+        # keeps exercising the real arithmetic rather than a stub of it.
+        mod = importlib.import_module(
+            "vllm.model_executor.layers.fused_moe.runner.moe_runner"
+        )
+        runner._forward_tokens_per_expert = lambda: (
+            mod.MoERunner._forward_tokens_per_expert(runner)
+        )
         dp = (
             None
             if tokens_across_dp is None
@@ -1637,3 +1660,30 @@ class TestPredictionIsSkippedWhenNoPlacementCanFollow:
         """The diagnostic paths run without DP metadata; they must not go silent."""
         runner, context = self._runner(None)
         assert self._call(runner, context)
+
+
+def test_lookahead_of_one_is_rejected_until_the_launch_point_moves(tmp_path):
+    """A lookahead of 1 currently gives an overlap window of zero, not one Attention.
+
+    `plan_and_launch` and `activate_and_publish` are adjacent statements at the head of
+    the
+    MoE forward, so at lookahead 1 the transfer aimed at *this* layer is issued on one
+    line
+    and awaited on the next, with no compute in between. The value reads like the
+    obvious
+    choice — it is the shortest prediction distance and the most accurate — which is
+    exactly
+    why it has to fail loudly rather than quietly cost the full transfer. Ticket 07
+    lifts
+    this once the launch moves to the predicting layer's MoE tail.
+    """
+    with pytest.raises(ValueError, match="overlap window is zero"):
+        _build(tmp_path, prediction_lookahead_layers=1)
+
+
+def test_lookahead_of_two_remains_accepted(tmp_path):
+    """The guard must reject one value, not the feature."""
+    config = _build(tmp_path, prediction_lookahead_layers=2)
+
+    predictive = config.parallel_config.predictive_expert_replication_config
+    assert predictive.prediction_lookahead_layers == 2

@@ -9,16 +9,29 @@ the per-layer table is the heatmap's and the line chart's table view, and the
 aggregate table is the metric that hides the skew, kept only as the evidence
 behind the first stat tile.
 """
+import argparse
 import json
 from pathlib import Path
 
 HERE = Path(__file__).parent
-D = json.loads((HERE / "rank-imbalance-data.json").read_text())
-EP, L = 8, 48
+_ap = argparse.ArgumentParser(description=__doc__)
+_ap.add_argument("--data", type=Path, default=HERE / "rank-imbalance-data.json")
+_ap.add_argument("--out", type=Path, default=HERE / "rank-imbalance.html")
+_ap.add_argument("--model", default="Qwen3-30B-A3B")
+_args = _ap.parse_args()
+
+D = json.loads(_args.data.read_text())
+# Shape comes from the data, not from constants: the figure was pinned to 8x48 and could
+# not be rebuilt for another model. DeepSeek-V4-Flash is 43 layers and 256 experts.
+_any = next(iter(D.values()))
+EP = _any.get("ep", 8)
+L = _any.get("num_layers", len(_any["share_by_layer"]))
+MODEL = _args.model
 UNIFORM = 100.0 / EP
 RAMP = ["#cde2fb","#b7d3f6","#9ec5f4","#86b6ef","#6da7ec","#5598e7",
         "#3987e5","#2a78d6","#256abf","#1c5cab","#184f95","#104281","#0d366b"]
-LO, HI = 4.0, 29.5
+_shares = [v for k in D for row in D[k]["share_by_layer"] for v in row]
+LO, HI = min(_shares), max(_shares)
 
 
 def ramp(v):
@@ -41,7 +54,8 @@ def heat_cells(key):
 
 
 W, H, PAD = 720, 150, 8
-YMIN, YMAX = 1.0, 2.45
+_peaks = [v for k in D for v in D[k]["peak_over_mean"]]
+YMIN, YMAX = 1.0, max(2.45, max(_peaks) * 1.05)
 def xp(i): return PAD + i * (W - 2 * PAD) / (L - 1)
 def yp(v): return H - PAD - (v - YMIN) / (YMAX - YMIN) * (H - 2 * PAD)
 
@@ -86,7 +100,7 @@ def agg_row(key, label):
 legend_ticks = "".join(f'<span class="sw" style="background:{c}"></span>' for c in RAMP)
 axis_ticks = "".join(f"<span>{i if i%6==0 else ''}</span>" for i in range(L))
 
-page = f"""<title>Rank Imbalance by Layer</title>
+page = f"""<title>Rank Imbalance by Layer — {MODEL}</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <style>
@@ -179,7 +193,7 @@ hr {{ border:0; border-top:1px solid var(--grid); margin:0 }}
 
 <div class="wrap">
   <header>
-    <div class="eyebrow">Qwen3-30B-A3B · 8×RTX 5090 · DP=8 EP=8 · 48 MoE layers</div>
+    <div class="eyebrow">{MODEL} · DP={EP} EP={EP} · {L} MoE layers · {_any.get("num_logical_experts","?")} logical experts</div>
     <h1>The same imbalance, measured two ways</h1>
     <p class="lede">Expert load across eight ranks looks almost even when the layers are
       summed first. Per layer — which is what a step actually waits on — it is not. These
@@ -191,7 +205,7 @@ hr {{ border:0; border-top:1px solid var(--grid); margin:0 }}
       <div class="card tile lo">
         <div class="k">Summed over layers</div>
         <div class="v">{D['prefill']['aggregate_imbalance']:.3f}×</div>
-        <div class="n">Add all 48 layers per rank, then compare ranks. Reads as
+        <div class="n">Add all {L} layers per rank, then compare ranks. Reads as
           near-balanced: {UNIFORM:.2f}% would be even, and the spread is
           {max(D['prefill']['aggregate_share'])-min(D['prefill']['aggregate_share']):.2f}
           points. <strong>This is the misleading one.</strong></div>
@@ -248,7 +262,7 @@ hr {{ border:0; border-top:1px solid var(--grid); margin:0 }}
       </div>
       <div style="overflow-x:auto">
         <svg viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img"
-             aria-label="Per-layer peak-over-mean rank imbalance, prefill and decode, across 48 layers">
+             aria-label="Per-layer peak-over-mean rank imbalance, prefill and decode, across {L} layers">
           {grid}{spark("decode","var(--series-2)")}{spark("prefill","var(--series-1)")}
         </svg>
       </div>
@@ -277,7 +291,7 @@ hr {{ border:0; border-top:1px solid var(--grid); margin:0 }}
   <section>
     <h2>Summed over layers — the view that hides it</h2>
     <p class="note">Kept only as the evidence behind the first tile. Every rank is the peak
-      on four to eight of the 48 layers, so adding the layers up cancels the skew and
+      on a handful of the {L} layers, so adding the layers up cancels the skew and
       leaves a 2-point spread. Do not read a placement decision off this table.</p>
     <div class="tw">
       <table>
@@ -340,5 +354,5 @@ hm.addEventListener('focusin', e => {{
 hm.addEventListener('focusout', () => tip.style.opacity = 0);
 </script>
 """
-(HERE / "rank-imbalance.html").write_text(page)
-print(f"wrote {len(page)} bytes")
+_args.out.write_text(page)
+print(f"wrote {_args.out} ({len(page)} bytes), {L} layers x {EP} ranks")

@@ -16,6 +16,8 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
+import triton
+import triton.language as tl
 
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -109,6 +111,149 @@ def build_source_local_physical_map(
     return chosen, torch.ones_like(logical_replica_count)
 
 
+def count_logical_experts_reference(
+    logical_ids: torch.Tensor,
+    num_unpadded: torch.Tensor,
+    num_logical_experts: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Count predicted tokens per logical expert, the elementwise way.
+
+    This is the implementation that shipped and was measured, kept as the **oracle** the
+    fused kernel is tested against rather than as a fallback. It is not on the serving
+    path.
+
+    An id outside the logical range contributes nothing rather than being folded into a
+    neighbouring expert's count, which would wrongly attribute load to a real expert and
+    make the planner replicate an expert that is not hot. The weight excludes it; the
+    clamp
+    only keeps `scatter_add_` in bounds. Deliberately not checked on the host, since
+    that
+    would synchronise every layer of every forward.
+
+    Args:
+        logical_ids: `[num_tokens, topk]` selected logical experts, either int width.
+        num_unpadded: Device scalar holding this rank's valid token count, 0-dim or with
+        a
+            single element. Rows at or past it are padding and must not reach the count.
+        num_logical_experts: Logical expert count, which bounds the output.
+        out: `[num_logical_experts]` int32 destination, zeroed here.
+
+    Returns:
+        `out`, for convenience.
+    """
+    out.zero_()
+    num_tokens = logical_ids.shape[0]
+    if num_tokens == 0:
+        return out
+
+    # `num_unpadded` is used unindexed: the runtime passes a 0-dim scalar out of a list
+    # of
+    # per-ubatch counts, and indexing that raises. Both a 0-dim and a one-element tensor
+    # broadcast correctly against `arange`, and the kernel reads element 0 of either.
+    is_valid = torch.arange(num_tokens, device=logical_ids.device) < num_unpadded
+    flat_ids = logical_ids.reshape(num_tokens, -1)
+    weights = is_valid.to(out.dtype).unsqueeze(1).expand_as(flat_ids)
+    # Copy before masking: `.to()` is a no-op when the router already returns int64, and
+    # an
+    # in-place clamp would then write through to the tensor the router just handed back,
+    # breaking its read-only contract for any other caller.
+    indices = flat_ids.reshape(-1).to(dtype=torch.int64, copy=True)
+    in_range = (indices >= 0) & (indices < num_logical_experts)
+    masked_weights = weights.reshape(-1) * in_range.to(out.dtype)
+    indices.clamp_(0, num_logical_experts - 1)
+    out.scatter_add_(0, indices, masked_weights)
+    return out
+
+
+@triton.jit
+def _count_logical_experts_kernel(
+    ids_ptr,
+    unpadded_ptr,
+    out_ptr,
+    num_pairs,
+    topk,
+    num_logical_experts,
+    BLOCK: tl.constexpr,
+):
+    """One atomic increment per valid, in-range token-expert pair.
+
+    The elementwise path materialised a mask, a weight vector, a range mask, a product
+    and
+    a clamped index copy — five tensors sized `[num_tokens, topk]` — and issued about
+    a dozen launches per source layer. Here the same arithmetic is per-element and stays
+    in
+    registers, so the layer costs one launch.
+
+    The count is small (128 to 256 integers) and the input large (tokens times topk), so
+    atomics into the output are the right shape: contention is bounded by the expert
+    count,
+    not by the token count, and the skew this feature exists to find means the hot
+    expert
+    takes the contention either way.
+    """
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    in_bounds = offsets < num_pairs
+
+    unpadded = tl.load(unpadded_ptr)
+    # Integer division recovers the token a flattened pair belongs to, which is what the
+    # padding boundary is expressed in.
+    token = offsets // topk
+    valid = in_bounds & (token < unpadded)
+
+    ids = tl.load(ids_ptr + offsets, mask=in_bounds, other=-1)
+    valid = valid & (ids >= 0) & (ids < num_logical_experts)
+
+    tl.atomic_add(out_ptr + ids, 1, mask=valid)
+
+
+def count_logical_experts_triton(
+    logical_ids: torch.Tensor,
+    num_unpadded: torch.Tensor,
+    num_logical_experts: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Count predicted tokens per logical expert in one kernel.
+
+    Replaces `count_logical_experts_reference` on the serving path. Prediction's own GPU
+    work is small — about 2.2 ms per prefill window — but it added roughly 700 launches,
+    and
+    the token collectives then grew 39.9 ms with the same kernel count and byte volume:
+    the launches desynchronise the DP ranks and the collectives absorb the skew. That
+    cost
+    is linear in the number of predicting layers, so removing launches removes cost
+    proportionally. Ticket 03.
+
+    Args and semantics are identical to the reference, which the tests assert by
+    equality.
+    """
+    out.zero_()
+    num_tokens = logical_ids.shape[0]
+    if num_tokens == 0:
+        return out
+
+    flat = logical_ids.reshape(-1)
+    topk = flat.numel() // num_tokens
+    # Contiguous so the flattened index arithmetic matches the kernel's, whatever view
+    # the
+    # router returned.
+    if not flat.is_contiguous():
+        flat = flat.contiguous()
+
+    BLOCK = 1024
+    grid = (triton.cdiv(flat.numel(), BLOCK),)
+    _count_logical_experts_kernel[grid](
+        flat,
+        num_unpadded,
+        out,
+        flat.numel(),
+        topk,
+        num_logical_experts,
+        BLOCK=BLOCK,
+    )
+    return out
+
+
 class CrossLayerLoadPredictor:
     """Predicts one target MoE's logical-expert load from the current MoE.
 
@@ -166,30 +311,37 @@ class CrossLayerLoadPredictor:
                 "Predictive expert replication requires EPLB per-forward state; "
                 "EplbState.prepare_forward must run before the model forward."
             )
-        is_valid = (
-            torch.arange(num_tokens, device=hidden_states.device)
-            < num_unpadded[dbo_current_ubatch_id()]
+        # `num_unpadded_tokens_tensors` is a **list** of per-ubatch scalars, so this
+        # indexes
+        # rather than slices — a list slice would hand the kernel a Python list and
+        # Triton
+        # would refuse to specialize it. The ubatch id matters even though DBO is
+        # rejected by
+        # configuration validation: reading ubatch 0's count unconditionally is the kind
+        # of
+        # wrong that shows up only once someone enables the thing.
+        # Triton where there is a GPU, the reference otherwise. This branches on a
+        # *device
+        # capability*, which is a static property identical on every rank, not on
+        # per-rank
+        # state — so it is not the class of decision that has deadlocked this branch.
+        # The CPU
+        # path exists because the deterministic behaviour of this counting is asserted
+        # by
+        # CPU-only unit tests, which is where padding boundaries and out-of-range ids
+        # are
+        # cheapest to pin.
+        count = (
+            count_logical_experts_triton
+            if logical_ids.is_cuda
+            else count_logical_experts_reference
         )
-
-        flat_ids = logical_ids.reshape(num_tokens, -1)
-        weights = is_valid.to(counts.dtype).unsqueeze(1).expand_as(flat_ids)
-        # Copy before masking: `.to()` is a no-op when the router already returns
-        # int64, and an in-place clamp would then write through to the tensor
-        # `select_logical_experts` just handed back, breaking its read-only
-        # contract for any other caller.
-        indices = flat_ids.reshape(-1).to(dtype=torch.int64, copy=True)
-        # An id outside the logical range must contribute nothing rather than be
-        # folded into a neighbouring expert's count, which would wrongly attribute
-        # load to a real expert. The weight excludes it; the clamp only keeps
-        # `scatter_add_` in bounds. Deliberately not checked on the host: that
-        # would synchronize every layer of every forward, which is the cost this
-        # whole path is written to avoid. The router's expert count is validated
-        # once at bind time instead.
-        in_range = (indices >= 0) & (indices < self.num_logical_experts)
-        masked_weights = weights.reshape(-1) * in_range.to(counts.dtype)
-        indices.clamp_(0, self.num_logical_experts - 1)
-        counts.scatter_add_(0, indices, masked_weights)
-        return counts
+        return count(
+            logical_ids,
+            num_unpadded[dbo_current_ubatch_id()],
+            self.num_logical_experts,
+            counts,
+        )
 
     def start_snapshot(self, local_counts: torch.Tensor) -> None:
         """Begin the predicted-count AllGather on the EPLB group.

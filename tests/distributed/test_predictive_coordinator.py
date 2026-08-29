@@ -49,16 +49,25 @@ class _FakeComm:
 
 
 class _FakeEvent:
-    """Stands in for a CUDA event; records that it was waited on."""
+    """Stands in for a CUDA event, counting host blocks and stream waits apart.
+
+    The two are not interchangeable and the distinction is the point: `synchronize`
+    blocks the host and is correct only where the host reads the data, while `wait`
+    orders a stream and leaves the CPU running ahead.
+    """
 
     def __init__(self):
         self.synchronized = 0
+        self.stream_waits = 0
 
     def record(self, stream=None):
         pass
 
     def synchronize(self):
         self.synchronized += 1
+
+    def wait(self, stream=None):
+        self.stream_waits += 1
 
 
 def _coordinator(
@@ -130,7 +139,13 @@ class TestPhasesHappenAtTheRightLayers:
         coordinator.plan_and_launch()
         placements = coordinator.activate(2)
         assert placements
-        assert coordinator.last_event.synchronized == 1
+        assert coordinator.last_event.stream_waits == 1, (
+            "the transfer must be waited for on the stream"
+        )
+        assert coordinator.last_event.synchronized == 0, (
+            "and not on the host: everything that consumes the weights is enqueued "
+            "afterwards, so blocking the CPU only costs its run-ahead"
+        )
 
     def test_activating_a_layer_with_nothing_pending_returns_nothing(self):
         coordinator = _coordinator()
@@ -213,16 +228,16 @@ class TestWaitingIsNeverPerRank:
 
         source = inspect.getsource(predictive_coordinator)
         assert ".query()" not in source, (
-            "event.query() is per-rank timing; use synchronize() so every rank "
-            "proceeds on the same layer"
+            "event.query() is per-rank timing; wait unconditionally, with "
+            "synchronize() or wait(), so every rank proceeds on the same layer"
         )
 
     def test_both_phases_wait(self):
         coordinator = _coordinator()
         coordinator.record_prediction(source_layer=0, predicted=_skewed())
-        coordinator.plan_and_launch()  # waits for the snapshot copy
-        coordinator.activate(2)  # waits for the transfer
-        assert coordinator.last_event.synchronized == 1
+        coordinator.plan_and_launch()  # blocks the host for the snapshot copy
+        coordinator.activate(2)  # orders the stream behind the transfer
+        assert coordinator.last_event.stream_waits == 1
 
     def test_the_coordinator_takes_no_per_rank_flag(self):
         """Nothing like `is_dummy` may reach a decision that gates a collective."""
@@ -254,6 +269,9 @@ class TestTheSnapshotEventBelongsToTheCopyStream:
                 recorded.append(stream)
 
             def synchronize(self):
+                pass
+
+            def wait(self, stream=None):
                 pass
 
         coordinator = _coordinator()
@@ -467,6 +485,46 @@ class TestDecodeForwardsRunNoPlacement:
             "revert the replica prefill placed and force it to be transferred again"
         )
 
+    def test_a_decode_forward_that_never_predicts_leaves_placement_alone(self):
+        """The real decode sequence: no `record_prediction` call at all.
+
+        `MoERunner._prediction_is_worth_it` holds the *same* `BLOCK_SIZE_M` bar as this
+        coordinator, so on a decode forward prediction is skipped in the runner and
+        `record_prediction` never runs. The test above hands the coordinator a thin
+        prediction instead, which is a sequence the runner cannot produce, and that is
+        why it passed while this one does not.
+
+        With nothing recorded, suppression must still hold. Otherwise
+        `activate_and_publish` publishes an empty desired set on every layer of every
+        decode and dummy forward, reverting what prefill placed — which also defeats
+        `reconcile`'s "transfer only the difference" on any mixed traffic, since
+        `_active` is empty again by the next prefill forward.
+        """
+        published: list[tuple[int, list]] = []
+        coordinator = _coordinator(min_tokens_per_expert=128.0)
+        coordinator._publish = lambda layer, placements: published.append(
+            (layer, placements)
+        )
+        coordinator.record_prediction(
+            source_layer=0, predicted=torch.tensor([[7000.0, 1000.0, 1000.0, 1000.0]])
+        )
+        coordinator.plan_and_launch()
+        coordinator.activate_and_publish(layer=2)
+        assert published, "the prefill forward must have published"
+        published.clear()
+
+        # A decode forward: the runner predicts nothing, so nothing is recorded.
+        coordinator.note_forward_token_load(tokens_per_expert=25.0)
+        for layer in range(4):
+            assert coordinator.plan_and_launch() == []
+            coordinator.activate_and_publish(layer=layer)
+
+        assert published == [], (
+            "a decode forward that never predicted must not publish. Publishing an "
+            "empty set reverts every layer's replica, so the next prefill forward "
+            "re-transfers all of them."
+        )
+
 
 class TestOnlyTheDifferenceIsTransferred:
     """A replica already resident needs no transfer.
@@ -576,4 +634,62 @@ class TestTheSnapshotStaysInteger:
         _target, host, _event = coordinator._recorded
         assert host[0].item() == 8 * 2**28, (
             f"got {host[0].item()}; the sum wrapped in int32 instead of promoting"
+        )
+
+
+class TestTheTransferBudgetChargesForTransfers:
+    """`max_transfers_per_forward` must bound transfers, which is what its name says.
+
+    It previously charged the whole plan, before `reconcile` removed the placements
+    already
+    resident, so it bounded *coverage*: a steady state that moved no bytes still
+    exhausted
+    the budget and starved the later layers of the model. Bytes in flight are a separate
+    bound, `max_concurrent_transfer_bytes`.
+    """
+
+    def test_a_resident_replica_costs_no_budget(self):
+        coordinator = _coordinator(budget=1, layers=8, lookahead=2)
+        published: list[tuple[int, list]] = []
+        coordinator._publish = lambda layer, placements: published.append(
+            (layer, placements)
+        )
+
+        # First forward: layer 2 places, which spends the single unit of budget.
+        coordinator.note_forward_token_load(tokens_per_expert=4096.0)
+        coordinator.record_prediction(source_layer=0, predicted=_skewed())
+        first = coordinator.plan_and_launch()
+        coordinator.activate_and_publish(layer=2)
+        assert first, "the first forward must place something"
+        transfers_after_first = coordinator.communicator.executed
+        assert transfers_after_first > 0
+
+        # Second forward, same load: the same placement is wanted and already resident,
+        # so
+        # nothing moves and nothing is charged.
+        coordinator.note_forward_token_load(tokens_per_expert=4096.0)
+        coordinator.record_prediction(source_layer=0, predicted=_skewed())
+        second = coordinator.plan_and_launch()
+
+        assert second == first, "the same load must want the same placement"
+        assert coordinator._spent == 0, (
+            "a resident replica moves no bytes, so it must not consume the budget"
+        )
+
+    def test_the_budget_still_stops_real_transfers(self):
+        """The bound has to bind, or one wrong behaviour was traded for another."""
+        coordinator = _coordinator(budget=1, layers=8, lookahead=2)
+
+        coordinator.note_forward_token_load(tokens_per_expert=4096.0)
+        coordinator.record_prediction(source_layer=0, predicted=_skewed())
+        coordinator.plan_and_launch()
+        coordinator.activate_and_publish(layer=2)
+
+        # A different layer, different expert, same forward: the budget is gone, so it
+        # must not transfer.
+        other = _skewed()
+        other[0], other[7] = 1.0, 40.0
+        coordinator.record_prediction(source_layer=1, predicted=other)
+        assert coordinator.plan_and_launch() == [], (
+            "a second layer must be refused once the budget is spent"
         )

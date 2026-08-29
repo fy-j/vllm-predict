@@ -30,6 +30,332 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 - **The cost is host synchronisation, not the transfers.** See the section below
   before touching anything.
 
+## Where the work stands, 2026-08-29 evening
+
+The spec was rewritten around **Device-planned placement** and the ticket set replaced; the
+old tickets are in `issues/superseded/` with a note on why, because their measurements are
+still cited. The new set is `issues/01`-`10`.
+
+**Delivered tonight.** Ticket 03: the predicted-count path is one Triton kernel instead of
+about twelve elementwise operations, tested by equality against the retained reference over
+200 randomised cases. Ticket 02 in part: `prediction_lookahead_layers=1` is now rejected
+(its overlap window is currently zero, which nothing caught before), and
+`max_transfers_per_forward` charges for transfers after reconciliation rather than for
+planned placements, so it bounds what its name says. 214 predictive tests pass, lint clean.
+
+**And it corrected the projection this ticket set was ordered on.** Launches per source layer
+fell 17.2 to 7.1, a 59% cut, but the extra collective waiting fell only 17%. Separating the
+two components — fusion moves launches only, where the earlier layer-count test moved
+everything together — gives **2.21 ms per layer that scales with launches (30%) and 5.28 ms
+that does not (70%)**, and the fixed part is essentially the host synchronisation, since the
+snapshot AllGather is under 2% of it. So the prediction arm extrapolates to about **+6.3%**
+mean TTFT rather than the +2.7% previously projected here.
+
+**Ticket 06 therefore matters more than ticket 03.** Removing the host synchronisation
+attacks 70% of prediction's added cost; the kernel attacked 30% and has delivered its share.
+Against the 5.05% ceiling, +6.3% is still above it and only the device-side plan can bring it
+below. Details in `bench/RESULTS.md`, 2026-08-29 (ticket 03).
+
+## VERDICT, 2026-08-29 (H100 SXM): negative, and this time about the mechanism
+
+Read this before planning any further work. `bench/RESULTS.md`, 2026-08-29, carries the
+evidence.
+
+Ticket 14's missing third arm was measured, and it settles the project:
+
+| arm | mean TTFT | vs stock |
+| --- | --- | --- |
+| feature fully disabled | 184.70 ms | — |
+| prediction on, placement withheld | 198.81 ms | **+7.6%** (upper bound: also records load, 17-row layout) |
+| placing, all 43 reachable layers | 242.79 ms | **+31.5%** |
+
+    perfect balance ceiling                     5.05% of a prefill step
+    what 24.0% of the excess actually delivered 1.21% of a prefill step
+    prediction alone                           +7.6% mean TTFT  = 1.51x the ceiling
+    the whole feature                         +31.5% mean TTFT  = 6.2x the ceiling
+
+**Prediction and its infrastructure cost more than perfect expert balance could ever
+return**, before a single replica moves. That is the finding, and it is different in kind from the 5090's:
+that one was about the interconnect, this one is about the mechanism. Ticket 13 removes
+the host synchronisation and with it most of placement's +22.1%, but it does not touch
+prediction's +7.6% — that is 43 extra gate matmuls and 43 extra AllGathers per forward,
+one per source layer, and a device-side plan leaves every one of them. So the ceiling
+sits below the floor on the fastest interconnect NVIDIA ships, and the conclusion
+transfers to the Ascend port rather than being a fact about this node.
+
+The mechanics all work, and worked better than before: `max_replicas_per_layer=1` took
+coverage from 22 layers to **all 43 reachable ones** and lifted recovered prefill excess
+from 15-17% to **24.0%**, about 69% of the offline oracle. The feature is not broken. It
+is correctly built and the arithmetic does not close.
+
+**Two refinements, both from measurement after the verdict was written.**
+
+*The batched cross-layer snapshot is not the escape*, and it was the one I named. The 43
+prediction AllGathers were traced on this node: own stream, **9.3 us p50, 0.40 ms per
+forward, 4% of the expert-GEMM window they hide in, and a 5% spread between p50 and max**.
+The 5090's two-thousand-fold spread on the same 4 KiB payload — the arrival skew that made
+43 barriers look expensive — does not exist here. Collapsing them to one saves 0.40 ms
+against a 7.6% cost. Closed.
+
+*The cost is prediction's compute, and `+7.6%` is an upper bound rather than prediction
+alone.* Arm `0` also enables EPLB actual-load recording and carries the 17-row layout, so
+it is not a clean isolate. What prediction does contribute is launches: about 15 kernels
+per source layer — gate GEMM, top-k, and a dozen elementwise ops in
+`predict_local_counts` — which is roughly **645 of the ~1910 kernels in a prefill
+window**, each also a host-side Python dispatch, in an eager engine.
+
+So the remaining question is narrow and cheap: one profiled `off` arm, diffed against the
+existing `budget=0` trace on kernel count and busy time. It separates prediction's compute
+from the recording and the layout, and decides whether a fused counting kernel is worth
+writing. It would have to bring the cost under about 2% to leave room under the 5.05%
+ceiling, and it cannot touch the gate GEMM or the top-k, which are what predicting *means*.
+
+Do not start `04`, `05`, `07`, `08` or the rest of `13` without an explicit decision that
+accounts for this.
+
+## H100 SXM, 2026-08-29: the ceiling tripled, and ticket 13 is unblocked
+
+First measurements on the new node. Full numbers in `bench/RESULTS.md`, 2026-08-29.
+
+- **8x H100 80GB HBM3, NV18 between all pairs** — SXM with a full NVSwitch fabric, so
+  handoff step 0 is answered on the favourable side.
+- **A genuine build of this tree**, `VLLM_USE_PRECOMPILED=1 uv pip install -e .` on
+  torch 2.13.0+cu130, first try. Ticket 05's precondition is met here for the first time;
+  the 5090 node only ever had symlinked kernels from another commit.
+- **`probe_nvshmem.py` passes 5 of 5**, 9.00 MiB put at **33.0 us** against PCIe's 289.
+  A plain CUDA event orders the consumer, so no fence and no flag polling. **Ticket 13
+  is unblocked.** Note that a 33 us put is not faster than the 40 us NCCL P2P copy — the
+  entire value is that the host never reads the plan.
+- **One Attention block now hides an expert transfer.** 37.5 us of Attention projections
+  at 512 tokens per rank against a 40.6 us transfer, where PCIe hid 18%. The operator's
+  intended pipeline shape is feasible on bandwidth; what still blocks it is hook
+  position and the host sync (audit finding 1 below).
+- **Expert GEMM is 10.76% of attributed prefill GPU time**, against 3.67% on the 5090.
+  So the ceiling is roughly **5% of a prefill step**, up about 3x from 1.37%-1.73%.
+  Baseline mean TTFT 303.61 ms.
+- **Collectives are 77% and went *up* from 66%.** Not bandwidth: at concurrency 8 over
+  DP=8 the ranks are unevenly loaded and most of it is waiting for the slowest. dp0
+  attributed 24.3 ms against dp7's 136.2 ms. So 10.76% is a **floor** on MoE's share,
+  and an evenly loaded point would raise it. A concurrency sweep would pin it.
+- **The KV constraint that closed decode is no longer binding at short contexts.**
+  643,873 KV tokens per rank puts 5024 concurrent decode tokens in reach at 1024
+  context, clearing the one-block bar by 2.45x, where the 5090 reached 464. This does
+  not reopen decode on its own — see `RESULTS.md` for the three things that gate it,
+  one of which is audit finding 5.
+
+## Code audit, 2026-08-29: where the implementation and the documents disagree
+
+Read this alongside the profiling section below. Nothing here is a new measurement;
+it is the code read against `spec.md` and the tickets. Two findings are runtime
+claims that have **not** been confirmed by a test and say so. Each finding ends with
+the decision it opens, which is the operator's.
+
+### 1. The intended overlap shape is not what runs, and the hooks cannot express it
+
+The design as stated by the operator: predict layer `i + 1`'s load at layer `i`,
+complete the transfer and the routing-map update during layer `i + 1`'s **Attention**,
+so layer `i + 1`'s MoE executes with the replica already live.
+
+What runs: both `plan_and_launch` and `activate_and_publish` sit at the **head of the
+MoE module's forward** (`moe_runner.py:952` and `:957`), as adjacent statements. There
+is no hook at a decoder-layer boundary — `qwen3_moe.py` only binds prediction targets.
+So:
+
+| lookahead | launch point | wait point | window |
+| --- | --- | --- | --- |
+| 2 (default) | head of layer `L+1`'s MoE | head of layer `L+2`'s MoE | `L+1`'s whole MoE **plus** `L+2`'s Attention |
+| 1 | head of layer `L+1`'s MoE | next statement, same layer | **zero** |
+
+The wait point is where the intended design wants it — immediately after that layer's
+Attention. The **launch** point is the problem: it is also a MoE head, so the window is
+one full extra MoE layer wider than intended at `lookahead=2`, and empty at
+`lookahead=1`. `prediction_lookahead_layers=1` passes config validation and silently
+exposes the entire transfer.
+
+Why it was built this way: the planner runs on the host, the snapshot is not complete
+until after the predicting layer's dispatch and AllGather, and synchronising on the
+host copy inside the predicting layer stalls that layer. Splitting `record_prediction`
+from `plan_and_launch` across a layer boundary buys the async copy a layer of compute
+to land in, at the cost of one layer of extra distance. That is a deliberate trade and
+it is not written down anywhere; the spec's lookahead discussion is about prediction
+accuracy versus window size and does not mention it.
+
+To get the intended shape the launch must move to the **tail** of layer `L`'s MoE,
+after `finish_snapshot`, leaving layer `L+1`'s Attention as the window. That puts the
+host sync immediately after the copy is issued, so it needs either a device-side plan
+with a one-sided put (ticket 13, needs NVLink) or an accepted exposed sync.
+
+**Also note the regime shift.** `prediction_lookahead_layers=2`'s justification — one
+layer's Attention is 23 to 31 us at up to 128 tokens per rank and 98 us at 512, against
+a 175 us transfer — was measured in the decode regime. In prefill at 2k+ tokens per
+rank one Attention is several hundred microseconds, so a single Attention block may
+already hide a PCIe transfer and `lookahead=1` may be viable *if* the hooks move.
+Unmeasured, and it would halve the prediction distance, which ticket 10 measured as the
+accurate one anyway.
+
+**Decision open:** keep the two-layer split, or move the launch to the predicting
+layer's tail and pay the sync.
+
+### 2. The online planner is per layer, which accounts for 15-17% versus the oracle's 33-35%
+
+`plan_and_launch` calls `plan_replicas(host.unsqueeze(0), ...)`
+(`predictive_coordinator.py:233`) — a **single row**, one target layer. `plan_replicas`'
+cross-layer ranking loop therefore never has a second candidate to compare. The
+spec's section 6 contract, "one list of candidate placements ranked across all layers",
+exists only in the offline `bench/imbalance.py:plan_moves`, which is a different
+implementation and is where the oracle figure comes from.
+
+This is forced by causality, not an oversight: when layer `L+1` plans for layer `L+2`,
+no later layer's prediction exists yet. It cannot be fixed by ranking harder.
+
+What it costs is **allocation order**. Layers are visited in increasing index order and
+each takes `min(remaining, max_replicas_per_layer)`, so the budget is spent
+first-come-first-served by layer index. At the measured `max_transfers_per_forward=43`
+and `max_replicas_per_layer=2`:
+
+    targets 5..25 take 2 each = 42, target 26 takes 1  ->  budget exhausted
+    targets 27..47 get nothing, on every forward
+
+**22 covered layers, always the lowest-indexed 22.** That is exactly the "coverage
+steady at 22 layers" and "22 layers removes 16.9%" already recorded below — it is
+`43 / 2`, not a property of the workload. Offline at the same budget and the same
+per-layer cap, global ranking reaches **31.8 layers and 34.9%**, because it gives most
+layers one and only the worst layers two.
+
+So `Not yet validated` item 3 is answered: the gap is coverage, not accuracy (ticket 10
+already ruled accuracy out at 33.2%) and not only "the online planner's causality" in
+the abstract. `spec.md` section 6's claim that `max_replicas_per_layer` is "a per-layer
+safety cap and not the allocation target" is **false of the implementation**: per-layer
+greedy always fills to the cap.
+
+Three fixes, none needing new mechanism, in increasing cost:
+
+1. `max_replicas_per_layer=1` with budget 43 — 43 reachable layers, one each, full
+   coverage.
+2. budget 86 with the cap at 2 — full coverage at two each. Spec section 6's own
+   measurement puts uniform per-layer spending at 1.245 critical path against global
+   ranking's 1.2258 at 86 placements, so uniform is about 1.6% behind the oracle.
+3. Allocate the per-layer share from the **previous** forward's per-layer excess, and
+   choose experts from the current prediction. This is not the cross-forward residency
+   that measured -20.0%: that moved placements, this moves only a budget share, which
+   is a far more stable statistic.
+
+Raising the budget does not raise steady-state bytes, because `_spent += len(plan)`
+counts placements *before* `reconcile` (see finding 4) — but that only holds once
+finding 3 is fixed.
+
+**None of this changes the verdict.** Against a corrected ceiling of 1.37%-1.73% of a
+prefill step, going from 15% to 33% of the excess moves the saving from 0.29% to about
+0.6% of a step, against a measured cost of +11% TTFT. It closes an open question and it
+is the only honest baseline for an H100 comparison. It does not make the feature pay on
+PCIe.
+
+**Decision open:** which fix, and whether to verify it offline first (all three are
+scoreable from existing dumps with `plan_moves`, no GPU needed).
+
+### 3. CONFIRMED and FIXED: decode and dummy forwards reverted every layer's replicas
+
+Reproduced 2026-08-29 by driving the coordinator with the runner's real decode sequence
+— a prefill forward places, then a forward that never calls `record_prediction`:
+
+    prefill published: [(layer 2, 2 placements)]
+    decode published:  [(0, 0), (1, 0), (2, 0), (3, 0)]   <- empty set = revert
+
+Fixed by `PlacementCoordinator.note_forward_token_load`, called from the runner at the
+forward's first MoE layer with `num_tokens_across_dp_cpu`-derived tokens per expert, so
+suppression is decided from a value every rank agrees on *before* anything is recorded.
+`_gated` is renamed `_suppressed`, per the glossary rule that reserves "gate" for the MoE
+routing gate. The regression test is
+`test_a_decode_forward_that_never_predicts_leaves_placement_alone`.
+
+Note why the existing test missed it: `test_a_gated_forward_leaves_what_prefill_placed_alone`
+hands the coordinator a *thin prediction* on the decode forward, which the runner cannot
+produce — it skips prediction on the same bar, so nothing is recorded at all. The test
+encoded a sequence that does not occur.
+
+The code trace, for the record:
+
+`plan_and_launch` returns at `if self._recorded is None` **before** it can ever set
+`_gated` (`predictive_coordinator.py:192` versus `:219`). On a decode forward
+`_recorded` is never set, because `moe_runner.py:962`'s `_prediction_is_worth_it()`
+skips prediction on the same `BLOCK_SIZE_M` bar, so `record_prediction` never runs. The
+two gates always agree, and that agreement is what makes `_gated` unreachable.
+
+`_gated` therefore keeps the `False` any prefill forward left it at, so
+`activate_and_publish` proceeds, `activate` finds no pending entry, and
+`publish(layer, [])` reverts that layer — an empty desired set is the revert trigger by
+design. On all 48 layers, on every decode forward, and on every `execute_dummy_batch`
+(the placement branch has no `is_dummy` guard).
+
+If it holds, then: the comment "Leave this layer exactly as the last prefill forward
+left it" describes behaviour that does not happen; "transfer only the difference" fails
+under any mixed traffic, because `_active` is empty again by the next prefill forward,
+so all 43 experts and 387 MiB move again; and the **+3.0% decode-with-resident-replicas
+measurement was not measuring resident replicas**, which weakens one side of the
+cross-forward residency contradiction in `Not yet validated` item 5.
+
+Cheapest confirmation: a unit test that calls `activate_and_publish` with nothing
+recorded and asserts no revert. On hardware, count `ncclDevKernel_SendRecv` per prefill
+forward — full budget every forward means no reuse.
+
+**Decision open:** fix by setting `_gated` from the token count before the
+`_recorded is None` return, or by making the runner skip the placement branch on the
+same condition it skips prediction. The second is narrower but leaves two places
+holding the same bar.
+
+### 4. Two bandwidth knobs do not do what their names and the spec say
+
+`max_transfers_per_forward` is incremented as `_spent += len(plan)` — **planned
+placements**, counted before `reconcile` removes the ones already resident. So it caps
+coverage, not transfers, and the documents that call it "the binding constraint" on
+bandwidth are describing something else.
+
+`max_concurrent_transfer_bytes` is **never read**. `grep` over `vllm/` finds it only in
+`config/parallel.py`. User story 15 and spec section 10 make it the binding constraint
+on bytes in flight — the reason a per-forward count was rejected — and it is not
+implemented. Nothing bounds expert-weight bytes in flight today.
+
+**Decision open:** implement the byte bound, or strike user story 15 and section 10's
+claim and state that the count is the only bound.
+
+### 5. `_MOE_BLOCK_SIZE_M = 128` is hardcoded and is both gates
+
+`eplb_state.py:78`. The same constant is the decode gate (`min_tokens_per_expert`, and
+the runner's `prediction_min_tokens_per_expert`) and the planner's `min_tokens` floor.
+This node has no tuned `E=128,N=768` config and the H200 one uses 128 only at
+M >= 1024, so on other hardware or other M the real block size may differ. Too small
+and the decode gate reopens a regime that is settled negative; too large and the
+planner rejects placements that would have paid.
+
+**Decision open:** read the selected `BLOCK_SIZE_M` from the kernel config at startup
+and carry it in the cost profile's fingerprint, or leave it pinned and assert the
+device matches.
+
+### 6. Ticket state misrepresents what is built
+
+`04`, `07` and `08` are marked unstarted, while a planner, a lifecycle
+(`reconcile`/revert/re-plan every forward), the weight transfer and the activation all
+run end to end. What is genuinely absent from them is the residency and hotness state
+machine, any consumer of the cost profile's four cost values, and the byte bound of
+finding 4. A reader following `Blocked by` will rebuild work that exists; a reader
+following `CLAUDE.md` will read that it works end to end. Both are in the tree.
+
+There is also no terminal ticket for the outcome the evidence currently points at.
+`05` is "validation and benchmark" and assumes a result worth validating.
+
+**Decision open:** re-status `04`/`07`/`08` as implemented in reduced form with the
+remainder listed, and add a terminal "report the negative result" ticket.
+
+### The gap that has no owner
+
+The feature's total cost is still unmeasured, because both arms of every runner enable
+prediction (see below). Prediction alone measured **19% of TPOT**. Its prefill cost is
+43 extra gate matmuls and 43 AllGathers per forward, of which 14.8% stays exposed —
+plausibly the same order as the entire 1.37%-1.73% ceiling, which would mean no planner
+and no interconnect can make the feature net positive here. This is the one measurement
+that can settle the project independently of hardware, it costs one extra arm, and no
+ticket owned it. Now `14`.
+
 ## What today's profiling settled (2026-08-26)
 
 Read this before optimising. Four earlier rounds of design chased the wrong cost.

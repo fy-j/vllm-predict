@@ -33,6 +33,7 @@ Run:
 
 from __future__ import annotations
 
+import inspect
 import os
 import statistics
 import sys
@@ -71,27 +72,55 @@ def main() -> int:
                 report(
                     "NVSHMEM importable", False,
                     "neither nvshmem.core nor pynvshmem; install NVSHMEM's Python "
-                    "bindings. Without them this design cannot be built at all and "
-                    "the fallback is raising the planning delay, which costs "
-                    "prediction accuracy.",
+                    "bindings with `uv pip install --extra-index-url "
+                    "https://pypi.nvidia.com nvshmem4py-cu13`. They are not on public "
+                    "PyPI, and `nvidia-nvshmem-cu13` alone ships only the C library. "
+                    "Without them this design cannot be built at all and the fallback "
+                    "is raising the planning delay, which costs prediction accuracy.",
                 )
             return 1
     if rank == 0:
         report("NVSHMEM importable", True, nvshmem.__name__)
 
     # (2) Symmetric heap after torch and NCCL are already initialised.
+    #
+    # UID bootstrap, not MPI: vLLM is not launched under mpirun and `mpi4py` must be
+    # built against the same MPI it runs with, which is a dependency this project will
+    # not take on. `get_unique_id(empty=True)` is how a non-root rank makes a
+    # correctly-typed receptacle for the broadcast — it is not an error path.
     try:
-        nvshmem.init(device=torch.cuda.current_device())  # type: ignore[attr-defined]
+        # `cuda.core.Device` since cuda-python 13; it was `cuda.core.experimental`
+        # before, and nvshmem4py's own docs still say the old path.
+        try:
+            from cuda.core import Device  # type: ignore
+        except ImportError:
+            from cuda.core.experimental import Device  # type: ignore
+
+        uid = [
+            nvshmem.get_unique_id(empty=rank != 0)  # type: ignore[attr-defined]
+        ]
+        dist.broadcast_object_list(uid, src=0)
+        dist.barrier()
+        nvshmem.init(  # type: ignore[attr-defined]
+            device=Device(),
+            uid=uid[0],
+            rank=rank,
+            nranks=world,
+            initializer_method="uid",
+        )
     except Exception as exc:  # noqa: BLE001
         if rank == 0:
             report("symmetric heap after NCCL", False, f"{type(exc).__name__}: {exc}")
         return 1
     if rank == 0:
-        report("symmetric heap after NCCL", True)
+        report("symmetric heap after NCCL", True, f"{nvshmem.n_pes()} PEs")
 
+    # `tensor`, not `empty`: nvshmem4py allocates symmetric memory and hands back a
+    # torch view in one call. `register_external_tensor` also exists, which matters
+    # more than this probe does — see the note at the end of this file.
     try:
-        send = nvshmem.empty((EXPERT_BYTES,), dtype=torch.uint8)  # type: ignore
-        recv = nvshmem.empty((EXPERT_BYTES,), dtype=torch.uint8)  # type: ignore
+        send = nvshmem.tensor((EXPERT_BYTES,), dtype=torch.uint8)  # type: ignore
+        recv = nvshmem.tensor((EXPERT_BYTES,), dtype=torch.uint8)  # type: ignore
     except Exception as exc:  # noqa: BLE001
         if rank == 0:
             report("9 MiB symmetric buffers", False, f"{type(exc).__name__}: {exc}")
@@ -102,24 +131,25 @@ def main() -> int:
     # (1) Stream-ordered put, so a plain CUDA event can order the consumer.
     peer = (rank + 1) % world
     stream = torch.cuda.Stream()
-    put = getattr(nvshmem, "put_on_stream", None) or getattr(
-        nvshmem, "putmem_on_stream", None
-    )
-    if put is None:
+    # Stream-orderedness is not a separate entry point here: `put` itself takes the
+    # stream and raises NotImplementedError when it is None. So the check is that the
+    # parameter exists, not that a `*_on_stream` name does.
+    put = getattr(nvshmem, "put", None)
+    takes_stream = put is not None and "stream" in inspect.signature(put).parameters
+    if not takes_stream:
         if rank == 0:
             report(
                 "stream-ordered put", False,
-                "only device-side put found. That needs a flag and polling, and "
-                "polling is per-rank timing — the divergence class that deadlocked "
-                "this branch twice. Reconsider before using it.",
+                "no host-initiated put taking a stream. A device-side-only put needs "
+                "a flag and polling, and polling is per-rank timing — the divergence "
+                "class that deadlocked this branch twice. Reconsider before using it.",
             )
         return 1
     if rank == 0:
-        report("stream-ordered put", True, put.__name__)
+        report("stream-ordered put", True, "nvshmem.core.put(..., stream=)")
 
     def one_put() -> None:
-        with torch.cuda.stream(stream):
-            put(recv, send, peer)  # type: ignore[misc]
+        put(recv, send, peer, stream=stream)  # type: ignore[misc]
 
     # Correctness: the neighbour's payload must land, and a CUDA event must be enough
     # to know it did. If `wait_event` is not sufficient the data will be wrong here.
@@ -149,7 +179,7 @@ def main() -> int:
         start, end = torch.cuda.Event(True), torch.cuda.Event(True)
         with torch.cuda.stream(stream):
             start.record(stream)
-            put(recv, send, peer)  # type: ignore[misc]
+            put(recv, send, peer, stream=stream)  # type: ignore[misc]
             end.record(stream)
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end) * 1000.0)

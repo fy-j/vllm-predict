@@ -12,6 +12,12 @@ forward against the 6 GiB of activations the collectives already move (+7%), and
 8.5 ms serialized against a ~200 ms prefill forward (4%). Both affordable, but the
 byte accounting and the serialized-span report must be sized for 48.
 
+**Partly implemented already**, by `transfer_replicas`. Read `CURRENT-STATUS.md`'s
+2026-08-29 code audit findings 3 and 4 first: `max_concurrent_transfer_bytes` is never
+read, so the byte bound this ticket owns does not exist yet, and the "transfer only the
+difference" reuse that sizes the per-forward count is suspected to be defeated on any
+mixed traffic.
+
 - [ ] The canonical owner sends and only the replica target receives, over the EPLB communicator on the predictive stream, into a shared staging workspace sized for one expert rather than one per layer.
 - [ ] The staging workspace reuses the leading row of the already-allocated expert transfer buffer, adding no memory. Its precondition, that native rearrangement never runs on the request path, is **already enforced and tested** — do not re-implement it, but do assert the reuse still depends on it.
 - [ ] Before a staging-to-slot copy overwrites a slot, the transfer waits for the event recorded when that slot was last read by a MoE kernel, and the target slot's contents are byte-identical to the canonical owner's afterwards.

@@ -43,7 +43,12 @@ _ANNOTATION = re.compile(r"execute_context_(\d+)\((\d+)\)_generation_(\d+)\((\d+
 _DETAILED_ANNOTATION = re.compile(r"execute_\d+_context_\d+\(")
 
 # Substring tests, because the mangled kernel names carry template arguments.
-_ATTENTION_MARKERS = ("flash_fwd", "flash::", "paged_attention", "flashinfer")
+_ATTENTION_MARKERS = (
+    "sparse_attn_fwd_kernel",
+    "QNormRope",
+    "_fused_inv_rope",
+    "mhc_",
+"flash_fwd", "flash::", "paged_attention", "flashinfer")
 
 
 def parse_annotation(name: str) -> tuple[int, int, int, int] | None:
@@ -64,6 +69,16 @@ def classify_kernel(name: str) -> str:
     if name.startswith("ncclDevKernel") or "nccl" in name:
         return "nccl"
     if "fused_moe_kernel" in name or "grouped_gemm" in name:
+        return "moe_expert"
+    # DeepSeek V4 runs DeepGEMM, whose MoE kernels are named for their *scheduler*
+    # rather than for the word "moe". A grouped scheduler is the tell: the expert GEMM
+    # is the only grouped one, and both of its halves carry it —
+    # `fp8_gemm_kernel<4096,4096,...GroupedWithOffsetScheduler>` is w13 (gate+up, output
+    # 2 x moe_intermediate) and `<4096,2048,...>` is w2 (down, K = moe_intermediate).
+    # Without this, DSV4's expert GEMM lands in "other" and the share reads near zero —
+    # a wrong number rather than an error. Matching on the substring "gemm" alone would
+    # be worse: the attention projections are `sm90_fp8_gemm_1d2d_impl` and are dense.
+    if "GroupedWithOffsetScheduler" in name or "GroupedMasked" in name:
         return "moe_expert"
     if any(marker in name for marker in _ATTENTION_MARKERS):
         return "attention"
@@ -91,13 +106,31 @@ class WindowAttribution:
     )
 
 
-def decode_windows(events: list[dict]) -> list[DecodeWindow]:
-    """Extract the pure-decode step windows from a trace's events.
+def decode_windows(
+    events: list[dict], phase: str = "decode"
+) -> list[DecodeWindow]:
+    """Extract one phase's step windows from a trace's events.
 
     Only `gpu_user_annotation` is used. Each step also emits a CPU-side
     `user_annotation` covering a wider span; counting both would double the step
     count and halve every per-step figure.
+
+    Args:
+        events: The trace's events.
+        phase: `"decode"` keeps only steps with no prefill token, which is what the
+            decode question needs and the default this module was written for.
+            `"prefill"` keeps only steps that carry prefill tokens, which is what
+            sets the *prefill* ceiling: balancing touches the expert GEMM alone, so
+            the ceiling is the expert GEMM's share of a prefill step times what
+            perfect balance can recover. Mixing the two phases is what this module
+            exists to prevent, so the two are never combined.
+
+    Raises:
+        ValueError: On an unknown phase, rather than silently defaulting, since a
+            typo would otherwise return the other phase's windows.
     """
+    if phase not in ("decode", "prefill"):
+        raise ValueError(f"phase must be 'decode' or 'prefill', not {phase!r}")
     windows = []
     detailed = 0
     for event in events:
@@ -110,8 +143,9 @@ def decode_windows(events: list[dict]) -> list[DecodeWindow]:
         if parsed is None:
             continue
         ctx_requests, ctx_tokens, gen_requests, gen_tokens = parsed
-        if ctx_requests or ctx_tokens:
-            continue  # any prefill token disqualifies the window
+        has_prefill = bool(ctx_requests or ctx_tokens)
+        if has_prefill != (phase == "prefill"):
+            continue  # a window of the other phase; never mix the two
         start = float(event["ts"])
         windows.append(
             DecodeWindow(
@@ -191,12 +225,12 @@ def summarize(rows: list[WindowAttribution], num_layers: int) -> dict:
     }
 
 
-def parse_trace(path: Path, num_layers: int) -> dict:
-    """Load one rank's trace and summarize its pure-decode steps."""
+def parse_trace(path: Path, num_layers: int, phase: str = "decode") -> dict:
+    """Load one rank's trace and summarize one phase's steps."""
     opener = gzip.open if path.name.endswith(".gz") else open
     with opener(path, "rt") as handle:  # type: ignore[operator]
         events = json.load(handle).get("traceEvents", [])
-    rows = attribute_windows(decode_windows(events), events)
+    rows = attribute_windows(decode_windows(events, phase), events)
     result = summarize(rows, num_layers)
     result["rank"] = path.name.split("_")[0]
     return result
@@ -206,6 +240,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace-dir", type=Path, required=True)
     parser.add_argument("--num-layers", type=int, default=48)
+    parser.add_argument(
+        "--phase",
+        choices=("decode", "prefill"),
+        default="decode",
+        help="which steps to attribute; prefill is what sets the prefill ceiling",
+    )
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
@@ -218,7 +258,7 @@ def main() -> None:
     per_rank, failed = [], []
     for path in paths:
         try:
-            per_rank.append(parse_trace(path, args.num_layers))
+            per_rank.append(parse_trace(path, args.num_layers, args.phase))
         except ValueError as exc:
             failed.append({"rank": path.name.split("_")[0], "reason": str(exc)})
 
@@ -228,6 +268,7 @@ def main() -> None:
 
     moe_per_layer = [r["moe_us_per_layer"] for r in per_rank]
     report = {
+        "phase": args.phase,
         "ranks_parsed": len(per_rank),
         "ranks_failed": failed,
         "per_rank": per_rank,

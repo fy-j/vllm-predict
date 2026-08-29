@@ -32,7 +32,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT_DIR="${1:-$HERE/results/e2e-placement}"
 MODEL="${MODEL:-/models/preset/Qwen/Qwen3-30B-A3B/v1.0}"
 PORT="${PORT:-8180}"
-BUDGETS="${BUDGETS:-0 43}"
+# Three arms by default: `off` is the stock server (ticket 14's missing denominator),
+# `0` enables prediction but withholds placement, `43` places. Any two of these answer
+# a different question, so quote which pair a number came from.
+BUDGETS="${BUDGETS:-off 0 43}"
 NUM_PROMPTS="${NUM_PROMPTS:-120}"
 CONC="${CONC:-64}"
 # Decode length. Short values raise the share of forwards that are prefill, which is
@@ -74,24 +77,44 @@ for budget in $BUDGETS; do
   # The env var only arms the path; the budget is `max_transfers_per_forward`, per the
   # spec. Its default of 4 was sized for decode and caps the ceiling at 1.0% of a
   # prefill step, so the placed arm asks for one per reachable layer.
-  ADDITIONAL=$(python3 -c "
+  # Three arms, and the third one is the point of ticket 14. `budget=off` is a
+  # genuinely stock server: no predictive config, so no `enable_eplb`, no redundant
+  # experts and no replica slots, which is also what prices the 432 MiB per rank and
+  # the startup layout normalization. `budget=0` still enables prediction and only
+  # withholds placement, so a 0-versus-43 comparison answers "what does placement cost
+  # on top of prediction" and never "what does the feature cost" — prediction alone
+  # measured 19% of TPOT. Every TTFT number in this branch before 2026-08-29 has that
+  # missing denominator.
+  FEATURE_ARGS=()
+  FEATURE_ENV=()
+  if [[ "$budget" == "off" ]]; then
+    echo "[e2e] arm=off: stock server, feature fully disabled"
+  else
+    ADDITIONAL=$(python3 -c "
 import json,sys
 cfg={'enabled': True, 'cost_profile_path': sys.argv[1]}
 if int(sys.argv[2]) > 0:
     cfg['max_transfers_per_forward'] = int(sys.argv[2])
 print(json.dumps({'predictive_expert_replication': cfg}))" "$PROFILE" "$budget")
+    FEATURE_ARGS=(
+      --additional-config "$ADDITIONAL"
+      --eplb-config '{"log_balancedness":true,"log_balancedness_interval":1,"step_interval":1000000000,"window_size":1000,"use_async":false}'
+    )
+    FEATURE_ENV=(
+      "VLLM_PREDICTIVE_PLACE_PER_FORWARD=$budget"
+      "VLLM_EPLB_DUMP_LOAD_PATH=$DUMP"
+      "VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS=0"
+    )
+  fi
 
-  VLLM_PREDICTIVE_PLACE_PER_FORWARD="$budget" \
-  VLLM_EPLB_DUMP_LOAD_PATH="$DUMP" \
-  VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS=0 \
+  env "${FEATURE_ENV[@]}" \
   python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" --port "$PORT" \
     --data-parallel-size 8 --enable-expert-parallel \
     --all2all-backend allgather_reducescatter --enforce-eager \
     --max-model-len 3072 --gpu-memory-utilization 0.88 \
     --max-num-seqs 64 --seed 0 --uvicorn-log-level warning \
-    --additional-config "$ADDITIONAL" \
-    --eplb-config '{"log_balancedness":true,"log_balancedness_interval":1,"step_interval":1000000000,"window_size":1000,"use_async":false}' \
+    "${FEATURE_ARGS[@]}" \
     >"$LOG" 2>&1 &
   PID=$!
 
@@ -127,20 +150,46 @@ print(json.dumps({'predictive_expert_replication': cfg}))" "$PROFILE" "$budget")
   # turns the one self-check into a false all-clear.
   placement_lines=$(grep -c "Predictive expert replication: activated" "$LOG" 2>/dev/null || true)
   placement_lines=${placement_lines:-0}
+  # String comparison, not `-eq`: `off` is not a number, and under `set -u` an
+  # arithmetic test treats it as a variable name and aborts the run after the arm has
+  # already served its whole benchmark.
+  if [[ "$budget" == "off" || "$budget" == "0" ]]; then
+    expect_placement=0
+  else
+    expect_placement=1
+  fi
   if [[ "$placement_lines" -gt 0 ]]; then
     echo "[e2e] $tag: $placement_lines placement log lines"
-    if [[ "$budget" -eq 0 ]]; then
-      echo "[e2e] $tag: UNEXPECTED - budget 0 placed replicas" >&2
+    if [[ "$expect_placement" -eq 0 ]]; then
+      echo "[e2e] $tag: UNEXPECTED - arm $budget placed replicas" >&2
     fi
-  elif [[ "$budget" -eq 0 ]]; then
-    echo "[e2e] $tag: no placement log line (correct for budget 0)"
+  elif [[ "$expect_placement" -eq 0 ]]; then
+    echo "[e2e] $tag: no placement log line (correct for arm $budget)"
   else
     echo "[e2e] $tag: NO PLACEMENT LOG LINE at budget $budget - arm was inert" >&2
   fi
-  [[ -s "$DUMP" ]] && echo "[e2e] $tag: $(wc -l < "$DUMP") forwards dumped" \
-                   || echo "[e2e] $tag: EMPTY DUMP" >&2
+  # The stock arm records no expert load by design, so an absent dump there is the
+  # expected outcome rather than the "measured nothing" failure it is on the others.
+  if [[ "$budget" == "off" ]]; then
+    echo "[e2e] $tag: no dump expected (feature disabled)"
+  else
+    [[ -s "$DUMP" ]] && echo "[e2e] $tag: $(wc -l < "$DUMP") forwards dumped" \
+                     || echo "[e2e] $tag: EMPTY DUMP" >&2
+  fi
 
-  kill -TERM "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; sleep 5
+  # Bounded teardown, then escalate. `kill -TERM` followed by a bare `wait` deadlocked
+  # a run: the DP=8 server did not die on SIGTERM, `wait` blocked forever, and the two
+  # remaining arms never started — 26 minutes of an idle 8-GPU server with the first
+  # arm's result already on disk and nothing in the log to say why. Never trust the
+  # graceful path to return here; the reap loop below depends on getting past this.
+  kill -TERM "$PID" 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    kill -0 "$PID" 2>/dev/null || break
+    sleep 2
+  done
+  kill -9 "$PID" 2>/dev/null || true
+  wait "$PID" 2>/dev/null || true
+  sleep 5
   for p in $(ps -eo pid,cmd --no-headers | grep "VLLM::" | grep -v grep | awk '{print $1}'); do kill -9 "$p" 2>/dev/null; done
   sleep 10
 done

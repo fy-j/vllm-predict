@@ -233,6 +233,8 @@ class _PlacementCoordinator(Protocol):
     as `object` it hid every call, including a rename of the publish entry point.
     """
 
+    def note_forward_token_load(self, tokens_per_expert: float) -> None: ...
+
     def plan_and_launch(self) -> list: ...
 
     def activate_and_publish(self, layer: int) -> list: ...
@@ -650,6 +652,34 @@ class MoERunner(MoERunnerInterface):
             fused_out,
         )
 
+    def _forward_tokens_per_expert(self) -> float | None:
+        """This forward's tokens per logical expert, or None if not establishable.
+
+        The count must be one every rank agrees on. `num_tokens_across_dp_cpu` is the
+        result of the DP coordination all-reduce, so it is identical on every rank and
+        already on the host. The **local** token count is not usable here: it differs
+        by rank under DP, and both `start_snapshot` and the placement path perform
+        collectives, so a per-rank decision would hang the engine — the failure this
+        branch has hit twice.
+
+        Returns:
+            Tokens per logical expert, or None when there is no DP metadata to read it
+            from, which keeps the diagnostic paths that run without one working.
+        """
+        context = get_forward_context()
+        dp_metadata = getattr(context, "dp_metadata", None)
+        if dp_metadata is None:
+            return None
+        across = getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
+        if across is None:
+            return None
+        config = self.moe_config
+        return (
+            int(across.sum())
+            * config.experts_per_token
+            / max(1, config.num_logical_experts)
+        )
+
     def _prediction_is_worth_it(self) -> bool:
         """Whether this forward can benefit from a placement at all.
 
@@ -659,31 +689,15 @@ class MoERunner(MoERunnerInterface):
         AllGather per layer for a result that is certain to be discarded: measured at
         7.3% of TPOT on a run where the placement gate rejected every forward.
 
-        The count must be one every rank agrees on. `num_tokens_across_dp_cpu` is the
-        result of the DP coordination all-reduce, so it is identical on every rank and
-        already on the host. The **local** token count is not usable here: it differs
-        by rank under DP, and `start_snapshot` performs an AllGather, so a per-rank
-        decision would hang the engine — the failure this branch has hit twice.
-
         Returns:
             True when the forward is large enough to be worth predicting, and when the
-            token count cannot be established, which keeps the diagnostic paths that
-            run without DP metadata working.
+            token count cannot be established.
         """
         if self.prediction_min_tokens_per_expert <= 0.0:
             return True
-        context = get_forward_context()
-        dp_metadata = getattr(context, "dp_metadata", None)
-        if dp_metadata is None:
+        per_expert = self._forward_tokens_per_expert()
+        if per_expert is None:
             return True
-        across = getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
-        if across is None:
-            return True
-        total = int(across.sum())
-        config = self.moe_config
-        per_expert = (
-            total * config.experts_per_token / max(1, config.num_logical_experts)
-        )
         return per_expert > self.prediction_min_tokens_per_expert
 
     def _sequence_parallel_context(self):
@@ -949,6 +963,15 @@ class MoERunner(MoERunnerInterface):
         # transfer aimed at *this* layer is waited for and activated, so this layer's
         # routing sees the replica rather than the canonical copy alone.
         if self.placement_coordinator is not None:
+            # Open the forward at its first MoE layer. Suppression cannot be derived
+            # from the snapshot: on a decode forward prediction is skipped below, so
+            # nothing is ever recorded, so the coordinator never reaches its own
+            # snapshot check and kept the previous prefill forward's answer — which
+            # made every decode and every dummy forward revert all 48 layers.
+            if self.moe_layer_index == 0:
+                per_expert = self._forward_tokens_per_expert()
+                if per_expert is not None:
+                    self.placement_coordinator.note_forward_token_load(per_expert)
             self.placement_coordinator.plan_and_launch()
             # Unconditional: an empty desired set is what reverts a replica the last
             # forward left on this layer. Gating on a non-empty activation left stale

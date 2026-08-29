@@ -8,6 +8,14 @@
 revision note below before implementing. Three criteria changed shape and one
 changed meaning; the lifecycle section is the part most affected.
 
+**Partly implemented already.** A planner and a reduced lifecycle run on this branch:
+`plan_replicas` chooses placements, `reconcile` keeps and reverts, and every forward
+re-plans. What is genuinely missing is the residency and hotness state machine, any
+consumer of the cost profile's four cost values, and the byte bound. Read
+`CURRENT-STATUS.md`'s 2026-08-29 code audit before starting — finding 2 shows the
+online planner is per layer and that this, not accuracy, is the 15%-versus-33% gap, so
+this ticket's cost model has less to fix than it looks.
+
 ## Revision note (2026-08-25)
 
 Measured on 1705 forwards across three domains (`bench/RESULTS.md`, 2026-08-25):
