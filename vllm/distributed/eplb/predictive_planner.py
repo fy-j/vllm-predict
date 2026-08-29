@@ -314,9 +314,7 @@ def apply_replica_maps(
         # row 11, and a replica on rank 0 sits at row 4 — so which index holds which
         # copy is not fixed. Assuming `[canonical, replica]` put the wrong row in the
         # map for exactly those cases.
-        canonical = canonical_row_of(
-            expert, per_rank_experts, replica_slots_per_rank
-        )
+        canonical = canonical_row_of(expert, per_rank_experts, replica_slots_per_rank)
         rows = sorted((canonical, replica_row))
         logical_to_physical[expert, 0] = rows[0]
         logical_to_physical[expert, 1] = rows[1]
@@ -521,3 +519,108 @@ def revert_replicas(
     for layer, _expert, target_rank in revert:
         view[layer, target_rank, canonical_per_rank] = -1
     return updated
+
+
+def plan_one_layer_on_device(
+    expert_load: torch.Tensor,
+    ep_size: int,
+    min_tokens: float,
+) -> torch.Tensor:
+    """One layer's placement, decided entirely on the device.
+
+    The device counterpart of `plan_replicas` at `max_replicas_per_layer = 1`, the
+    default. Ticket 04. It exists so the plan never has to reach the host: the host
+    synchronisation `plan_and_launch` performs once per predicted layer costs 5.28 ms of
+    collective waiting per layer, 70% of what prediction adds, and it is there only
+    because the planner runs in Python.
+
+    **Bit-identity with the host planner is a correctness property, not a nicety.**
+    Every rank derives the plan locally from the same snapshot, so a plan that differs
+    by rank pairs a sender with no receiver and hangs the engine. Two things make exact
+    agreement achievable rather than approximate:
+
+    * The snapshot is integer, and the only non-integer step is a halving, so every
+    value
+      here is exactly representable in float64. Comparisons and equalities therefore
+      mean
+      what they do in Python, and `gain == gain.max()` is safe.
+    * Reductions that could depend on block order are avoided. A device argmax over
+    floats
+      is order-dependent, and two ranks reducing the same values in a different order
+      can pick different experts; the winner is selected by an explicit lowest-index
+      rule over an equality mask instead.
+
+    Args:
+        expert_load: `[num_logical_experts]` predicted load, integer-valued, already
+            reduced across the EP group so every rank sees identical values.
+        ep_size: EP group size. Expert `e` belongs to rank
+            `e // (num_logical // ep_size)`.
+        min_tokens: Refuse a placement moving less than this. Below one `BLOCK_SIZE_M` a
+            replica saves no block, so it saves no time.
+
+    Returns:
+        A `[4]` int64 device tensor `(found, logical_expert, target_rank, moved_x2)`.
+        `found` is 0 or 1; the remaining entries are meaningless when it is 0.
+        `moved_x2` is twice the moved load, kept integral so the whole result stays
+        exact — the caller halves it if it needs the value.
+    """
+    num_logical = expert_load.numel()
+    if num_logical % ep_size != 0:
+        raise ValueError(
+            f"{num_logical} logical experts do not divide across {ep_size} EP ranks."
+        )
+    per_rank = num_logical // ep_size
+    load = expert_load.to(torch.float64)
+    rank_load = load.view(ep_size, per_rank).sum(dim=1)
+
+    empty = torch.zeros(4, dtype=torch.int64, device=expert_load.device)
+    if float(rank_load.sum()) <= 0.0:
+        # A dummy or padding-only forward. Checked on the host because this is the one
+        # value already known there — the caller decided to run at all from it.
+        return empty
+
+    # The first maximum, matching Python's `max(range(n), key=...)`, so ties go to the
+    # lowest rank id exactly as the host planner's do.
+    peak_load = rank_load.max()
+    peak = int((rank_load == peak_load).to(torch.int64).argmax())
+
+    peak_experts = load.view(ep_size, per_rank)[peak]
+    moved = peak_experts * 0.5
+
+    # Every (expert on the peak rank, target rank) pair at once. 16 x 8 x 8 values for
+    # this model, so materialising the trial loads is cheaper than being clever about
+    # it.
+    trial = rank_load.view(1, 1, ep_size).repeat(per_rank, ep_size, 1)
+    idx = torch.arange(ep_size, device=load.device)
+    trial[:, :, peak] -= moved.view(per_rank, 1)
+    trial[torch.arange(per_rank).view(-1, 1), idx.view(1, -1), idx.view(1, -1)] += (
+        moved.view(per_rank, 1)
+    )
+    gain = peak_load - trial.max(dim=2).values
+
+    admissible = (
+        (moved.view(per_rank, 1) >= min_tokens)
+        & (moved.view(per_rank, 1) > 0)
+        & (idx.view(1, ep_size) != peak)
+        & (gain > 0)  # relocating the peak is not lowering it
+    )
+    if not bool(admissible.any()):
+        return empty
+
+    # Strongest gain, then the lowest expert id, then the lowest target id. The
+    # flattened order is expert-major, so "first admissible index at the maximum gain"
+    # is exactly the host planner's tie-break, and taking it from an equality mask keeps
+    # the choice independent of how the reduction was scheduled.
+    masked = torch.where(admissible, gain, torch.full_like(gain, float("-inf")))
+    flat = masked.reshape(-1)
+    best = flat == flat.max()
+    winner = int(best.to(torch.int64).argmax())
+    offset, target = divmod(winner, ep_size)
+
+    out = empty.clone()
+    out[0] = 1
+    out[1] = peak * per_rank + offset
+    out[2] = target
+    # Twice the moved load, which is the original integer expert count.
+    out[3] = int(peak_experts[offset])
+    return out

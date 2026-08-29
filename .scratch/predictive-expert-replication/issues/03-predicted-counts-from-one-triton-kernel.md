@@ -45,6 +45,12 @@ claims are only worth making once a run that measured nothing cannot report succ
       per-rank state.
 - [x] Kernels per source layer measured before and after, from a profile restricted to the
       `execute_context_*` annotations. The expectation to test is 17.2 falling to about 5 to 6.
-- [ ] The three-arm TTFT re-measured. The prediction arm's cost against a stock server is the
+- [x] The three-arm TTFT re-measured — and the method could not resolve it. The stock arm
+      got 28% faster on mean TTFT and 40% on throughput between the two runs, on identical
+      workloads, so the baseline moved eight times further than the 5.05% ceiling. Within-run
+      ratios rose (prediction +7.6% -> +24.2%), which is consistent with a fixed overhead
+      against a faster baseline rather than with fusion failing; the same-run profile is what
+      showed fusion working. Ticket 08's method needs repeats or interleaved arms before any
+      TTFT verdict. Original wording: The prediction arm's cost against a stock server is the
       number this ticket exists to move; report it beside the 5.05% ceiling and beside the
       +7.6% it started from, whatever the result.

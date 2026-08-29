@@ -2043,3 +2043,60 @@ If removing the host sync recovers most of B, the floor lands near 1% and the fe
 positive for the first time. That remains an extrapolation, and the lesson from this ticket
 is precisely that a per-layer cost can have a large component the obvious lever does not
 touch.
+
+## Ticket 03's TTFT re-measurement: the method cannot resolve the effect
+
+Ran the three arms again with the fused kernel, at the configuration the earlier ones used
+(`ko`, 400 requests, CONC=8, OUT_LEN=1), to turn the extrapolated `+6.3%` into a measurement.
+The guard passed and the placed arm activated on all 43 reachable layers.
+
+| arm | before, mean TTFT | after, mean TTFT | before req/s | after req/s |
+| --- | --- | --- | --- | --- |
+| feature disabled | 184.70 ms | **132.21 ms** | 43.21 | **60.30** |
+| prediction only | 198.81 ms (+7.6%) | 164.20 ms (+24.2%) | 40.14 | 48.56 |
+| placing | 242.79 ms (+31.5%) | 258.21 ms (+95.3%) | 32.87 | 30.91 |
+
+**The two runs are not comparable, and the reason is in the first row.** The `off` arm is a
+stock server carrying none of this feature's code, and it got 28% faster on mean TTFT and 40%
+faster on throughput between the runs — same 400 requests, same 390,152 input tokens. Nothing
+in the commit can do that; the machine was simply in a better state, with weights and JIT
+caches warm after a day of runs. **The baseline moved eight times further than the ceiling
+being chased.**
+
+So no cross-run conclusion is available, and the honest statement is that this configuration
+cannot measure a 5% effect.
+
+### What the within-run ratios do and do not say
+
+Each run measures its own `off` arm minutes from the others, so within-run ratios are the
+defensible comparison. They say the feature costs *more* after fusion: prediction +7.6% ->
++24.2%, placing +31.5% -> +95.3%.
+
+That is consistent with fusion working rather than failing, which is worth spelling out. The
+feature's overhead is largely fixed per-layer host and launch work, and that does not shrink
+when the GPU-side and queueing parts of the baseline get faster. A fixed overhead against a
+40% faster baseline is a larger fraction of it. The same mechanism was recorded earlier from
+the profiling side: launch-bound behaviour gets relatively *worse* on faster hardware, since
+launch cost is unchanged while GPU work shrinks.
+
+The lower-variance measurement is the one that already showed fusion working, because both of
+its arms come from the same run: launches per source layer 17.2 -> 7.1, and the extra
+collective waiting 322.4 -> 266.5 ms, a 17% reduction.
+
+### Consequence for ticket 08
+
+Its method needs fixing before any TTFT verdict, and this is the ticket's own risk rather
+than a detail. Options, in increasing cost:
+
+* **Repeat each arm** several times within one run and report a distribution. Cheapest, and
+  it at least bounds the variance instead of ignoring it.
+* **Interleave the arms** rather than running them in sequence, so a drift in machine state
+  cannot land entirely on one of them. Requires restarting servers per block.
+* **Make the profile-based attribution primary** and TTFT supporting. GPU time inside
+  annotated windows is measured within a single run and has shown a 17% change cleanly,
+  where mean TTFT could not see 40%.
+* **Report throughput as well as TTFT.** It is less tail-sensitive and moved coherently in
+  both runs (43.21/40.14/32.87 and 60.30/48.56/30.91).
+
+Recorded as a warning rather than a fix: no TTFT number from this harness should be quoted
+across runs until arms are repeated or interleaved.
