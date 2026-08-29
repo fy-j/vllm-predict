@@ -79,10 +79,12 @@ def summarize(results_dir: Path, budget: str) -> dict:
     """Imbalance per assignment band, plus whether the run stayed healthy."""
     out: dict = {"budget": budget}
     dump = results_dir / f"dump-b{budget}.jsonl"
+    # A missing dump is noted but does not stop the rest. The `off` arm records no
+    # expert load by design, so returning early here left its served-request count and
+    # its log unread — and those are exactly what tells you whether that arm ran at all.
+    grouped = by_assignments(dump) if dump.exists() else {}
     if not dump.exists():
         out["missing"] = str(dump)
-        return out
-    grouped = by_assignments(dump)
     out["forwards"] = sum(len(v) for v in grouped.values())
     out["bands"] = {
         str(assignments): {

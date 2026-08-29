@@ -193,4 +193,11 @@ print(json.dumps({'predictive_expert_replication': cfg}))" "$PROFILE" "$budget")
   for p in $(ps -eo pid,cmd --no-headers | grep "VLLM::" | grep -v grep | awk '{print $1}'); do kill -9 "$p" 2>/dev/null; done
   sleep 10
 done
+# One guard over every arm, because the per-arm messages above only ever printed. Three
+# runs in this project reported success having measured nothing, and each of them printed a
+# warning to stderr and carried on.
+if ! python3 "$HERE/check_run_measured.py" --results-dir "$OUT_DIR" --arms $BUDGETS; then
+  echo "[e2e] MEASURED NOTHING - do not read $OUT_DIR" >&2
+  exit 5
+fi
 echo "[e2e] done; results in $OUT_DIR"

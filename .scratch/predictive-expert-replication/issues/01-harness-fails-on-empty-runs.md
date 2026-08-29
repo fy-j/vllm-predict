@@ -15,24 +15,30 @@ Every later ticket makes a measurement claim, so this one comes first.
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** DONE 2026-08-29. All three runners exit 5 with `MEASURED NOTHING` when an arm
+served no request, recorded no load where it should, was inert at a non-zero budget, placed
+where it must not, or activated replicas without being connected. The checks live in
+`check_run_measured.py` and reuse `analyse_e2e.summarize` and `is_connected` rather than
+reimplementing them, with 12 unit tests over minimal fixtures. Verified in both directions
+against real data: the healthy three-arm run passes, and the DSV4 run whose base checkpoint
+had no chat template — the incident this ticket exists for — fails.
 
-- [ ] Every runner exits non-zero and prints `MEASURED NOTHING` when its benchmark log
+- [x] Every runner exits non-zero and prints `MEASURED NOTHING` when its benchmark log
       carries no TTFT, or when no rank trace contains an `execute_context_*` annotation.
       Both conditions, not either: a served run with an empty trace is equally useless.
-- [ ] Teardown escalates rather than trusting the graceful path: SIGTERM, a bounded poll,
+- [x] Teardown escalates rather than trusting the graceful path: SIGTERM, a bounded poll,
       then SIGKILL, then reap the orphaned engine processes. A hung server must not consume
       the arms that follow it, and the reap must run — it currently sits after the unbounded
       wait and therefore never did.
-- [ ] The three-arm sweep is the default shape everywhere: feature disabled, prediction
+- [x] The three-arm sweep is the default shape everywhere: feature disabled, prediction
       only, placing. `budget=0` is not a baseline; it enables prediction and only withholds
       placement, and every TTFT figure in this project before 2026-08-29 was missing the
       disabled arm.
-- [ ] The connectivity self-check is asserted rather than printed: the activation log line
+- [x] The connectivity self-check is asserted rather than printed: the activation log line
       must appear, and the dumped physical per-rank load must diverge from canonical
       ownership by a non-zero amount. Zero divergence means no token reached a replica no
       matter what else looks healthy.
-- [ ] Verified by deliberately breaking one arm — a wrong endpoint, or a model with no chat
+- [x] Verified by deliberately breaking one arm — a wrong endpoint, or a model with no chat
       template — and observing the non-zero exit rather than a `done`.
-- [ ] The guard itself is covered: a unit test over a trace fixture with and without step
+- [x] The guard itself is covered: a unit test over a trace fixture with and without step
       annotations, so the guard cannot rot into a no-op.

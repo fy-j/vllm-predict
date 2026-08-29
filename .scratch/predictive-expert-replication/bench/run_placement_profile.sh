@@ -168,4 +168,16 @@ print(json.dumps({'profiler':'torch','torch_profiler_dir':sys.argv[1],
   done
   sleep 10
 done
+# Guarded for the same reason as the e2e runner, and additionally on the traces: this
+# script exists to produce an attribution, and an empty trace yields a share of zero, which
+# reads as a finding rather than as a failed capture.
+prof_failed=0
+for budget in $BUDGETS; do
+  python3 "$HERE/check_trace_nonempty.py" "$OUT_DIR/trace-b$budget" >/dev/null 2>&1 \
+    || { echo "[prof] arm $budget: traces carry no step annotation" >&2; prof_failed=1; }
+done
+if [[ "$prof_failed" -ne 0 ]]; then
+  echo "[prof] MEASURED NOTHING - do not read $OUT_DIR" >&2
+  exit 5
+fi
 echo "[prof] done; traces in $OUT_DIR"

@@ -1687,3 +1687,63 @@ def test_lookahead_of_two_remains_accepted(tmp_path):
 
     predictive = config.parallel_config.predictive_expert_replication_config
     assert predictive.prediction_lookahead_layers == 2
+
+
+class TestTheBlockSizeComesFromTheKernel:
+    """`BLOCK_SIZE_M` is asked of the kernel, not assumed.
+
+    The same number gates suppression and floors the planner's minimum move, so a
+    wrong value either reopens the decode regime settled negative, or rejects
+    placements that would have paid. It is also not a constant: it is selected per `M`
+    from the tuned configuration for an expert geometry, and the tuned files disagree
+    across devices. Tested against `try_get_optimal_moe_config` itself rather than a
+    hardcoded expectation, for the same reason the counting kernel is tested against its
+    reference: a number invented here could be wrong in the way I happened to imagine.
+    """
+
+    def _model(self, num_rows=17, inter=768, hidden=2048, top_k=8):
+        w13 = torch.zeros(num_rows, 2 * inter, hidden)
+        w2 = torch.zeros(num_rows, hidden, inter)
+        return SimpleNamespace(
+            expert_weights=[[w13, w2]],
+            moe_layers=[
+                SimpleNamespace(moe_config=SimpleNamespace(experts_per_token=top_k))
+            ],
+        )
+
+    @pytest.mark.parametrize("m", [8, 512, 8192, 65536])
+    def test_it_agrees_with_the_kernel_at_every_batch_size(self, m):
+        from vllm.distributed.eplb.eplb_state import resolve_moe_block_size_m
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            try_get_optimal_moe_config,
+        )
+
+        model = self._model()
+        expected = try_get_optimal_moe_config(
+            w1_shape=tuple(model.expert_weights[0][0].shape),
+            w2_shape=tuple(model.expert_weights[0][1].shape),
+            top_k=8,
+            dtype=None,
+            M=m,
+        )["BLOCK_SIZE_M"]
+
+        got = resolve_moe_block_size_m(model, top_k=8, num_batched_tokens=m)
+
+        assert got == expected
+
+    def test_a_model_it_cannot_read_falls_back_rather_than_raising(self):
+        """Startup must not die because the config could not be consulted.
+
+        The fallback is logged, because the mode it replaces is silently guessing.
+        """
+        from vllm.distributed.eplb.eplb_state import (
+            _MOE_BLOCK_SIZE_M_FALLBACK,
+            resolve_moe_block_size_m,
+        )
+
+        broken = SimpleNamespace(expert_weights=[])
+
+        assert (
+            resolve_moe_block_size_m(broken, top_k=8, num_batched_tokens=4096)
+            == _MOE_BLOCK_SIZE_M_FALLBACK
+        )

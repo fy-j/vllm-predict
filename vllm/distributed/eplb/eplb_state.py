@@ -73,9 +73,74 @@ from .rebalance_execute import (
 logger = init_logger(__name__)
 
 # The MoE kernel pads each expert's token list to a multiple of `BLOCK_SIZE_M`, so a
-# replica taking fewer tokens saves no block and no time. 128 is the bf16 default at the
-# post-allgather counts a prefill step reaches, which is the regime this path targets.
-_MOE_BLOCK_SIZE_M = 128
+# replica taking fewer tokens saves no block and no time. Used only as the fallback when
+# the kernel's own configuration cannot be resolved; `resolve_moe_block_size_m` is the
+# source of truth, because this number gates placement suppression *and* floors the
+# planner's minimum move, so a wrong value either reopens a regime that is settled
+# negative or rejects placements that would have paid.
+_MOE_BLOCK_SIZE_M_FALLBACK = 128
+
+
+def resolve_moe_block_size_m(
+    model: MixtureOfExperts,
+    top_k: int,
+    num_batched_tokens: int,
+    dtype: str | None = None,
+) -> int:
+    """The `BLOCK_SIZE_M` the fused MoE kernel will use, at a stated batch size.
+
+    Asked of the kernel rather than assumed. The value is not a constant: it is selected
+    per `M` from the tuned configuration for this expert geometry, and the tuned files
+    disagree
+    across devices — the H200 entry for one shape uses 128 only from `M >= 1024`.
+    Hardcoding it meant that on a device with no tuned configuration for `E=128,N=768`
+    the bar was a guess in both directions.
+
+    `M` matters, so the caller states it. The decision this feeds is "does a prefill
+    step put more than one block of tokens on each expert", so the batch size to ask
+    about is the largest a prefill step can present, not a decode-sized one.
+
+    Args:
+        model: The registered mixture-of-experts model, for its expert shapes.
+        top_k: Experts per token. Not on the `MixtureOfExperts` interface, so the caller
+            takes it from a layer's MoE config.
+        num_batched_tokens: The `M` to resolve at, post-allgather.
+        dtype: The fused-MoE dtype token, or None for an unquantised model.
+
+    Returns:
+        The selected `BLOCK_SIZE_M`, or the fallback if the kernel cannot be consulted —
+        which is logged, because silently guessing is what this function replaces.
+    """
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        try_get_optimal_moe_config,
+    )
+
+    try:
+        w13, w2 = model.expert_weights[0][0], model.expert_weights[0][1]
+        config = try_get_optimal_moe_config(
+            w1_shape=tuple(w13.shape),
+            w2_shape=tuple(w2.shape),
+            top_k=top_k,
+            dtype=dtype,
+            M=num_batched_tokens,
+        )
+        block = int(config["BLOCK_SIZE_M"])
+    except Exception:
+        logger.warning(
+            "Predictive expert replication could not resolve the MoE BLOCK_SIZE_M from "
+            "the kernel configuration; falling back to %d. The suppression bar "
+            "and the planner's minimum move both use it, so verify it against this "
+            "device's tuned configuration before trusting a result.",
+            _MOE_BLOCK_SIZE_M_FALLBACK,
+            exc_info=True,
+        )
+        return _MOE_BLOCK_SIZE_M_FALLBACK
+    logger.info(
+        "Predictive expert replication resolved MoE BLOCK_SIZE_M=%d at M=%d.",
+        block,
+        num_batched_tokens,
+    )
+    return block
 
 
 def _compute_eplb_load_stats(
@@ -828,6 +893,24 @@ class EplbState:
         predictive = self.parallel_config.predictive_expert_replication_config
         ep_group = get_ep_group().device_group
         model = model_state.model
+        # Resolved once, at the largest M a prefill step can present after the
+        # allgather: every rank sees all DP ranks' tokens, so that is the scheduler's
+        # batch limit times the EP size. The block size is selected per M, and the
+        # decision it feeds is about the prefill regime, so asking at a decode-sized M
+        # would answer the wrong question.
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        batched = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+            if vllm_config is not None and vllm_config.scheduler_config is not None
+            else 8192
+        )
+        block_size_m = resolve_moe_block_size_m(
+            model,
+            top_k=model.moe_layers[0].moe_config.experts_per_token,
+            num_batched_tokens=batched * ep_group.size(),
+        )
         coordinator = PlacementCoordinator(
             ep_size=ep_group.size(),
             ep_rank=ep_group.rank(),
@@ -837,8 +920,8 @@ class EplbState:
             lookahead=predictive.prediction_lookahead_layers,
             budget=predictive.max_transfers_per_forward,
             max_per_layer=predictive.max_replicas_per_layer,
-            min_tokens_per_expert=float(_MOE_BLOCK_SIZE_M),
-            min_tokens=float(_MOE_BLOCK_SIZE_M),
+            min_tokens_per_expert=float(block_size_m),
+            min_tokens=float(block_size_m),
             expert_weights=model.expert_weights,
             expert_buffer=model_state.expert_buffer,
             communicator=model_state.communicator,
@@ -852,7 +935,7 @@ class EplbState:
             # Prediction and placement share one bar. Predicting a forward the
             # placement gate is certain to reject costs a gate matmul and a small
             # AllGather per layer for nothing: measured at 7.3% of TPOT.
-            layer.prediction_min_tokens_per_expert = float(_MOE_BLOCK_SIZE_M)
+            layer.prediction_min_tokens_per_expert = float(block_size_m)
 
     def _placement_stream(self) -> torch.cuda.Stream:
         """The ordered predictive communication stream of spec section 9."""
