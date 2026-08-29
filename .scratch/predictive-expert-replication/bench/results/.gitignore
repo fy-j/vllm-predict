@@ -1,0 +1,18 @@
+# Everything here is regenerable by the scripts one directory up, and some of it must
+# not be committed at all.
+#
+# Two prompt sets built from `likaixin/InstructCoder` carried third-party secrets — a
+# Slack webhook and a Stripe test key that real GitHub code had leaked into that
+# dataset — and GitHub's push protection blocked the branch until they were purged from
+# history. Any regenerated code prompt set will trip it again, so the rule is that
+# generated data does not go in git.
+#
+# The traces are the other reason: 16 rank traces at 10-14 MB each is 200 MB of clone
+# weight whose value lasted exactly as long as the analysis that read them. Conclusions
+# belong in `RESULTS.md`, `CURRENT-STATUS.md` and the handoff documents; the bytes do
+# not belong here.
+*
+!.gitignore
+# `cost-profile.json` is an input, not an artifact: the runners read it and write a
+# per-run copy beside their own output.
+!cost-profile.json

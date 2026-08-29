@@ -1,0 +1,11 @@
+__pycache__/
+results/*.log
+results/**/*.log
+
+# Raw per-forward prediction dumps: 43 MB per session and regenerable from the
+# runner. The scored `accuracy-*.json` next to them is the durable artifact.
+results/**/dump-*.jsonl
+
+# Duplicated prompt sets. The canonical copies live in `results/` and are
+# tracked; a per-run subdirectory copy is the same 2 MB again.
+results/*/prompts-*.jsonl

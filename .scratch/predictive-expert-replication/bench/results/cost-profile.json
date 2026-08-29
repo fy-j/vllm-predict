@@ -1,0 +1,13 @@
+{
+  "fingerprint": {
+    "model": "Qwen/Qwen3-30B-A3B",
+    "dtype": "bfloat16",
+    "ep_size": 8,
+    "num_logical_experts": 128,
+    "device_name": "NVIDIA GeForce RTX 5090"
+  },
+  "expert_compute_us_per_token": 0.1313,
+  "attention_window_us": 154.9,
+  "transfer_latency_us": 177.0,
+  "usable_transfer_bandwidth_bytes_per_us": 53317.4
+}
