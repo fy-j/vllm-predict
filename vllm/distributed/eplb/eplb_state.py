@@ -1035,6 +1035,20 @@ class EplbState:
             )
             return None
 
+        # Two per-layer lists, built from two different attributes, and indexed by the
+        # same number. A length mismatch would have the weights and the routing maps
+        # describing different layers, which routes tokens to a row holding another
+        # expert's weights and raises nothing.
+        if len(pointers) != len(maps):
+            logger.error(
+                "Predictive expert replication: %d weight layers against %d MoE "
+                "layers, so the device path cannot index them together. Falling back "
+                "to the host-issued transfer.",
+                len(pointers),
+                len(maps),
+            )
+            return None
+
         logger.info(
             "Predictive expert replication: device-issued transfer active on %d "
             "layers, %d ranks.",
