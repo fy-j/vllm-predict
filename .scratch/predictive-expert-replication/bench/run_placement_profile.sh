@@ -34,7 +34,10 @@ NUM_PROMPTS="${NUM_PROMPTS:-64}"
 # without writing a kernel: at 3 there are 43 source layers, at 35 there are 11. Used to
 # test whether the collectives' extra waiting scales with prediction's launch count.
 SKIP_FIRST="${SKIP_FIRST:-3}"
-BUDGETS="${BUDGETS:-0 43}"
+# Three arms, matching the e2e runner: `off` is a stock server, `0` predicts without
+# placing, `43` places. The diff of `off` against `0` is what isolates prediction's own
+# cost, and the comment below explaining that was previously unreachable by default.
+BUDGETS="${BUDGETS:-off 0 43}"
 
 export PYTHONPATH="$REPO_ROOT"
 RESOLVED=$(python3 -c 'import vllm,sys; sys.stdout.write(vllm.__file__)' 2>/dev/null || true)
@@ -152,7 +155,14 @@ print(json.dumps({'profiler':'torch','torch_profiler_dir':sys.argv[1],
   grep -c "Predictive expert replication: activated" "$LOG" 2>/dev/null \
     | xargs -I{} echo "[prof] $tag: {} placement log lines"
 
-  kill -TERM "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; sleep 5
+  # Bounded, then escalate. A bare `wait` after SIGTERM left an idle 8-GPU server running
+  # for 26 minutes with the first arm's result already on disk, and the arms after it never
+  # started. This script loops over arms, so it is the shape that failure takes.
+  kill -TERM "$PID" 2>/dev/null || true
+  for _ in $(seq 1 30); do kill -0 "$PID" 2>/dev/null || break; sleep 2; done
+  kill -9 "$PID" 2>/dev/null || true
+  wait "$PID" 2>/dev/null || true
+  sleep 5
   for p in $(ps -eo pid,cmd --no-headers | grep "VLLM::" | grep -v grep | awk '{print $1}'); do
     kill -9 "$p" 2>/dev/null
   done

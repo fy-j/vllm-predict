@@ -48,7 +48,11 @@ _ATTENTION_MARKERS = (
     "QNormRope",
     "_fused_inv_rope",
     "mhc_",
-"flash_fwd", "flash::", "paged_attention", "flashinfer")
+    "flash_fwd",
+    "flash::",
+    "paged_attention",
+    "flashinfer",
+)
 
 
 def parse_annotation(name: str) -> tuple[int, int, int, int] | None:
@@ -106,9 +110,7 @@ class WindowAttribution:
     )
 
 
-def decode_windows(
-    events: list[dict], phase: str = "decode"
-) -> list[DecodeWindow]:
+def decode_windows(events: list[dict], phase: str = "decode") -> list[DecodeWindow]:
     """Extract one phase's step windows from a trace's events.
 
     Only `gpu_user_annotation` is used. Each step also emits a CPU-side

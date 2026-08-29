@@ -1,10 +1,10 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
+# the vLLM project
 """Cross-layer predicted-load estimation for Predictive expert replication.
 
-The current sparse MoE evaluates the *next* sparse MoE's gate and router on its
-own source-local hidden states, producing that layer's predicted logical-expert
-load before token dispatch. An AllGather over the EPLB group then gives every EP
+The current sparse MoE evaluates the *next* sparse MoE's gate and router on its own
+source-local hidden states, producing that layer's predicted logical-expert load before
+token dispatch. An AllGather over the EPLB group then gives every EP
 rank the same `[source rank, logical expert]` Global predicted-load snapshot, so
 a deterministic planner can run locally on every rank without a plan broadcast.
 
@@ -16,10 +16,9 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
-import triton
-import triton.language as tl
 
 from vllm.distributed.parallel_state import get_eplb_group
+from vllm.triton_utils import tl, triton
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 if TYPE_CHECKING:
@@ -42,9 +41,9 @@ def build_predictive_physical_map(
 
     Rank `r` owns logical experts `[r * canonical, (r + 1) * canonical)` in its
     leading physical rows, where `canonical = num_logical_experts // ep_size`.
-    Its trailing `replica_slots_per_rank` rows are inactive, marked `-1`, which
-    both keeps canonical ownership fixed and gives every rank room to receive one
-    predictive replica.
+    Its trailing `replica_slots_per_rank` rows are inactive, marked `-1`, which both
+    keeps canonical ownership fixed and gives every rank room to receive one predictive
+    replica.
 
     Args:
         num_layers: Number of sparse MoE layers.
@@ -85,15 +84,15 @@ def build_source_local_physical_map(
     This is the Source-local physical map. It is returned in the shape the shared
     routing path already accepts, `[num_logical_experts, 1]` alongside an all-ones
     replica count, so that path's per-token replica choice degenerates to a plain
-    lookup. Source-rank routing is then true *by construction*: with one copy on
-    offer there is nothing left for a per-token decision to split, so a rank's
-    chunk cannot be divided across copies. Nothing in the shared routing kernel
-    changes, which also leaves the other model families that call it untouched.
+    lookup. Source-rank routing is then true *by construction*: with one copy on offer
+    there is nothing left for a per-token decision to split, so a rank's chunk cannot be
+    divided across copies. Nothing in the shared routing kernel changes, which also
+    leaves the other model families that call it untouched.
 
-    Ranks are spread across the available copies by `source_rank % replicas`,
-    which is deterministic and identical on every rank, so each rank derives its
-    own row without a broadcast. A plan may later override the choice per expert;
-    this is the placement-free default.
+    Ranks are spread across the available copies by `source_rank % replicas`, which is
+    deterministic and identical on every rank, so each rank derives its own row without
+    a broadcast. A plan may later override the choice per expert; this is the
+    placement-free default.
 
     Args:
         logical_to_physical_map: `[num_logical_experts, max_replicas]` for one
@@ -124,18 +123,15 @@ def count_logical_experts_reference(
     path.
 
     An id outside the logical range contributes nothing rather than being folded into a
-    neighbouring expert's count, which would wrongly attribute load to a real expert and
-    make the planner replicate an expert that is not hot. The weight excludes it; the
-    clamp
-    only keeps `scatter_add_` in bounds. Deliberately not checked on the host, since
-    that
+    neighbouring expert's count, which would attribute load to a real expert and make
+    the planner replicate one that is not hot. The weight excludes it and the clamp only
+    keeps `scatter_add_` in bounds. Deliberately not validated on the host, since that
     would synchronise every layer of every forward.
 
     Args:
         logical_ids: `[num_tokens, topk]` selected logical experts, either int width.
-        num_unpadded: Device scalar holding this rank's valid token count, 0-dim or with
-        a
-            single element. Rows at or past it are padding and must not reach the count.
+        num_unpadded: Device scalar holding this rank's valid token count, either 0-dim
+            or single-element. Rows at or past it are padding and must not be counted.
         num_logical_experts: Logical expert count, which bounds the output.
         out: `[num_logical_experts]` int32 destination, zeroed here.
 
@@ -148,16 +144,15 @@ def count_logical_experts_reference(
         return out
 
     # `num_unpadded` is used unindexed: the runtime passes a 0-dim scalar out of a list
-    # of
-    # per-ubatch counts, and indexing that raises. Both a 0-dim and a one-element tensor
-    # broadcast correctly against `arange`, and the kernel reads element 0 of either.
+    # of per-ubatch counts, and indexing that raises. Both a 0-dim and a one-element
+    # tensor broadcast correctly against `arange`, and the kernel reads element 0 of
+    # either.
     is_valid = torch.arange(num_tokens, device=logical_ids.device) < num_unpadded
     flat_ids = logical_ids.reshape(num_tokens, -1)
     weights = is_valid.to(out.dtype).unsqueeze(1).expand_as(flat_ids)
     # Copy before masking: `.to()` is a no-op when the router already returns int64, and
-    # an
-    # in-place clamp would then write through to the tensor the router just handed back,
-    # breaking its read-only contract for any other caller.
+    # an in-place clamp would then write through to the tensor the router just handed
+    # back, breaking its read-only contract for any other caller.
     indices = flat_ids.reshape(-1).to(dtype=torch.int64, copy=True)
     in_range = (indices >= 0) & (indices < num_logical_experts)
     masked_weights = weights.reshape(-1) * in_range.to(out.dtype)
@@ -180,17 +175,14 @@ def _count_logical_experts_kernel(
 
     The elementwise path materialised a mask, a weight vector, a range mask, a product
     and
-    a clamped index copy — five tensors sized `[num_tokens, topk]` — and issued about
-    a dozen launches per source layer. Here the same arithmetic is per-element and stays
-    in
-    registers, so the layer costs one launch.
+    a clamped index copy — five tensors sized `[num_tokens, topk]` — and issued about a
+    dozen launches per source layer. Here the same arithmetic is per-element and stays
+    in registers, so the layer costs one launch.
 
-    The count is small (128 to 256 integers) and the input large (tokens times topk), so
+    The count is small, 128 to 256 integers, and the input large, tokens times topk, so
     atomics into the output are the right shape: contention is bounded by the expert
-    count,
-    not by the token count, and the skew this feature exists to find means the hot
-    expert
-    takes the contention either way.
+    count rather than the token count, and the skew this feature exists to find means
+    the hot expert takes that contention either way.
     """
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     in_bounds = offsets < num_pairs
@@ -216,13 +208,16 @@ def count_logical_experts_triton(
     """Count predicted tokens per logical expert in one kernel.
 
     Replaces `count_logical_experts_reference` on the serving path. Prediction's own GPU
-    work is small — about 2.2 ms per prefill window — but it added roughly 700 launches,
-    and
-    the token collectives then grew 39.9 ms with the same kernel count and byte volume:
-    the launches desynchronise the DP ranks and the collectives absorb the skew. That
-    cost
-    is linear in the number of predicting layers, so removing launches removes cost
-    proportionally. Ticket 03.
+    work is small, about 2.2 ms per prefill window, but it added roughly 700 launches,
+    and the token collectives then grew 39.9 ms with the same kernel count and the same
+    byte volume: the launches desynchronise the DP ranks and the collectives absorb the
+    skew.
+
+    Measured, this kernel takes launches per source layer from 17.2 to 7.1 and recovers
+    17% of that added waiting — which separated the per-layer cost into 2.21 ms that
+    scales with launches and 5.28 ms that does not. The fixed part is the host
+    synchronisation, so it is ticket 06 rather than this kernel that carries the rest.
+    Ticket 03.
 
     Args and semantics are identical to the reference, which the tests assert by
     equality.
@@ -235,8 +230,7 @@ def count_logical_experts_triton(
     flat = logical_ids.reshape(-1)
     topk = flat.numel() // num_tokens
     # Contiguous so the flattened index arithmetic matches the kernel's, whatever view
-    # the
-    # router returned.
+    # the router returned.
     if not flat.is_contiguous():
         flat = flat.contiguous()
 
@@ -257,9 +251,9 @@ def count_logical_experts_triton(
 class CrossLayerLoadPredictor:
     """Predicts one target MoE's logical-expert load from the current MoE.
 
-    One instance is bound per non-final sparse MoE. It holds the target gate
-    *module* rather than a snapshot of its weights, so ordinary weight loading
-    stays authoritative.
+    One instance is bound per non-final sparse MoE. It holds the target gate *module*
+    rather than a snapshot of its weights, so ordinary weight loading stays
+    authoritative.
     """
 
     def __init__(
@@ -281,8 +275,8 @@ class CrossLayerLoadPredictor:
     def predict_local_counts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Count predicted target-layer tokens per logical expert on this rank.
 
-        Padding rows are excluded, so a dummy or padding-only forward
-        contributes all-zero counts. Nothing here synchronizes with the host.
+        Padding rows are excluded, so a dummy or padding-only forward contributes
+        all-zero counts. Nothing here synchronizes with the host.
 
         Args:
             hidden_states: Source-local current-MoE hidden states, before token
@@ -298,13 +292,15 @@ class CrossLayerLoadPredictor:
         )
 
         counts = self._counts_buffer(hidden_states.device)
-        counts.zero_()
         num_tokens = hidden_states.shape[0]
         if num_tokens == 0:
+            # Both counting implementations zero their output, so the only path that has
+            # to do it here is the one that returns before calling either.
+            counts.zero_()
             return counts
 
-        # Real tokens occupy the leading rows; everything past the unpadded
-        # count is padding and must not reach the predicted load.
+        # Real tokens occupy the leading rows; everything past the unpadded count is
+        # padding and must not reach the predicted load.
         num_unpadded = self.eplb_layer_state.num_unpadded_tokens_tensors
         if num_unpadded is None:
             raise RuntimeError(
@@ -312,25 +308,16 @@ class CrossLayerLoadPredictor:
                 "EplbState.prepare_forward must run before the model forward."
             )
         # `num_unpadded_tokens_tensors` is a **list** of per-ubatch scalars, so this
-        # indexes
-        # rather than slices — a list slice would hand the kernel a Python list and
-        # Triton
-        # would refuse to specialize it. The ubatch id matters even though DBO is
-        # rejected by
-        # configuration validation: reading ubatch 0's count unconditionally is the kind
-        # of
-        # wrong that shows up only once someone enables the thing.
-        # Triton where there is a GPU, the reference otherwise. This branches on a
-        # *device
-        # capability*, which is a static property identical on every rank, not on
-        # per-rank
-        # state — so it is not the class of decision that has deadlocked this branch.
-        # The CPU
-        # path exists because the deterministic behaviour of this counting is asserted
-        # by
-        # CPU-only unit tests, which is where padding boundaries and out-of-range ids
-        # are
-        # cheapest to pin.
+        # indexes rather than slices — a list slice would hand the kernel a Python list
+        # and Triton would refuse to specialize it. The ubatch id matters even though
+        # DBO is rejected by configuration validation: reading ubatch 0's count
+        # unconditionally is the kind of wrong that shows up only once someone enables
+        # the thing. Triton where there is a GPU, the reference otherwise. This branches
+        # on a *device capability*, which is a static property identical on every rank,
+        # not on per-rank state — so it is not the class of decision that has deadlocked
+        # this branch. The CPU path exists because the deterministic behaviour of this
+        # counting is asserted by CPU-only unit tests, which is where padding boundaries
+        # and out-of-range ids are cheapest to pin.
         count = (
             count_logical_experts_triton
             if logical_ids.is_cuda
@@ -346,13 +333,13 @@ class CrossLayerLoadPredictor:
     def start_snapshot(self, local_counts: torch.Tensor) -> None:
         """Begin the predicted-count AllGather on the EPLB group.
 
-        Call this only after the current layer's token dispatch, so the small
-        collective overlaps this layer's local expert GEMM.
+        Call this only after the current layer's token dispatch, so the small collective
+        overlaps this layer's local expert GEMM.
         """
         group = get_eplb_group().device_group
-        # The gather buffer stays flat: ProcessGroupGloo rejects a pre-shaped
-        # `[ep_size, num_logical_experts]` output that NCCL would accept, and the
-        # tests exercise the gloo path.
+        # The gather buffer stays flat: ProcessGroupGloo rejects a pre-shaped `[ep_size,
+        # num_logical_experts]` output that NCCL would accept, and the tests exercise
+        # the gloo path.
         self._work = torch.distributed.all_gather_into_tensor(
             self._snapshot_buffer(local_counts, group.size()),
             local_counts,
@@ -398,9 +385,9 @@ _BOUND_LAYER_COUNT: list[int] = []
 def bound_layer_count() -> int | None:
     """Sparse MoE layers in the model the registry was last bound for.
 
-    Lets a reader tell whether a given model is the one the pairs describe, since
-    the registry holds runners rather than a model identity and the pairs of one
-    model scored against another's load would look like poor accuracy.
+    Lets a reader tell whether a given model is the one the pairs describe, since the
+    registry holds runners rather than a model identity and the pairs of one model
+    scored against another's load would look like poor accuracy.
     """
     return _BOUND_LAYER_COUNT[0] if _BOUND_LAYER_COUNT else None
 
@@ -409,12 +396,12 @@ def registered_prediction_pairs() -> list[tuple[int, int, "MoERunner"]]:
     """Source layer, target layer, and source runner for every bound prediction.
 
     A diagnostic registry filled by :func:`bind_moe_prediction_targets` so the
-    prediction-accuracy study can pair a source layer's prediction with its
-    target layer's recorded load. Nothing on the serving path reads it.
+    prediction-accuracy study can pair a source layer's prediction with its target
+    layer's recorded load. Nothing on the serving path reads it.
 
     Only one model's bindings are held, which is all the PoC supports: it rejects
-    a model whose decoder layers do not all carry a sparse MoE, and pipeline
-    parallelism is out of scope.
+    a model whose decoder layers do not all carry a sparse MoE, and pipeline parallelism
+    is out of scope.
 
     Returns:
         `(source layer index, target layer index, source runner)` triples, in
@@ -433,17 +420,17 @@ def bind_moe_prediction_targets(
     This is the cross-layer gate registry. Source layers are the index range
     `[skip_first_layers, num_layers - lookahead)`. Layers outside it bind no
     target, create no plan, and run no predicted-count collective: the leading
-    layers because their cross-layer prediction is unreliable, the trailing ones
-    because they have no target.
+    layers because their cross-layer prediction is unreliable, the trailing ones because
+    they have no target.
 
-    The PoC only supports a topology where every decoder layer holds a sparse
-    MoE. A model that interleaves dense layers is rejected rather than silently
-    predicting across a different distance than `lookahead` names.
+    The PoC only supports a topology where every decoder layer holds a sparse MoE. A
+    model that interleaves dense layers is rejected rather than silently predicting
+    across a different distance than `lookahead` names.
 
     Args:
         moe_runners_in_layer_order: One entry per decoder layer in order, holding
-            that layer's sparse MoE runner, or None if the layer has none.
-            Layers absent from this pipeline-parallel rank must be omitted.
+            that layer's sparse MoE runner, or None if the layer has none. Layers absent
+            from this pipeline-parallel rank must be omitted.
         lookahead: Distance in layers from a source to its target, so `lookahead`
             of `n` binds layer `i` to layer `i + n` with `n - 1` layers between.
         skip_first_layers: Leading layers excluded from prediction.
@@ -455,9 +442,9 @@ def bind_moe_prediction_targets(
         ValueError: If any decoder layer lacks a sparse MoE, or if the lookahead
             and skip leave no valid source layer.
     """
-    # Cleared before validation, not after binding: a second model that fails
-    # validation would otherwise leave the first model's runners registered, and the
-    # accuracy dump would score its predictions against the wrong model's load.
+    # Cleared before validation, not after binding: a second model that fails validation
+    # would otherwise leave the first model's runners registered, and the accuracy dump
+    # would score its predictions against the wrong model's load.
     _PREDICTION_PAIRS.clear()
     _BOUND_LAYER_COUNT.clear()
 

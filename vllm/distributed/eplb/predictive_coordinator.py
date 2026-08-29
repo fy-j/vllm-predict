@@ -1,13 +1,13 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
+# the vLLM project
 """In-forward placement coordination for Predictive expert replication.
 
 Planning from *predicted* load rather than measured load is what makes the transfer
 hideable, and that is the reason the design predicts at all. Routing maps logical
 experts to physical rows **before** dispatch, so a placement decided from a layer's own
-measured load would have to finish transferring before that same layer's dispatch
-begins — leaving no window and exposing the whole transfer. Predicting `i + lookahead`
-buys the intervening layers' compute to hide it in. Spec sections 9 and 10.
+measured load would have to finish transferring before that same layer's dispatch begins
+— leaving no window and exposing the whole transfer. Predicting `i + lookahead` buys the
+intervening layers' compute to hide it in. Spec sections 9 and 10.
 
 Three phases, one per layer boundary:
 
@@ -46,8 +46,8 @@ class _Communicator(Protocol):
     """What this path needs of the EPLB communicator.
 
     Narrower than `EplbCommunicator` on purpose: it states the four methods used
-    here, so tests can substitute a recorder without a process group, and typing
-    still catches a call the real communicator does not answer.
+    here, so tests can substitute a recorder without a process group, and typing still
+    catches a call the real communicator does not answer.
     """
 
     def set_stream(self, cuda_stream: torch.cuda.Stream | None) -> None: ...
@@ -128,8 +128,8 @@ class PlacementCoordinator:
         self._event_factory = event_factory or torch.cuda.Event
         self.last_event: _TransferEvent | None = None
 
-        # One recording in flight: the snapshot buffer is reused, so a second
-        # recording before `plan_and_launch` would overwrite the first.
+        # One recording in flight: the snapshot buffer is reused, so a second recording
+        # before `plan_and_launch` would overwrite the first.
         self._recorded: tuple[int, torch.Tensor, _TransferEvent] | None = None
         self._pending: dict[int, tuple[list[Placement], _TransferEvent]] = {}
         self._host_buffer: torch.Tensor | None = None
@@ -193,13 +193,13 @@ class PlacementCoordinator:
             )
         summed = predicted if predicted.dim() == 1 else predicted.sum(dim=0)
         host = self.host_snapshot_buffer(summed.numel())
-        # Integer end to end. The counts are int32 and their sum is exact in int64,
-        # so nothing here rounds and nothing depends on summation order. A float
-        # snapshot is safe on the host planner, which promotes to float64 anyway, but
-        # a device-side argmax over floats is order-dependent: two ranks reducing the
-        # same values in a different block order can pick different experts, and the
-        # plan has to be identical on every rank. Keeping it integer makes that
-        # constructive rather than something the kernel has to be careful about.
+        # Integer end to end. The counts are int32 and their sum is exact in int64, so
+        # nothing here rounds and nothing depends on summation order. A float snapshot
+        # is safe on the host planner, which promotes to float64 anyway, but a
+        # device-side argmax over floats is order-dependent: two ranks reducing the same
+        # values in a different block order can pick different experts, and the plan has
+        # to be identical on every rank. Keeping it integer makes that constructive
+        # rather than something the kernel has to be careful about.
         host.copy_(summed.to(dtype=torch.int64), non_blocking=True)
         event = self._event_factory()
         # Recorded on the **current** stream, which is where the copy was enqueued.
@@ -232,21 +232,26 @@ class PlacementCoordinator:
         # target that does not advance means a new forward has begun.
         if target <= self._last_target:
             self._spent = 0
-            self._suppressed = False
         self._last_target = target
-        # Below one block per expert the MoE kernel pads every expert to the same
-        # number of blocks, so the imbalance costs nothing and balancing it saves
-        # nothing — ticket 00's inequality. Decode never clears this bar on this node
-        # and measured -1.2% imbalance for a 10% TPOT cost, so a decode forward runs
-        # the placement machinery not at all: no plan, no transfer, and no publish, so
-        # what prefill put there stays and does not have to be sent again.
+        # Below one block per expert the MoE kernel pads every expert to the same number
+        # of blocks, so the imbalance costs nothing and balancing it saves nothing —
+        # ticket 00's inequality. Decode never clears this bar on this node and measured
+        # -1.2% imbalance for a 10% TPOT cost, so a decode forward runs the placement
+        # machinery not at all: no plan, no transfer, and no publish, so what prefill
+        # put there stays and does not have to be sent again.
         #
         # `host` is the allgathered snapshot and identical on every rank, so this
         # decision is too. Gating a transfer on per-rank state is the deadlock this
-        # branch has already hit twice.
+        # branch has already hit twice. Assigns rather than only setting True.
+        # `note_forward_token_load` is the authority for a forward, and it decides from
+        # the DP-agreed padded count; this decides from the unpadded snapshot, which is
+        # the more accurate of the two. Having the snapshot only ever set True meant a
+        # boundary reset had to clear it, and that reset silently overrode the runner —
+        # harmless while both thresholds are the same value, and a revert of every layer
+        # the moment they diverge.
         tokens_per_expert = float(host.sum()) / host.numel()
-        if tokens_per_expert <= self.min_tokens_per_expert:
-            self._suppressed = True
+        self._suppressed = tokens_per_expert <= self.min_tokens_per_expert
+        if self._suppressed:
             return []
         remaining = self.budget - self._spent
         if remaining <= 0:
@@ -254,11 +259,21 @@ class PlacementCoordinator:
         # One layer's row, because that is all that exists yet: when this layer plans
         # for `target`, no later layer's prediction has been computed. So the
         # cross-layer ranking `plan_replicas` implements never has a second candidate
-        # here, and the
-        # forward's budget is spent **first-come-first-served by layer index**. That
-        # makes `max_per_layer` the allocation target rather than a safety cap, and it
-        # decides coverage: at cap `k` a budget of `b` reaches `b/k` layers, always the
-        # lowest-indexed ones.
+        # here, and the forward's budget is spent **first-come-first-served by layer
+        # index**. That makes `max_per_layer` the allocation target rather than a safety
+        # cap, and it decides coverage: at cap `k` a budget of `b` reaches `b/k` layers,
+        # always the lowest-indexed ones.
+        #
+        # Note what charging for transfers means, since the arithmetic above no longer
+        # holds across forwards: a layer whose replica is already resident costs
+        # nothing, so coverage ratchets up over successive forwards until every
+        # reachable layer holds one. That is the intended trade — coverage is free once
+        # resident and the budget's job is to bound *churn*, which it still does: a
+        # domain switch invalidates every replica and the next forward may then move
+        # only `budget` of them. The offline control
+        # `imbalance.plan_moves_in_layer_order` charges every placement regardless of
+        # residency, so it models the first forward under the old accounting, and the
+        # `b/k` figures it produced describe that rather than the steady state.
         #
         # Coverage is what drives benefit, because a layer's second replica chases a
         # much smaller expert than its first. Handing each layer the whole remaining
@@ -287,11 +302,11 @@ class PlacementCoordinator:
             )
             for p in plan
         ]
-        # Only the difference is sent. A replica already resident needs no transfer:
-        # its row still holds that expert's weights, because reverting never touches
-        # weights and nothing else writes a replica row. With coverage steady at 22
-        # layers, consecutive prefill forwards want largely the same set, so this is
-        # most of the 43 transfers that were being repeated every forward.
+        # Only the difference is sent. A replica already resident needs no transfer: its
+        # row still holds that expert's weights, because reverting never touches weights
+        # and nothing else writes a replica row. With coverage steady at 22 layers,
+        # consecutive prefill forwards want largely the same set, so this is most of the
+        # 43 transfers that were being repeated every forward.
         #
         # `active` comes from this coordinator's own published history, which is driven
         # by plans identical on every rank, so the transfer set stays identical across
@@ -318,15 +333,11 @@ class PlacementCoordinator:
         self.last_event = event
         self._pending[target] = (plan, event)
         # Charged for what actually moved, not for what was planned. Counting the whole
-        # plan
-        # made a knob named for transfers bound *coverage* instead: a replica already
-        # resident
-        # needs no transfer, because its row still holds that expert's weights and
-        # nothing
-        # else writes a replica row, so in a steady state the honest charge is zero.
-        # Bytes in
-        # flight are bounded separately, which is what `max_concurrent_transfer_bytes`
-        # is for.
+        # plan made a knob named for transfers bound *coverage* instead: a replica
+        # already resident needs no transfer, because its row still holds that expert's
+        # weights and nothing else writes a replica row, so in a steady state the honest
+        # charge is zero. Bytes in flight are bounded separately, which is what
+        # `max_concurrent_transfer_bytes` is for.
         self._spent += len(to_transfer)
         return plan
 
@@ -335,11 +346,11 @@ class PlacementCoordinator:
 
         Publishing unconditionally is the point. `placements` is the layer's whole
         desired set, so an empty one means "this layer should hold no replica" and
-        publishing it is what reverts whatever the last forward left there. Skipping
-        the call when a layer planned nothing — as the runner first did — left
-        reversion running only on layers that happened to receive a new placement, and
-        active replicas stayed at a measured 53-66 per forward against a budget of 43
-        even after reversion was written.
+        publishing it is what reverts whatever the last forward left there. Skipping the
+        call when a layer planned nothing — as the runner first did — left reversion
+        running only on layers that happened to receive a new placement, and active
+        replicas stayed at a measured 53-66 per forward against a budget of 43 even
+        after reversion was written.
 
         Returns:
             The placements activated, for the caller's own accounting.
@@ -391,14 +402,14 @@ class PlacementCoordinator:
         placements, event = entry
         # `wait()` with no argument orders the *current* stream behind the event.
         # `synchronize()` would block the host instead, which this site never needed:
-        # everything that consumes the weights — the map writes below, then this
-        # layer's MoE kernel — is enqueued on the current stream afterwards, so stream
-        # ordering is the whole requirement. Blocking the CPU only threw away its
-        # run-ahead, and a placed run made 126 `cudaEventSynchronize` calls with GPU
-        # occupancy falling 86.8% -> 52.9%. About half of those were here.
+        # everything that consumes the weights — the map writes below, then this layer's
+        # MoE kernel — is enqueued on the current stream afterwards, so stream ordering
+        # is the whole requirement. Blocking the CPU only threw away its run-ahead, and
+        # a placed run made 126 `cudaEventSynchronize` calls with GPU occupancy falling
+        # 86.8% -> 52.9%. About half of those were here.
         #
         # The host copy in `plan_and_launch` is not this and must stay a real
-        # `synchronize()`: the planner reads that buffer on the host. Only a
-        # device-side plan removes that one, which is the rest of ticket 13.
+        # `synchronize()`: the planner reads that buffer on the host. Only a device-side
+        # plan removes that one, which is the rest of ticket 13.
         event.wait()
         return placements

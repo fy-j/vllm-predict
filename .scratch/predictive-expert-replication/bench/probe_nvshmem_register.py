@@ -35,37 +35,38 @@ Shapes are Qwen3-30B-A3B's, EP=8: 16 canonical + 1 replica row per rank, w13
 **ANSWER (2026-08-29): option (a) is not available on this stack.** Registration and the
 symmetric heap have mutually exclusive requirements, four checks deep:
 
-  1. NVSHMEM's per-device memory resource must exist first. It is created lazily on the
-     first symmetric-heap allocation (`nvshmem/core/memory.py:89`), so registering before
-     any allocation fails with "device that is not initialized with NVSHMEM" — which reads
-     like a device-binding bug and is not one. One `nvshmem.core.tensor((1,), uint8)` fixes it.
-  2. The buffer size must be a multiple of the heap granularity, 512 MiB by default.
-     A layer's w13 is 102 MiB and w2 51 MiB, so 48 layers would need 49 GiB per rank.
-     `NVSHMEM_CUMEM_GRANULARITY=2097152` lowers it to 2 MiB, and one padding row (18 rows,
-     not 17) makes both tensors align.
-  3. The buffer must be CUDA VMM allocated. PyTorch's caching allocator uses `cudaMalloc`,
-     so a plain tensor fails with "Please check if buffer is allocated using CUDA VMM API".
-     `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` makes torch use VMM and clears this.
-  4. **And then `cuMemMap` fails with `CUDA_ERROR_NOT_SUPPORTED`**: the handle type torch
-     creates its VMM allocations with is not one NVSHMEM can map into its heap, and torch
-     does not expose that as a knob.
+1. NVSHMEM's per-device memory resource must exist first. It is created lazily on the
+   first symmetric-heap allocation (`nvshmem/core/memory.py:89`), so registering before
+   any allocation fails with "device that is not initialized with NVSHMEM" — which reads
+   like a device-binding bug and is not one. One tiny `nvshmem.core.tensor` forces it.
+2. The buffer size must be a multiple of the heap granularity, 512 MiB by default. A
+   layer's w13 is 102 MiB and w2 51 MiB, so 48 layers would need 49 GiB per rank.
+   `NVSHMEM_CUMEM_GRANULARITY=2097152` lowers it to 2 MiB, and one padding row — 18
+   rows rather than 17 — aligns both tensors.
+3. The buffer must be CUDA VMM allocated. PyTorch's caching allocator uses `cudaMalloc`,
+   so a plain tensor fails with "Please check if buffer is allocated using CUDA VMM
+   API". `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` makes torch use VMM.
+4. **And then `cuMemMap` fails with `CUDA_ERROR_NOT_SUPPORTED`**: the handle type torch
+   gives its VMM allocations is not one NVSHMEM can map into its heap, and torch does
+   not expose that as a knob.
 
-`NVSHMEM_DISABLE_CUDA_VMM=1` makes step 4 disappear and registration *report* success for
-all 48 layers, 7.59 GiB per rank — but the first real put then fails with "Buffer
+`NVSHMEM_DISABLE_CUDA_VMM=1` makes step 4 disappear and registration *report* success
+for all 48 layers, 7.59 GiB per rank — but the first real put fails with "Buffer
 registration requires dynamic VMM heap". So the registration was not symmetric. The two
-settings are mutually exclusive: registration needs the VMM heap, and the VMM heap needs a
-mappable user handle that torch does not provide.
+settings are mutually exclusive: registration needs the VMM heap, and the VMM heap needs
+a mappable user handle that torch does not provide.
 
 **Consequence: land replicas through a symmetric-heap staging buffer (option b).** Its
-cost is one local device copy, 6.3 us for Qwen's 9 MiB and 16.8 us for DSV4's 24 MiB at the
-measured 3.00 TB/s, against a 67.87 ms prefill step — 0.01%. There is also an option (c):
-allocate the expert weights *from* the symmetric heap with `nvshmem.core.tensor()` rather
-than registering torch memory. That is mechanically proven by `probe_nvshmem.py`, but it
+cost is one local device copy, 6.3 us for Qwen's 9 MiB and 16.8 us for DSV4's 24 MiB at
+the
+measured 3.00 TB/s, against a 67.87 ms prefill step — 0.01%. There is also option (c):
+allocate the expert weights *from* the symmetric heap with `nvshmem.core.tensor()`
+instead of registering torch memory. Proven by `probe_nvshmem.py`, but it
 puts NVSHMEM's allocator underneath the model's own weights, which weight loading and
 EPLB's `rearrange` both use — a deeper intrusion than registration would have been.
 
 A row-granular put needs `nvshmem.bindings.putmem_on_stream(dst_ptr, src_ptr, bytes, pe,
-stream)`. `nvshmem.core.put` resolves its arguments through nvshmem's tracking table, which
+stream)`. `nvshmem.core.put` resolves arguments through nvshmem's tracking table, which
 holds whole allocations, so passing a row slice raises "Tensor not tracked by nvshmem".
 
 Run:
@@ -84,10 +85,11 @@ import torch.distributed as dist
 
 HIDDEN = 2048
 MOE_INTERMEDIATE = 768
-# 18, not 17. `register_external_buffer` requires the buffer size to be a multiple of the
-# heap granularity, and w2 at 17 rows is 51 MiB — not a multiple of even the smallest
-# granularity CUDA VMM allows (2 MiB), since a w2 row is 3 MiB. One padding row makes both
-# tensors align: w13 18x6 = 108 MiB, w2 18x3 = 54 MiB, both multiples of 2 MiB.
+# 18, not 17. `register_external_buffer` requires the buffer size to be a multiple of
+# the heap granularity, and w2 at 17 rows is 51 MiB — not a multiple of even the
+# smallest granularity CUDA VMM allows (2 MiB), since a w2 row is 3 MiB. One padding row
+# makes both tensors align: w13 18x6 = 108 MiB, w2 18x3 = 54 MiB, both multiples of 2
+# MiB.
 ROWS = 18  # 16 canonical + 1 replica slot + 1 alignment pad
 NUM_LAYERS = 48
 REPLICA_ROW = 16
@@ -95,7 +97,10 @@ ITERS = 30
 
 
 def report(name: str, ok: bool, detail: str = "") -> None:
-    print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""), flush=True)
+    print(
+        f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""),
+        flush=True,
+    )
 
 
 def main() -> int:
@@ -111,10 +116,10 @@ def main() -> int:
     except ImportError:
         from cuda.core.experimental import Device  # type: ignore
 
-    # Bind NVSHMEM to the *same* device torch is using. `Device()` with no argument takes
-    # cuda.core's current device, which does not follow `torch.cuda.set_device`, and then
-    # registration fails with "device that is not initialized with NVSHMEM" — the tensors
-    # live on one device and NVSHMEM was initialised on another.
+    # Bind NVSHMEM to the *same* device torch is using. `Device()` with no argument
+    # takes cuda.core's current device, which does not follow `torch.cuda.set_device`,
+    # and then registration fails with "device that is not initialized with NVSHMEM" —
+    # the tensors live on one device and NVSHMEM was initialised on another.
     local = rank % torch.cuda.device_count()
     dev = Device(local)
     dev.set_current()
@@ -131,8 +136,8 @@ def main() -> int:
     # `register_external_tensor` needs NVSHMEM's memory resource for this device to
     # already exist, and that is created lazily on the *first* symmetric-heap allocation
     # (`memory.py:89`). Registering before any allocation fails with "device that is not
-    # initialized with NVSHMEM", which reads like a device-binding problem and is not one.
-    # One byte is enough to force it.
+    # initialized with NVSHMEM", which reads like a device-binding problem and is not
+    # one. One byte is enough to force it.
     _mr_anchor = nvshmem.tensor((1,), dtype=torch.uint8)
     if rank == 0:
         report("symmetric-heap anchor allocated", True, "forces the per-device MR")
@@ -193,7 +198,8 @@ def main() -> int:
     if not ok:
         return 1
 
-    # (3): put into the *replica row* of the peer's registered tensor, not the whole thing.
+    # (3): put into the *replica row* of the peer's registered tensor, not the whole
+    # thing.
     peer = (rank + 1) % world
     stream = torch.cuda.Stream()
     src_w13, _ = registered[0]
@@ -203,8 +209,9 @@ def main() -> int:
     torch.cuda.synchronize()
     dist.barrier()
 
-    # Each rank fills a *canonical* row with its own id and puts that row into the peer's
-    # replica row: the shape of a real transfer, one expert out of a layer's block.
+    # Each rank fills a *canonical* row with its own id and puts that row into the
+    # peer's replica row: the shape of a real transfer, one expert out of a layer's
+    # block.
     with torch.cuda.stream(stream):
         w13[0].fill_(payload)
     torch.cuda.synchronize()
@@ -232,7 +239,9 @@ def main() -> int:
         dist.barrier()
     except Exception as exc:  # noqa: BLE001
         if rank == 0:
-            report("row-granular put via bindings", False, f"{type(exc).__name__}: {exc}")
+            report(
+                "row-granular put via bindings", False, f"{type(exc).__name__}: {exc}"
+            )
         return 1
 
     expected = float(((rank - 1) % world) + 1)

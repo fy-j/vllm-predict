@@ -3,12 +3,13 @@
 
 Written because a DSV4 run reported "done", wrote eight rank traces, and had served
 zero requests: the base checkpoint has no chat template, the chat endpoint raised before
-sending anything, and the traces contained 54 events and no `gpu_user_annotation` at all.
-Every harness failure in this project has this shape — a wrong number or a silent
+sending anything, and the traces contained 54 events and no `gpu_user_annotation` at
+all. Every harness failure in this project has this shape — a wrong number or a silent
 no-op, never an error — so the guard belongs in the runner, not in the reader.
 
 Exit 0 if at least one rank trace carries an `execute_context_*` annotation.
 """
+
 import glob
 import gzip
 import json
@@ -27,8 +28,7 @@ for path in paths:
     hits = sum(
         1
         for e in events
-        if e.get("cat") == "gpu_user_annotation"
-        and pattern.search(e.get("name") or "")
+        if e.get("cat") == "gpu_user_annotation" and pattern.search(e.get("name") or "")
     )
     total += hits
     print(f"{path.split('/')[-1]}: {hits} step annotations, {len(events)} events")

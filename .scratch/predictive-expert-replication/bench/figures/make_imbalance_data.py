@@ -84,9 +84,7 @@ def summarize(records: list[dict], block_size_m: int) -> dict:
         share = []
         peak_over_mean = []
         for li in range(num_layers):
-            per_rank = [
-                [rec["rank_load"][li][r] for rec in recs] for r in range(ep)
-            ]
+            per_rank = [[rec["rank_load"][li][r] for rec in recs] for r in range(ep)]
             means = [statistics.mean(x) for x in per_rank]
             total = sum(means) or 1.0
             share.append([100.0 * m / total for m in means])
@@ -94,15 +92,15 @@ def summarize(records: list[dict], block_size_m: int) -> dict:
 
         # The aggregate view: sum each rank across layers, then compare ranks.
         rank_totals = [
-            statistics.mean(sum(rec["rank_load"][li][r] for li in range(num_layers))
-                            for rec in recs)
+            statistics.mean(
+                sum(rec["rank_load"][li][r] for li in range(num_layers)) for rec in recs
+            )
             for r in range(ep)
         ]
         agg_total = sum(rank_totals) or 1.0
 
         tokens_per_expert = statistics.mean(
-            statistics.mean(sum(r) for r in rec["rank_load"]) / logical
-            for rec in recs
+            statistics.mean(sum(r) for r in rec["rank_load"]) / logical for rec in recs
         )
         m_tokens = statistics.mean(
             statistics.mean(sum(r) for r in rec["rank_load"]) for rec in recs
@@ -115,12 +113,9 @@ def summarize(records: list[dict], block_size_m: int) -> dict:
             "aggregate_imbalance": max(rank_totals) / (agg_total / ep),
             # The figure reads `critical_path`; the same number under the longer name is
             # kept because `imbalance.py` and the RESULTS tables use that spelling.
-            "critical_path": sum(
-                max(s) / 100.0 for s in share
-            ) / (num_layers / ep),
-            "critical_path_imbalance": sum(
-                max(s) / 100.0 for s in share
-            ) / (num_layers / ep),
+            "critical_path": sum(max(s) / 100.0 for s in share) / (num_layers / ep),
+            "critical_path_imbalance": sum(max(s) / 100.0 for s in share)
+            / (num_layers / ep),
             "forwards": len(recs),
             "ep": ep,
             "num_layers": num_layers,
@@ -154,8 +149,10 @@ def main() -> None:
     args.out.write_text(json.dumps(data, indent=1))
     for band, d in sorted(data.items()):
         print(
-            f"{band:8} {d['forwards']:>4} forwards  ep={d['ep']} layers={d['num_layers']} "
-            f"experts={d['num_logical_experts']}  tokens/expert {d['tokens_per_expert']:.0f}  "
+            f"{band:8} {d['forwards']:>4} forwards  "
+            f"ep={d['ep']} layers={d['num_layers']} "
+            f"experts={d['num_logical_experts']}  "
+            f"tokens/expert {d['tokens_per_expert']:.0f}  "
             f"critical path {d['critical_path_imbalance']:.4f}  "
             f"aggregate {d['aggregate_imbalance']:.4f}"
         )

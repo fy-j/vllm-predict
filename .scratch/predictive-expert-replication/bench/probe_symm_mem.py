@@ -3,33 +3,34 @@
 """Can the replica land in the model's own weights through PyTorch symmetric memory?
 
 `probe_nvshmem_register.py` ruled out NVSHMEM's `register_external_tensor`: registration
-needs a dynamic VMM heap, the VMM heap needs a user handle PyTorch does not create, and the
-two settings exclude each other. That left a symmetric-heap staging buffer plus a local
-copy as the only NVSHMEM route.
+needs a dynamic VMM heap, the VMM heap needs a user handle PyTorch does not create, and
+the two settings exclude each other. That left a symmetric-heap staging buffer plus a
+local copy as the only NVSHMEM route.
 
 But PyTorch has its own symmetric memory, and **this repository already uses it** for
-custom all-reduce (`vllm/distributed/device_communicators/symm_mem.py`). It offers what the
-NVSHMEM route could not:
+custom all-reduce (`vllm/distributed/device_communicators/symm_mem.py`). It offers what
+the NVSHMEM route could not:
 
-  * `get_mem_pool(device)` returns a `torch.cuda.MemPool`, so a tensor can be *allocated*
+  * `get_mem_pool(device)` returns a `torch.cuda.MemPool`, so a tensor can be allocated
     inside the symmetric pool with ordinary `torch.empty`. Weight loading and EPLB's
-    `rearrange` keep working on an ordinary torch tensor — no NVSHMEM allocator underneath
-    the model's weights.
+    `rearrange` keep working on an ordinary torch tensor — no NVSHMEM allocator
+    underneath the model's weights.
   * `rendezvous(tensor, group)` then makes it addressable by every rank.
   * `get_buffer(peer, sizes, dtype)` hands back a **torch tensor view of the peer's
     memory**, so writing one expert is `peer_view[row].copy_(my_row)` — a slice, which
     NVSHMEM's tracking table refused.
-  * `buffer_ptrs_dev` is a **device-resident array of peer base pointers**, which is what
-    lets a Triton kernel compute the destination on device and keep the host out entirely.
+  * `buffer_ptrs_dev` is a **device-resident array of peer base pointers**, which is
+  what lets a Triton kernel compute the destination on device and keep the host out
+  entirely.
 
 What this probe has to establish, in order, because each would sink the design alone:
 
   1. A realistically shaped expert-weight tensor can be allocated in the symmetric pool.
   2. It rendezvous, and `is_symm_mem_tensor` agrees.
-  3. It is still an ordinary tensor for local compute — the MoE kernel reads it every layer.
-  4. A **row-granular** write into a peer's replica row lands, ordered by a CUDA event.
-  5. It scales to all 48 layers, about 7.3 GiB per rank, not just one tensor.
-  6. What a 6 MiB row costs, against NVSHMEM's 33 us put plus a 6.3 us local copy.
+  3. It is still an ordinary tensor for local compute — the MoE kernel reads it every
+  layer. 4. A **row-granular** write into a peer's replica row lands, ordered by a CUDA
+  event. 5. It scales to all 48 layers, about 7.3 GiB per rank, not just one tensor. 6.
+  What a 6 MiB row costs, against NVSHMEM's 33 us put plus a 6.3 us local copy.
 
 Shapes are Qwen3-30B-A3B's at EP=8: 17 rows per rank (16 canonical + 1 replica), w13
 [17, 2*768, 2048] and w2 [17, 2048, 768] in bf16, 153 MiB per layer per rank.
@@ -57,7 +58,10 @@ ITERS = 30
 
 
 def report(name: str, ok: bool, detail: str = "") -> None:
-    print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""), flush=True)
+    print(
+        f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""),
+        flush=True,
+    )
 
 
 def main() -> int:
@@ -74,8 +78,9 @@ def main() -> int:
     w2_shape = (ROWS, HIDDEN, MOE_INTERMEDIATE)
     row_bytes = 2 * MOE_INTERMEDIATE * HIDDEN * 2
 
-    # (1) Allocate inside the symmetric pool with ordinary torch, which is the whole point:
-    # the model's weight loader would do exactly this and keep plain tensor semantics.
+    # (1) Allocate inside the symmetric pool with ordinary torch, which is the whole
+    # point: the model's weight loader would do exactly this and keep plain tensor
+    # semantics.
     try:
         pool = symm_mem.get_mem_pool(device)
         with torch.cuda.use_mem_pool(pool):
@@ -83,7 +88,11 @@ def main() -> int:
             w2 = torch.zeros(w2_shape, dtype=torch.bfloat16, device=device)
     except Exception as exc:  # noqa: BLE001
         if rank == 0:
-            report("allocate weights in the symmetric pool", False, f"{type(exc).__name__}: {exc}")
+            report(
+                "allocate weights in the symmetric pool",
+                False,
+                f"{type(exc).__name__}: {exc}",
+            )
         return 1
     if rank == 0:
         report(
@@ -144,7 +153,11 @@ def main() -> int:
         hdl13.barrier()
     except Exception as exc:  # noqa: BLE001
         if rank == 0:
-            report("row-granular write into a peer's replica row", False, f"{type(exc).__name__}: {exc}")
+            report(
+                "row-granular write into a peer's replica row",
+                False,
+                f"{type(exc).__name__}: {exc}",
+            )
         return 1
 
     expected = float(((rank - 1) % world) + 1)
@@ -153,7 +166,8 @@ def main() -> int:
         report(
             "row-granular write into a peer's replica row",
             got == expected,
-            f"replica row holds {got}, expected {expected} from rank {(rank - 1) % world}",
+            f"replica row holds {got}, expected {expected} "
+            f"from rank {(rank - 1) % world}",
         )
 
     # (5) All 48 layers, which is the real memory ask rather than one tensor.
@@ -197,8 +211,9 @@ def main() -> int:
         med = statistics.median(times)
         print(
             f"\n{row_bytes / 2**20:.2f} MiB row -> peer replica row: p50 {med:.1f} us "
-            f"({row_bytes / (med * 1e-6) / 1e9:.0f} GB/s), min {min(times):.1f}, max {max(times):.1f}\n"
-            f"  NVSHMEM staged route: 33.0 us put + 6.3 us local copy = 39.3 us for 9 MiB.\n"
+            f"({row_bytes / (med * 1e-6) / 1e9:.0f} GB/s), "
+            f"min {min(times):.1f}, max {max(times):.1f}\n"
+            f"  NVSHMEM staged: 33.0 us put + 6.3 us copy = 39.3 us for 9 MiB.\n"
             f"  buffer_ptrs_dev present: {hdl13.buffer_ptrs_dev is not None} "
             f"(a device-side pointer table, so a Triton kernel needs no host)",
             flush=True,

@@ -9,6 +9,7 @@ the per-layer table is the heatmap's and the line chart's table view, and the
 aggregate table is the metric that hides the skew, kept only as the evidence
 behind the first stat tile.
 """
+
 import argparse
 import json
 from pathlib import Path
@@ -28,10 +29,28 @@ EP = _any.get("ep", 8)
 L = _any.get("num_layers", len(_any["share_by_layer"]))
 MODEL = _args.model
 UNIFORM = 100.0 / EP
-RAMP = ["#cde2fb","#b7d3f6","#9ec5f4","#86b6ef","#6da7ec","#5598e7",
-        "#3987e5","#2a78d6","#256abf","#1c5cab","#184f95","#104281","#0d366b"]
+RAMP = [
+    "#cde2fb",
+    "#b7d3f6",
+    "#9ec5f4",
+    "#86b6ef",
+    "#6da7ec",
+    "#5598e7",
+    "#3987e5",
+    "#2a78d6",
+    "#256abf",
+    "#1c5cab",
+    "#184f95",
+    "#104281",
+    "#0d366b",
+]
 _shares = [v for k in D for row in D[k]["share_by_layer"] for v in row]
 LO, HI = min(_shares), max(_shares)
+# A uniform-routing control, or a single-layer dataset, makes every share identical and the
+# ramp's normalisation divide by zero. Widen to a degenerate-but-drawable band instead of
+# failing the build: a flat heatmap is the correct picture of flat data.
+if HI - LO < 1e-9:
+    LO, HI = LO - 1.0, HI + 1.0
 
 
 def ramp(v):
@@ -49,15 +68,22 @@ def heat_cells(key):
             out.append(
                 f'<div class="cell{" pk" if peak else ""}" style="background:{ramp(v)}" '
                 f'tabindex="0" data-t="L{li} · rank {r} · {v:.2f}% of this layer'
-                f'{" · layer peak" if peak else ""}"></div>')
+                f'{" · layer peak" if peak else ""}"></div>'
+            )
     return "".join(out)
 
 
 W, H, PAD = 720, 150, 8
 _peaks = [v for k in D for v in D[k]["peak_over_mean"]]
 YMIN, YMAX = 1.0, max(2.45, max(_peaks) * 1.05)
-def xp(i): return PAD + i * (W - 2 * PAD) / (L - 1)
-def yp(v): return H - PAD - (v - YMIN) / (YMAX - YMIN) * (H - 2 * PAD)
+
+
+def xp(i):
+    return PAD + i * (W - 2 * PAD) / (L - 1)
+
+
+def yp(v):
+    return H - PAD - (v - YMIN) / (YMAX - YMIN) * (H - 2 * PAD)
 
 
 def spark(key, color):
@@ -66,18 +92,22 @@ def spark(key, color):
     dots = "".join(
         f'<circle cx="{xp(i):.1f}" cy="{yp(v):.1f}" r="4" fill="{color}" '
         f'stroke="var(--surface-1)" stroke-width="2"><title>L{i} · {v:.3f}×</title></circle>'
-        for i, v in enumerate(pk))
+        for i, v in enumerate(pk)
+    )
     nf = D[key]["noise_floor"]
-    return (f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2" '
-            f'stroke-linejoin="round"/>{dots}'
-            f'<line x1="{PAD}" y1="{yp(nf):.1f}" x2="{W-PAD}" y2="{yp(nf):.1f}" '
-            f'stroke="{color}" stroke-width="1.5" stroke-dasharray="3 4" opacity="0.75"/>')
+    return (
+        f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2" '
+        f'stroke-linejoin="round"/>{dots}'
+        f'<line x1="{PAD}" y1="{yp(nf):.1f}" x2="{W - PAD}" y2="{yp(nf):.1f}" '
+        f'stroke="{color}" stroke-width="1.5" stroke-dasharray="3 4" opacity="0.75"/>'
+    )
 
 
 grid = "".join(
-    f'<line x1="{PAD}" y1="{yp(v):.1f}" x2="{W-PAD}" y2="{yp(v):.1f}" stroke="var(--grid)"/>'
-    f'<text x="{PAD-2}" y="{yp(v)+3:.1f}" class="ax" text-anchor="end">{v:.1f}×</text>'
-    for v in (1.0, 1.5, 2.0))
+    f'<line x1="{PAD}" y1="{yp(v):.1f}" x2="{W - PAD}" y2="{yp(v):.1f}" stroke="var(--grid)"/>'
+    f'<text x="{PAD - 2}" y="{yp(v) + 3:.1f}" class="ax" text-anchor="end">{v:.1f}×</text>'
+    for v in (1.0, 1.5, 2.0)
+)
 
 # The table view the heatmap and the line chart both needed.
 per_layer_rows = []
@@ -85,20 +115,27 @@ for li in range(L):
     sh = D["prefill"]["share_by_layer"][li]
     peak_r = max(range(EP), key=lambda r: sh[r])
     cells = "".join(
-        f'<td class="{"pkc" if r == peak_r else ""}">{sh[r]:.2f}</td>' for r in range(EP))
+        f'<td class="{"pkc" if r == peak_r else ""}">{sh[r]:.2f}</td>'
+        for r in range(EP)
+    )
     per_layer_rows.append(
         f'<tr><th scope="row">L{li}</th>{cells}'
         f'<td class="em">{D["prefill"]["peak_over_mean"][li]:.3f}×</td>'
-        f'<td>{D["decode"]["peak_over_mean"][li]:.3f}×</td></tr>')
+        f"<td>{D['decode']['peak_over_mean'][li]:.3f}×</td></tr>"
+    )
+
 
 def agg_row(key, label):
     a = D[key]["aggregate_share"]
-    return (f'<tr><th scope="row">{label}</th>'
-            + "".join(f"<td>{v:.2f}</td>" for v in a)
-            + f'<td class="em">{D[key]["aggregate_imbalance"]:.3f}×</td></tr>')
+    return (
+        f'<tr><th scope="row">{label}</th>'
+        + "".join(f"<td>{v:.2f}</td>" for v in a)
+        + f'<td class="em">{D[key]["aggregate_imbalance"]:.3f}×</td></tr>'
+    )
+
 
 legend_ticks = "".join(f'<span class="sw" style="background:{c}"></span>' for c in RAMP)
-axis_ticks = "".join(f"<span>{i if i%6==0 else ''}</span>" for i in range(L))
+axis_ticks = "".join(f"<span>{i if i % 6 == 0 else ''}</span>" for i in range(L))
 
 page = f"""<title>Rank Imbalance by Layer — {MODEL}</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -193,33 +230,33 @@ hr {{ border:0; border-top:1px solid var(--grid); margin:0 }}
 
 <div class="wrap">
   <header>
-    <div class="eyebrow">{MODEL} · DP={EP} EP={EP} · {L} MoE layers · {_any.get("num_logical_experts","?")} logical experts</div>
+    <div class="eyebrow">{MODEL} · DP={EP} EP={EP} · {L} MoE layers · {_any.get("num_logical_experts", "?")} logical experts</div>
     <h1>The same imbalance, measured two ways</h1>
     <p class="lede">Expert load across eight ranks looks almost even when the layers are
       summed first. Per layer — which is what a step actually waits on — it is not. These
-      are the same {D['prefill']['forwards']} prefill forwards, read with two metrics.</p>
+      are the same {D["prefill"]["forwards"]} prefill forwards, read with two metrics.</p>
   </header>
 
   <section>
     <div class="duo">
       <div class="card tile lo">
         <div class="k">Summed over layers</div>
-        <div class="v">{D['prefill']['aggregate_imbalance']:.3f}×</div>
+        <div class="v">{D["prefill"]["aggregate_imbalance"]:.3f}×</div>
         <div class="n">Add all {L} layers per rank, then compare ranks. Reads as
           near-balanced: {UNIFORM:.2f}% would be even, and the spread is
-          {max(D['prefill']['aggregate_share'])-min(D['prefill']['aggregate_share']):.2f}
+          {max(D["prefill"]["aggregate_share"]) - min(D["prefill"]["aggregate_share"]):.2f}
           points. <strong>This is the misleading one.</strong></div>
       </div>
       <div class="card tile hi">
         <div class="k">Per-layer critical path</div>
-        <div class="v">{D['prefill']['critical_path']:.3f}×</div>
+        <div class="v">{D["prefill"]["critical_path"]:.3f}×</div>
         <div class="n">Sum each layer's <em>peak</em> rank, divide by the sum of its means.
           Every layer is its own collective and waits for its own slowest rank, so this is
           the figure that costs time.</div>
       </div>
     </div>
     <p class="note">Multinomial noise alone would give
-      {D['prefill']['noise_floor']:.3f}× at {D['prefill']['tokens_per_expert']} tokens per
+      {D["prefill"]["noise_floor"]:.3f}× at {D["prefill"]["tokens_per_expert"]} tokens per
       expert, so the per-layer skew is real routing behaviour rather than sampling.</p>
   </section>
 
@@ -251,19 +288,19 @@ hr {{ border:0; border-top:1px solid var(--grid); margin:0 }}
     <h2>Per-layer peak over mean, prefill against decode</h2>
     <p>Both regimes carry a real, comparable skew. The dashed line under each series is
       that regime's noise floor — decode's is high because it has only
-      {D['decode']['tokens_per_expert']} tokens per expert, prefill's is near 1.0 because it
-      has {D['prefill']['tokens_per_expert']}.</p>
+      {D["decode"]["tokens_per_expert"]} tokens per expert, prefill's is near 1.0 because it
+      has {D["prefill"]["tokens_per_expert"]}.</p>
     <div class="card">
       <div class="legend" style="margin-bottom:12px">
         <b><span class="dot" style="background:var(--series-1)"></span>Prefill · median
-          {D['prefill']['critical_path']:.3f}×</b>
+          {D["prefill"]["critical_path"]:.3f}×</b>
         <b><span class="dot" style="background:var(--series-2)"></span>Decode · median
-          {D['decode']['critical_path']:.3f}×</b>
+          {D["decode"]["critical_path"]:.3f}×</b>
       </div>
       <div style="overflow-x:auto">
         <svg viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img"
              aria-label="Per-layer peak-over-mean rank imbalance, prefill and decode, across {L} layers">
-          {grid}{spark("decode","var(--series-2)")}{spark("prefill","var(--series-1)")}
+          {grid}{spark("decode", "var(--series-2)")}{spark("prefill", "var(--series-1)")}
         </svg>
       </div>
       <div class="axrow" style="margin-left:0">{axis_ticks}</div>
@@ -285,7 +322,7 @@ hr {{ border:0; border-top:1px solid var(--grid); margin:0 }}
       </table>
     </div>
     <p class="note">Shares are percentages of that layer's tokens and each row sums to
-      100%. Averaged over the {D['prefill']['forwards']} prefill forwards in the dump.</p>
+      100%. Averaged over the {D["prefill"]["forwards"]} prefill forwards in the dump.</p>
   </section>
 
   <section>
@@ -298,7 +335,7 @@ hr {{ border:0; border-top:1px solid var(--grid); margin:0 }}
         <thead><tr><th scope="col" style="text-align:left">Regime</th>
           {"".join(f'<th scope="col">r{r}</th>' for r in range(EP))}
           <th scope="col">peak / mean</th></tr></thead>
-        <tbody>{agg_row("prefill","Prefill")}{agg_row("decode","Decode")}</tbody>
+        <tbody>{agg_row("prefill", "Prefill")}{agg_row("decode", "Decode")}</tbody>
       </table>
     </div>
   </section>
@@ -315,12 +352,12 @@ hr {{ border:0; border-top:1px solid var(--grid); margin:0 }}
           <th scope="col">BLOCK_SIZE_M</th><th scope="col">blocks / expert</th>
           <th scope="col">critical path</th><th scope="col">transduces?</th></tr></thead>
         <tbody>
-          <tr><th scope="row">Prefill</th><td>{D['prefill']['M']:,}</td>
-            <td>{D['prefill']['tokens_per_expert']}</td><td>128</td><td>8</td>
-            <td class="em">{D['prefill']['critical_path']:.3f}×</td><td class="em">yes</td></tr>
-          <tr><th scope="row">Decode</th><td>{D['decode']['M']:,}</td>
-            <td>{D['decode']['tokens_per_expert']}</td><td>32</td><td>1</td>
-            <td class="em">{D['decode']['critical_path']:.3f}×</td><td>no</td></tr>
+          <tr><th scope="row">Prefill</th><td>{D["prefill"]["M"]:,}</td>
+            <td>{D["prefill"]["tokens_per_expert"]}</td><td>128</td><td>8</td>
+            <td class="em">{D["prefill"]["critical_path"]:.3f}×</td><td class="em">yes</td></tr>
+          <tr><th scope="row">Decode</th><td>{D["decode"]["M"]:,}</td>
+            <td>{D["decode"]["tokens_per_expert"]}</td><td>32</td><td>1</td>
+            <td class="em">{D["decode"]["critical_path"]:.3f}×</td><td>no</td></tr>
         </tbody>
       </table>
     </div>

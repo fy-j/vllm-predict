@@ -70,7 +70,8 @@ def main() -> int:
         except ImportError:
             if rank == 0:
                 report(
-                    "NVSHMEM importable", False,
+                    "NVSHMEM importable",
+                    False,
                     "neither nvshmem.core nor pynvshmem; install NVSHMEM's Python "
                     "bindings with `uv pip install --extra-index-url "
                     "https://pypi.nvidia.com nvshmem4py-cu13`. They are not on public "
@@ -139,7 +140,8 @@ def main() -> int:
     if not takes_stream:
         if rank == 0:
             report(
-                "stream-ordered put", False,
+                "stream-ordered put",
+                False,
                 "no host-initiated put taking a stream. A device-side-only put needs "
                 "a flag and polling, and polling is per-rank timing — the divergence "
                 "class that deadlocked this branch twice. Reconsider before using it.",
@@ -164,10 +166,15 @@ def main() -> int:
     got = int(recv[0].item())
     if rank == 0:
         report(
-            "wait_event orders the put", got == expected,
+            "wait_event orders the put",
+            got == expected,
             f"expected {expected}, got {got}"
-            + ("" if got == expected else "; a stream event is not sufficient, so the "
-               "consumer needs an NVSHMEM fence instead"),
+            + (
+                ""
+                if got == expected
+                else "; a stream event is not sufficient, so the "
+                "consumer needs an NVSHMEM fence instead"
+            ),
         )
 
     # The number that decides how much hiding the transfer still needs.
@@ -188,10 +195,14 @@ def main() -> int:
         gbs = EXPERT_BYTES / (med * 1e-6) / 1e9
         print(f"\n9.00 MiB put: p50 {med:8.1f} us  ({gbs:6.1f} GB/s)")
         print(f"              min {min(times):8.1f} us   max {max(times):8.1f} us")
-        print(f"  PCIe on the 5090 node measured 289 us. 43 per forward is "
-              f"{43 * med / 1000:.1f} ms here against 12.4 ms there.")
-        print("  Under ~50 us the planning delay can stay at one layer and the "
-              "lookahead need not rise, so prediction accuracy costs nothing.")
+        print(
+            f"  PCIe on the 5090 node measured 289 us. 43 per forward is "
+            f"{43 * med / 1000:.1f} ms here against 12.4 ms there."
+        )
+        print(
+            "  Under ~50 us the planning delay can stay at one layer and the "
+            "lookahead need not rise, so prediction accuracy costs nothing."
+        )
 
     dist.barrier()
     dist.destroy_process_group()

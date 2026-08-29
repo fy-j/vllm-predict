@@ -229,9 +229,11 @@ class PredictiveExpertReplicationConfig:
     replicas costs that many transfers, and the interconnect budget binds on
     transfers.
 
-    In practice it counts *planned placements*, before `reconcile` drops the ones
-    already resident, so it bounds coverage rather than bytes. The byte bound is
-    `max_concurrent_transfer_bytes`, which is not implemented.
+    Charged after `reconcile`, so a replica already resident costs nothing: the bound is
+    on churn, not on how many replicas end up active. Coverage ratchets up over
+    successive forwards while the load is stable, and the bound bites when a shift in
+    traffic invalidates the resident set. The separate byte bound is
+    `max_concurrent_transfer_bytes`, which is not yet implemented.
     """
     static_replica_placement: str | None = None
     """Install a fixed replica at startup, as `"<logical expert>:<target rank>"`.
