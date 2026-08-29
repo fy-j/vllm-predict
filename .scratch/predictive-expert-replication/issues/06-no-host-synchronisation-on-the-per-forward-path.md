@@ -34,6 +34,18 @@ expression does not look like one. Second, still open: the put kernel needs a bu
 path in the worker, whose seven toolchain traps are written down in `bench/RESULTS.md`,
 2026-08-30 — each one fails with a message naming the wrong cause.
 
+**A third consequence, found 2026-08-30 while scoping the wiring, and not implied by the
+criteria as written.** Once the plan is a device tensor the host no longer knows what was
+placed, and three pieces of bookkeeping currently derive from knowing: the residency set that
+makes an already-resident replica cost no transfer, the per-forward transfer budget, and the
+layout edit that reverts a row. All three are Python objects built from `list[Placement]`. Left
+as they are, each one reads the plan back and puts the synchronisation straight back — which is
+the failure mode most likely to produce a run that looks correct and measures nothing. They
+have to become device tensors: a `[num_layers, ep_size]` resident-expert table, a device
+counter for the budget, and a scatter for the layout. The residency table is the one that
+matters for benefit, not just for cost, because transfer reuse across forwards is what lets
+coverage ratchet up to all 43 layers.
+
 - [ ] A device scatter publishes the **source-local** map pair. Writing the global pair
       instead transfers the replica, describes it correctly, and publishes it where nothing
       reads: a measured run then activated 131 replicas per forward and removed 0.6% of
