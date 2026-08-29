@@ -25,12 +25,14 @@ host-issued**, so the device-issued route costs nothing in time. The masking alt
 issue every put the plan might have chosen — is ruled out at about 230 us per layer, 10 ms
 across 43 layers against a ceiling near 5%.
 
-Two consequences for the work here. `plan_one_layer_on_device` currently returns through the
-host (`int()`, `float()`, `bool()` on device tensors), so it must be made fully tensorised
-even though ticket 04 is closed; the tensor it already returns is the right contract. And the
-put kernel needs a small build-and-register path in the worker, whose seven toolchain traps
-are written down in `bench/RESULTS.md`, 2026-08-30 — each one fails with a message naming the
-wrong cause.
+Two consequences for the work here. **The first is done:** `plan_one_layer_on_device` returned
+through the host (`int()`, `float()` and `bool()` on device tensors, each a synchronisation) and
+is now fully tensorised, with bit-identity to the host planner still holding over the randomised
+sweep on CPU and CUDA. It is guarded by `set_sync_debug_mode("error")` rather than by grepping
+the source, because a synchronisation arrives through a dozen spellings and an indexing
+expression does not look like one. Second, still open: the put kernel needs a build-and-register
+path in the worker, whose seven toolchain traps are written down in `bench/RESULTS.md`,
+2026-08-30 — each one fails with a message naming the wrong cause.
 
 - [ ] A device scatter publishes the **source-local** map pair. Writing the global pair
       instead transfers the replica, describes it correctly, and publishes it where nothing

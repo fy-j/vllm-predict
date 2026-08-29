@@ -204,3 +204,52 @@ def test_the_result_is_a_device_tensor_the_transfer_can_read_without_the_host():
     assert out.dtype == torch.int64
     assert out.device == load.device
     assert tuple(out.shape) == (4,)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="a host read is only observable on CUDA"
+)
+def test_planning_performs_no_host_read():
+    """Ticket 06's headline criterion, at the seam where it is decided.
+
+    "On the device" has two meanings and only one of them is worth anything here. The
+    arithmetic ran on the device from the start, but the function returned through
+    `int()`, `float()` and `bool()` on device tensors, each of which is a
+    synchronisation — so the host still waited once per predicted layer, which is 70% of
+    what prediction costs and the entire reason for the ticket.
+
+    `set_sync_debug_mode("error")` is the check rather than grepping the source, because
+    the sync can arrive through any of a dozen spellings and an indexing expression does
+    not look like one.
+    """
+    load = torch.ones(128, dtype=torch.int64, device="cuda")
+    load[3] = 400
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        out = plan_one_layer_on_device(load, 8, 0.0)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert out.device.type == "cuda"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="a host read is only observable on CUDA"
+)
+def test_a_layer_that_places_nothing_also_performs_no_host_read():
+    """The empty case took the earliest host read of all, and it is the common one.
+
+    Deciding "this forward placed nothing" from `float(rank_load.sum())` synchronised
+    before any of the rest ran, so a balanced layer paid the full cost to decide it had
+    nothing to do.
+    """
+    load = torch.zeros(128, dtype=torch.int64, device="cuda")
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        out = plan_one_layer_on_device(load, 8, 0.0)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert int(out[0]) == 0

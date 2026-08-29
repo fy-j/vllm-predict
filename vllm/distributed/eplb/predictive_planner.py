@@ -529,26 +529,29 @@ def plan_one_layer_on_device(
     """One layer's placement, decided entirely on the device.
 
     The device counterpart of `plan_replicas` at `max_replicas_per_layer = 1`, the
-    default. Ticket 04. It exists so the plan never has to reach the host: the host
-    synchronisation `plan_and_launch` performs once per predicted layer costs 5.28 ms of
-    collective waiting per layer, 70% of what prediction adds, and it is there only
-    because the planner runs in Python.
+    default. Ticket 04, completed by ticket 06. It exists so the plan never has to reach
+    the host: the host synchronisation `plan_and_launch` performs once per predicted
+    layer costs 5.28 ms of collective waiting, 70% of what prediction adds, and it is
+    there only because the planner runs in Python.
+
+    **Nothing here reads a value back.** "On the device" has two meanings and only one
+    is worth anything: the arithmetic ran on the device from the first version, which
+    still returned through `int()`, `float()` and `bool()` on device tensors — each a
+    synchronisation, so the cost the function exists to remove was still being paid. The
+    result is assembled as a tensor and every branch is a mask.
 
     **Bit-identity with the host planner is a correctness property, not a nicety.**
     Every rank derives the plan locally from the same snapshot, so a plan that differs
     by rank pairs a sender with no receiver and hangs the engine. Two things make exact
     agreement achievable rather than approximate:
 
-    * The snapshot is integer, and the only non-integer step is a halving, so every
-    value
-      here is exactly representable in float64. Comparisons and equalities therefore
-      mean
-      what they do in Python, and `gain == gain.max()` is safe.
+    * The snapshot is integer and the only non-integer step is a halving, so every
+      value here is exactly representable in float64. Comparisons and equalities
+      therefore mean what they do in Python, and `gain == gain.max()` is safe.
     * Reductions that could depend on block order are avoided. A device argmax over
-    floats
-      is order-dependent, and two ranks reducing the same values in a different order
-      can pick different experts; the winner is selected by an explicit lowest-index
-      rule over an equality mask instead.
+      floats is order-dependent, and two ranks reducing the same values in a different
+      order can pick different experts; the winner is selected by an explicit
+      lowest-index rule over an equality mask instead.
 
     Args:
         expert_load: `[num_logical_experts]` predicted load, integer-valued, already
@@ -560,9 +563,11 @@ def plan_one_layer_on_device(
 
     Returns:
         A `[4]` int64 device tensor `(found, logical_expert, target_rank, moved_x2)`.
-        `found` is 0 or 1; the remaining entries are meaningless when it is 0.
-        `moved_x2` is twice the moved load, kept integral so the whole result stays
-        exact — the caller halves it if it needs the value.
+        `found` is 0 or 1, and the other entries are zero when it is 0 rather than
+        garbage — the winner index is 0 over an all-rejected mask, so they would
+        otherwise name a real placement that was refused. `moved_x2` is twice the moved
+        load, kept integral so the whole result stays exact; the caller halves it if it
+        needs the value.
     """
     num_logical = expert_load.numel()
     if num_logical % ep_size != 0:
@@ -570,57 +575,64 @@ def plan_one_layer_on_device(
             f"{num_logical} logical experts do not divide across {ep_size} EP ranks."
         )
     per_rank = num_logical // ep_size
+    device = expert_load.device
     load = expert_load.to(torch.float64)
     rank_load = load.view(ep_size, per_rank).sum(dim=1)
-
-    empty = torch.zeros(4, dtype=torch.int64, device=expert_load.device)
-    if float(rank_load.sum()) <= 0.0:
-        # A dummy or padding-only forward. Checked on the host because this is the one
-        # value already known there — the caller decided to run at all from it.
-        return empty
+    ranks = torch.arange(ep_size, device=device)
 
     # The first maximum, matching Python's `max(range(n), key=...)`, so ties go to the
-    # lowest rank id exactly as the host planner's do.
+    # lowest rank id exactly as the host planner's do. Kept as a 0-dim tensor: reading
+    # it out with `int()` is a synchronisation, and one per predicted layer is 70% of
+    # what prediction costs.
     peak_load = rank_load.max()
-    peak = int((rank_load == peak_load).to(torch.int64).argmax())
-
-    peak_experts = load.view(ep_size, per_rank)[peak]
+    peak = (rank_load == peak_load).to(torch.int64).argmax()
+    peak_experts = load.view(ep_size, per_rank).index_select(0, peak.view(1)).squeeze(0)
     moved = peak_experts * 0.5
 
-    # Every (expert on the peak rank, target rank) pair at once. 16 x 8 x 8 values for
-    # this model, so materialising the trial loads is cheaper than being clever about
-    # it.
-    trial = rank_load.view(1, 1, ep_size).repeat(per_rank, ep_size, 1)
-    idx = torch.arange(ep_size, device=load.device)
-    trial[:, :, peak] -= moved.view(per_rank, 1)
-    trial[torch.arange(per_rank).view(-1, 1), idx.view(1, -1), idx.view(1, -1)] += (
-        moved.view(per_rank, 1)
+    # Every (expert on the peak rank, target rank) pair at once, built by broadcasting
+    # rather than by writing into a repeated tensor: an in-place update at a tensor
+    # index is the kind of expression that reads as pure device work and is not.
+    # Dimensions are (expert offset, target rank, rank whose load this is).
+    trial = (
+        rank_load.view(1, 1, ep_size)
+        - moved.view(per_rank, 1, 1)
+        * (ranks == peak).to(load.dtype).view(1, 1, ep_size)
+        + moved.view(per_rank, 1, 1)
+        * (ranks.view(1, ep_size, 1) == ranks.view(1, 1, ep_size)).to(load.dtype)
     )
     gain = peak_load - trial.max(dim=2).values
 
     admissible = (
         (moved.view(per_rank, 1) >= min_tokens)
         & (moved.view(per_rank, 1) > 0)
-        & (idx.view(1, ep_size) != peak)
+        & (ranks.view(1, ep_size) != peak)
         & (gain > 0)  # relocating the peak is not lowering it
     )
-    if not bool(admissible.any()):
-        return empty
+    # A dummy or padding-only forward places nothing, and deciding that on the host was
+    # the earliest read of all — so a balanced layer paid the full synchronisation to
+    # learn it had nothing to do.
+    found = admissible.any() & (rank_load.sum() > 0)
 
     # Strongest gain, then the lowest expert id, then the lowest target id. The
-    # flattened order is expert-major, so "first admissible index at the maximum gain"
-    # is exactly the host planner's tie-break, and taking it from an equality mask keeps
-    # the choice independent of how the reduction was scheduled.
+    # flattened order is expert-major, so "first admissible index at the max gain" is
+    # the host planner's tie-break, and taking it from an equality mask keeps the choice
+    # independent of how the reduction was scheduled.
     masked = torch.where(admissible, gain, torch.full_like(gain, float("-inf")))
     flat = masked.reshape(-1)
-    best = flat == flat.max()
-    winner = int(best.to(torch.int64).argmax())
-    offset, target = divmod(winner, ep_size)
+    winner = (flat == flat.max()).to(torch.int64).argmax()
+    offset = winner // ep_size
+    target = winner % ep_size
 
-    out = empty.clone()
-    out[0] = 1
-    out[1] = peak * per_rank + offset
-    out[2] = target
-    # Twice the moved load, which is the original integer expert count.
-    out[3] = int(peak_experts[offset])
-    return out
+    out = torch.stack(
+        [
+            found.to(torch.int64),
+            peak * per_rank + offset,
+            target,
+            # Twice the moved load, which is the original integer expert count.
+            peak_experts.index_select(0, offset.view(1)).squeeze(0).to(torch.int64),
+        ]
+    )
+    # Zeroed rather than left as garbage when nothing was found: `winner` is 0 over an
+    # all `-inf` mask, so the other entries would otherwise name a real placement that
+    # was rejected.
+    return out * found.to(torch.int64)
