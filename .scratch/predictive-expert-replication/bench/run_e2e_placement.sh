@@ -36,6 +36,12 @@ PORT="${PORT:-8180}"
 # `0` enables prediction but withholds placement, `43` places. Any two of these answer
 # a different question, so quote which pair a number came from.
 BUDGETS="${BUDGETS:-off 0 43}"
+# How many times to measure each arm. One pass cannot see a 5% effect: between two runs of
+# this script the stock arm alone moved 28% on mean TTFT and 40% on throughput, on identical
+# workloads, because the machine was in a better state. Arms are measured in blocks —
+# every arm once, then again — so a drift in machine state spreads across all of them
+# instead of landing on whichever ran last.
+REPEATS="${REPEATS:-1}"
 NUM_PROMPTS="${NUM_PROMPTS:-120}"
 CONC="${CONC:-64}"
 # Decode length. Short values raise the share of forwards that are prefill, which is
@@ -68,8 +74,11 @@ PROMPTS="$HERE/results/prompts-$DOMAIN-p1024.jsonl"
 [[ -s "$PROMPTS" ]] || { echo "[e2e] missing $PROMPTS" >&2; exit 1; }
 echo "[e2e] domain=$DOMAIN"
 
+for repeat in $(seq 1 "$REPEATS"); do
 for budget in $BUDGETS; do
-  tag="b$budget"
+  # The tag carries the repeat only when there is more than one, so a single-pass run keeps
+  # the filenames every existing reader and every recorded result already expects.
+  if [[ "$REPEATS" -gt 1 ]]; then tag="b${budget}-r${repeat}"; else tag="b$budget"; fi
   echo "[e2e] budget=$budget: starting server"
   LOG="$OUT_DIR/server-$tag.log"
   DUMP="$OUT_DIR/dump-$tag.jsonl"
@@ -193,10 +202,17 @@ print(json.dumps({'predictive_expert_replication': cfg}))" "$PROFILE" "$budget")
   for p in $(ps -eo pid,cmd --no-headers | grep "VLLM::" | grep -v grep | awk '{print $1}'); do kill -9 "$p" 2>/dev/null; done
   sleep 10
 done
-# One guard over every arm, because the per-arm messages above only ever printed. Three
-# runs in this project reported success having measured nothing, and each of them printed a
-# warning to stderr and carried on.
-if ! python3 "$HERE/check_run_measured.py" --results-dir "$OUT_DIR" --arms $BUDGETS; then
+done
+# One guard over every arm of every repeat, because the per-arm messages above only ever
+# printed. Three runs in this project reported success having measured nothing, and each of
+# them printed a warning to stderr and carried on.
+guard_arms=""
+for repeat in $(seq 1 "$REPEATS"); do
+  for budget in $BUDGETS; do
+    if [[ "$REPEATS" -gt 1 ]]; then guard_arms="$guard_arms ${budget}-r${repeat}"; else guard_arms="$guard_arms $budget"; fi
+  done
+done
+if ! python3 "$HERE/check_run_measured.py" --results-dir "$OUT_DIR" --arms $guard_arms; then
   echo "[e2e] MEASURED NOTHING - do not read $OUT_DIR" >&2
   exit 5
 fi

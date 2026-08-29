@@ -2100,3 +2100,75 @@ than a detail. Options, in increasing cost:
 
 Recorded as a warning rather than a fix: no TTFT number from this harness should be quoted
 across runs until arms are repeated or interleaved.
+
+## Fixing the ruler: the operating point was wrong, and so were three of my own numbers
+
+Prompted by the observation that concurrency 8 over DP=8 is one request per rank, and that
+what the feature can shorten is a prefill *step* — so the point to measure at is the highest
+concurrency that does not queue, where TTFT is the step and not the wait behind other
+requests.
+
+### The knee is 16, and the theory that said 64 was wrong
+
+`run_concurrency_knee.sh` sweeps one stock server, so no restart drift enters the comparison.
+1024 prompts, `ko`, OUT_LEN=1:
+
+| concurrency | mean TTFT | median | p99 | req/s | median vs c=1 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 112.4 | 111.6 | 143.6 | 8.9 | 1.00 |
+| 4 | 130.3 | 126.5 | 141.6 | 30.6 | 1.13 |
+| 8 | 141.2 | 125.4 | **629.2** | 56.5 | 1.12 |
+| **16** | 137.4 | **138.7** | 162.3 | 113.5 | **1.24** |
+| 32 | 195.8 | 184.2 | 354.4 | 157.7 | 1.65 |
+| 48 | 246.6 | 247.0 | 346.2 | 188.6 | 2.21 |
+| 64 | 301.8 | 281.9 | 494.9 | 199.6 | 2.53 |
+| 96 | 386.5 | 414.2 | 557.7 | 228.7 | 3.71 |
+| 128 | 439.7 | 421.9 | 607.5 | 263.9 | 3.78 |
+
+**Concurrency 16 is the highest that does not queue** — median TTFT 1.24x the unloaded value,
+against 1.65x at 32 — and it carries twice the throughput of 8. Note also that 8, the point
+every earlier figure in this file was taken at, has a p99 of 629 ms against 16's 162: it has a
+tail anomaly that 4 and 16 both lack, which is its own reason not to measure there.
+
+**The theoretical estimate of 64 was wrong and the error is instructive.** It assumed a rank
+fits eight 958-token prompts in one 8192-token forward, times eight ranks. But under
+`allgather_reducescatter` every rank's MoE runs over *all* DP ranks' tokens, so per-rank
+compute grows with **total** concurrency rather than with per-rank batching. The no-queue
+limit is therefore far below the batching limit.
+
+### Cost and ceiling in one unit at last, and three corrections
+
+The anchors that disagreed 8x disagreed because one of them was **summed across streams**.
+Attributed GPU time adds the durations of kernels on the compute stream, the token-collective
+stream and the prediction stream, which overlap; a prefill window's **wall-clock** duration is
+what compares with TTFT. Measured on the same run, three arms, median across ranks:
+
+| arm | window wall-clock | vs off |
+| --- | --- | --- |
+| feature disabled | 85.7 ms | — |
+| prediction only | 105.5 ms | **+23.1%** |
+| placing | 129.4 ms | **+51.0%** |
+
+And in the `off` arm, per rank, within the same run:
+
+    window wall-clock        86.9 ms
+    kernel time              72.9 ms   -> 84% occupancy
+    expert GEMM              12.42 ms  -> 14.29% of the window
+    perfect balance saves     5.83 ms  -> 6.71% of the window
+    at the online 24% recovery 1.40 ms -> 1.61% of the window
+
+Three things I had written here are corrected by this:
+
+1. **The ceiling is 6.71% of a prefill window, not 5.05%.** The 5.05% divided by attributed
+   time, which double-counts overlapping streams, so it understated the expert GEMM's share:
+   14.29% of wall-clock rather than 10.76% of a summed total.
+2. **The window is not mostly idle.** I read an 8-rank-summed kernel total as a per-rank one
+   and concluded occupancy was ~10%. Seven of eight ranks are at 84%; only `dp0` sits at 35%,
+   and it is the rank that receives less work.
+3. **The ceiling expressed against TTFT is not 2.6%.** That figure came from the same
+   summed-time denominator. With the wall-clock window at 86.9 ms and mean TTFT around 132 ms
+   at this concurrency, a prefill step is most of TTFT, not half of it.
+
+So at concurrency 8: ceiling 6.71%, prediction costs 22.8%, placing costs 50.3% — 3.4x and
+7.5x the ceiling. Both are properties of the wrong operating point, and both are being
+re-measured at the knee.
