@@ -811,6 +811,13 @@ class EplbState:
     _predictive_stream: torch.cuda.Stream | None = None
     """Ordered predictive communication stream, spec section 9."""
 
+    _one_sided: object | None = None
+    """The worker's NVSHMEM transport, initialised once and shared by every layer.
+
+    One symmetric staging buffer per worker, not per layer: at most one expert is in
+    flight, so sizing it per layer would multiply it by the row count for nothing.
+    """
+
     _logged_inactive_slot_check: bool = False
     """Set once the inactive-slot check has reported, so it logs a single line."""
 
@@ -911,6 +918,13 @@ class EplbState:
             top_k=model.moe_layers[0].moe_config.experts_per_token,
             num_batched_tokens=batched * ep_group.size(),
         )
+        if predictive.device_issued_transfer:
+            coordinator = self._build_device_coordinator(
+                model_config, model_state, ep_group, float(block_size_m)
+            )
+            if coordinator is not None:
+                self._attach(model, coordinator, float(block_size_m))
+                return
         coordinator = PlacementCoordinator(
             ep_size=ep_group.size(),
             ep_rank=ep_group.rank(),
@@ -930,12 +944,147 @@ class EplbState:
                 model_config, layer, placements
             ),
         )
+        self._attach(model, coordinator, float(block_size_m))
+
+    def _attach(self, model, coordinator, block_size_m: float) -> None:
+        """Give every MoE layer the coordinator and the shared token bar."""
         for layer in model.moe_layers:
             layer.placement_coordinator = coordinator
             # Prediction and placement share one bar. Predicting a forward the
             # placement gate is certain to reject costs a gate matmul and a small
             # AllGather per layer for nothing: measured at 7.3% of TPOT.
-            layer.prediction_min_tokens_per_expert = float(block_size_m)
+            layer.prediction_min_tokens_per_expert = block_size_m
+
+    def _build_device_coordinator(
+        self, model_config: ModelConfig, model_state, ep_group, block_size_m: float
+    ):
+        """The device-issued path, or None with a warning saying what was missing.
+
+        Returning None rather than raising, because the host path still works and still
+        serves — but *loudly*, because a silent fallback here produces a run that looks
+        correct while measuring the very cost it was meant to remove. That has happened
+        on this branch more than once, and it is why `analyse_e2e.py` treats an
+        activation log line as the evidence a path was reached at all.
+        """
+        from vllm.distributed.eplb.device_coordinator import (
+            DevicePlacementCoordinator,
+            LayerMaps,
+        )
+        from vllm.distributed.eplb.device_transfer import (
+            DeviceExpertTransfer,
+            WeightPointers,
+        )
+        from vllm.distributed.eplb.nvshmem_transfer import (
+            nvshmem_unavailable_reason,
+        )
+
+        predictive = self.parallel_config.predictive_expert_replication_config
+        model = model_state.model
+        reason = nvshmem_unavailable_reason()
+        if reason is not None:
+            logger.warning(
+                "Predictive expert replication: falling back to the host-issued "
+                "transfer because %s. The host synchronisation this path removes is "
+                "5.28 ms per predicted layer, so the feature is expected to cost more "
+                "than it returns in this configuration.",
+                reason,
+            )
+            return None
+
+        # Publishing needs the source-local maps, which the placement path writes into
+        # rather than rebuilding. They are allocated here so a layer cannot be reached
+        # with them unset.
+        self.publish_source_local_maps(model_config)
+
+        canonical_per_rank = model.num_logical_experts // ep_group.size()
+        per_local = canonical_per_rank + predictive.replica_slots_per_rank
+        layout = model_state.physical_to_logical_map.view(
+            -1, ep_group.size(), per_local
+        )
+        try:
+            pointers = [
+                WeightPointers.build(tensors) for tensors in model.expert_weights
+            ]
+            maps = []
+            for index, layer_module in enumerate(model.moe_layers):
+                layer_state = layer_module.eplb_state
+                maps.append(
+                    LayerMaps(
+                        logical_to_physical=model_state.logical_to_physical_map[index],
+                        logical_replica_count=model_state.logical_replica_count[index],
+                        source_local=layer_state.source_local_physical_map,
+                        source_local_replica_count=(
+                            layer_state.source_local_replica_count
+                        ),
+                        layout=layout[index],
+                    )
+                )
+            staging = self._symmetric_staging(
+                ep_group, max(p.total_bytes for p in pointers)
+            )
+            transfer = DeviceExpertTransfer(
+                staging=staging,
+                ep_rank=ep_group.rank(),
+                per_rank_experts=canonical_per_rank,
+            )
+        except Exception:
+            logger.exception(
+                "Predictive expert replication: the device-issued transfer could not "
+                "be set up, so the host-issued path is used. This is not a silent "
+                "fallback: the run below measures the host synchronisation."
+            )
+            return None
+
+        logger.info(
+            "Predictive expert replication: device-issued transfer active on %d "
+            "layers, %d ranks.",
+            len(pointers),
+            ep_group.size(),
+        )
+        return DevicePlacementCoordinator(
+            ep_size=ep_group.size(),
+            ep_rank=ep_group.rank(),
+            canonical_per_rank=canonical_per_rank,
+            replica_slots_per_rank=predictive.replica_slots_per_rank,
+            num_layers=len(model.expert_weights),
+            lookahead=predictive.prediction_lookahead_layers,
+            budget=predictive.max_transfers_per_forward,
+            min_tokens=block_size_m,
+            min_tokens_per_expert=block_size_m,
+            pointers=pointers,
+            maps=maps,
+            transfer=transfer,
+            device=self.device,
+            stream=self._placement_stream(),
+        )
+
+    def _symmetric_staging(self, ep_group, expert_bytes: int) -> torch.Tensor:
+        """One symmetric staging buffer for this worker, allocated once.
+
+        NVSHMEM is initialised here rather than earlier because it has to come after
+        torch and NCCL, which vLLM brings up first and this code does not get to
+        precede.
+        """
+        if self._one_sided is None:
+            from vllm.distributed.eplb.nvshmem_transfer import OneSidedExpertTransfer
+
+            def broadcast_uid(local):
+                holder = [local]
+                torch.distributed.broadcast_object_list(
+                    holder,
+                    src=torch.distributed.get_global_rank(ep_group, 0),
+                    group=ep_group,
+                )
+                return holder[0]
+
+            self._one_sided = OneSidedExpertTransfer(
+                rank=ep_group.rank(),
+                world_size=ep_group.size(),
+                expert_bytes=expert_bytes,
+                device=self.device,
+                broadcast_uid=broadcast_uid,
+            )
+        return self._one_sided._staging
 
     def _placement_stream(self) -> torch.cuda.Stream:
         """The ordered predictive communication stream of spec section 9."""

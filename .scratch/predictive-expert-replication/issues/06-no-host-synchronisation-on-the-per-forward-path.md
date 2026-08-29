@@ -13,7 +13,7 @@ device tensors, so a device scatter suffices.
 
 **Blocked by:** 05 — The transfer lands in the replica slot. Done.
 
-**Status:** in progress — precondition answered 2026-08-30, wiring not started
+**Status:** in progress — plan, publish and transfer done and verified; the put kernel segfaults a real server and is the one thing left
 
 **The precondition is answered and it changes the shape of this ticket.** Ticket 05's
 transport cannot reach this ticket's headline criterion, because a **host-issued** put takes
@@ -69,3 +69,36 @@ coverage ratchet up to all 43 layers.
       deadlock.
 - [ ] GPU occupancy inside real forward windows measured, and reported against the baseline's
       86.8% and the placed arm's 52.9%.
+
+
+## Where this stands, 2026-08-30 night
+
+Done, each verified against the host path it replaces:
+
+- [x] A device scatter publishes the **source-local** map pair. Checked against
+      `apply_replica_maps` plus the layout edit over a 200-plan random sequence and the four
+      transitions that actually break it: a slot changing hands, a placement repeating, a
+      forward placing nothing, and a replica whose row sits below its own canonical row.
+- [x] The published set is a layer's complete desired state, so `found == 0` reverts.
+- [x] Placement suppression is decided per forward from `num_tokens_across_dp_cpu`, before
+      anything is recorded.
+- [x] No host read in the plan or the publish, asserted with `set_sync_debug_mode("error")`
+      rather than by grepping the source — a synchronisation has a dozen spellings and an
+      indexing expression does not look like one.
+
+Also done, beyond what the criteria asked: residency and the transfer budget moved to the
+device. They had to. Once the plan stops reaching the host, reconstructing "is this replica
+already resident" by reading it back restores the synchronisation, and residency is what makes
+transfer reuse free and coverage ratchet up across forwards.
+
+Not done, and it blocks the rest:
+
+- [ ] `put_expert` segfaults NVSHMEM's proxy thread in a real server, at the startup EPLB
+      rearrange, after all 48 layers have launched a transfer. Bisected: transfer skipped is
+      healthy, barrier only is healthy, barrier plus drain is healthy. Does not reproduce in a
+      standalone script that pipelines 48 transfers with NCCL work and no synchronisation, so
+      the trigger is something the server supplies. Print the plan and the resolved source
+      address from the kernel before hypothesising again.
+- [ ] The reproduction of at least 24.0% of prefill excess on all 43 layers, and the occupancy
+      measurement against 86.8% / 52.9%. Both need a server that stays up.
+- [ ] Output equivalence over many forwards against a no-replica reference.

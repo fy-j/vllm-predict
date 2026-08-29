@@ -30,6 +30,33 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 - **The cost is host synchronisation, not the transfers.** See the section below
   before touching anything.
 
+## Ticket 06, 2026-08-30 night: three pieces done, one crash open
+
+**Done and committed.** The plan is fully tensorised (bit-identical to the host planner,
+`set_sync_debug_mode("error")` clean). Publishing is a device scatter, checked against
+`apply_replica_maps` over a 200-plan random sequence. The transfer is two kernels plus a
+stream-ordered barrier: **112/112 weight tensors byte-identical over all 56 ordered rank
+pairs, p50 36.7-40.0 us against 53.7 us host-issued**. Residency and the transfer budget moved
+to the device with them, which they had to — "already resident" is what makes a transfer free.
+
+**Open.** Wired into a real 8-rank server it initialises on every worker, reaches all 48
+layers, and then segfaults inside NVSHMEM's proxy thread at the startup EPLB rearrange.
+Bisected with four server runs to `put_expert` alone: skipping the transfer is healthy, the
+barrier alone is healthy, barrier plus drain is healthy, full is not. It does not reproduce in
+a standalone script that pipelines 48 transfers per round with NCCL work and no
+synchronisation, so the trigger is something the server supplies — most likely the model's own
+weight tensors as the put source. **Next step: print the plan and the resolved source address
+from inside the kernel for one layer.** Two hypotheses were reasoned through tonight and both
+were wrong; the third attempt should measure.
+
+`device_issued_transfer` **defaults to False** because of this. The host path on the same
+commit still comes up healthy and serves, so nothing regressed — but no TTFT number tonight is
+a device-path number, and the +31.5% figure still stands as the only measured end-to-end cost.
+
+Debug switches `VLLM_PREDICTIVE_SKIP_DEVICE_TRANSFER` and
+`VLLM_PREDICTIVE_DEVICE_TRANSFER_STAGE` are kept; they are what made the bisection possible.
+See `bench/RESULTS.md`, 2026-08-30.
+
 ## Ticket 06's precondition answered, 2026-08-30: the put can be issued from a kernel
 
 A **host-issued** put cannot be aimed by a device-resident plan — its peer, source pointer and

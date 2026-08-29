@@ -2377,3 +2377,71 @@ has been corrected: the check passes without it. Two passing runs of one payload
 evidence that a stream barrier completes a device-issued nbi put, this project has already
 shipped one ordering claim resting on exactly that kind of observation, and the quiet costs
 about 1 us.
+
+
+## Ticket 06's wiring, 2026-08-30: every piece works, and the put kernel crashes a server
+
+The three device-side pieces are built, tested and committed. Each is verified against the
+host path it replaces, because the host path is the code that was measured working end to
+end and disagreement with it means tokens routed to a row holding another expert's weights.
+
+| piece | verified how | result |
+|---|---|---|
+| plan, fully tensorised | bit-identity to `plan_replicas` over the randomised sweep, CPU and CUDA | agrees, and `set_sync_debug_mode("error")` passes |
+| publish, device scatter | `apply_replica_maps` plus the layout edit as oracle, 200-plan random sequence | agrees on all four map tensors |
+| transfer, two kernels | 8 ranks, all 56 ordered rank pairs | **112/112** byte-identical, **p50 36.7-40.0 us** |
+
+Two of those numbers are worth putting beside the thing they replace. The host-issued put of
+the same payload measured **53.7 us**, so issuing from a kernel is not a trade — it is the
+same time with the host removed. And an empty plan moves nothing, decided on the device on
+8/8 ranks, which is what lets a forward that places nothing avoid a host round trip to find
+that out.
+
+### In a real server it reaches all 48 layers and then segfaults
+
+Wired into `attach_placement_coordinator` behind `device_issued_transfer`, an 8-rank DP=EP=8
+server starts, initialises NVSHMEM after NCCL in every worker, logs `device-issued transfer
+active on 48 layers, 8 ranks` on all of them, and launches a device-issued transfer for every
+one of the 48 layers. Then, at the startup EPLB rearrange, three workers segfault inside
+`progress_channels` / `nvshmemi_proxy_progress` — NVSHMEM's host-side proxy thread.
+
+**Bisected to `put_expert`, with four server runs and one standalone reproduction attempt:**
+
+| arm | outcome |
+|---|---|
+| NVSHMEM up, `transfer()` skipped entirely | **healthy** — so it is not NVSHMEM coexisting with vLLM |
+| barrier only, both kernels skipped | **healthy** — so 48 pipelined stream-ordered barriers per forward are fine |
+| barrier + drain, put skipped | **healthy** — so it is not the drain and not the launch machinery |
+| full | **segfault**, 3 workers |
+
+And it does **not** reproduce standalone. A script that pipelines 48 transfers per round for
+5 rounds with no synchronisation, then runs an all-reduce and a host barrier with the
+predictive stream still unwaited — the closest thing to what the server does — survives every
+time. So the trigger is something the server supplies that the reproduction does not: the
+model's own weight tensors as the put source, real plan values, or the rearrange's own use of
+those tensors. That is the next thing to establish, and the cheap way in is to print the plan
+and the resolved source address from the kernel for one layer rather than to keep guessing —
+two hypotheses were investigated by reasoning tonight and both were wrong.
+
+`device_issued_transfer` therefore **defaults to False**. Enabling it today loses a worker,
+and a config default that crashes is worse than one that measures the wrong thing. The host
+path is unaffected: the same server on the same commit comes up healthy, logs 8 activation
+lines, and serves.
+
+### Two debug switches are kept, and they earned it
+
+`VLLM_PREDICTIVE_SKIP_DEVICE_TRANSFER` and `VLLM_PREDICTIVE_DEVICE_TRANSFER_STAGE`
+(`full`, `barrier-only`, `put-only`, `drain-only`) are what produced the table above. The
+distinction between "NVSHMEM cannot coexist with this engine" and "one of my two kernels is
+wrong" took three server starts to make and would have taken far longer to make by reading
+code. `no-barrier` and `put-only` produce wrong bytes on purpose and must never serve.
+
+### The in-kernel quiet was removed, and the note that blamed it was wrong
+
+The put kernel called `nvshmem_quiet()` because the NVSHMEM spec completes a non-blocking put
+with one. It was removed while chasing the segfault, and byte equality still holds at 112/112
+over every rank pair — so the stream-ordered `barrier_all` is what establishes arrival, and
+the quiet was not load-bearing. Removing it did **not** fix the crash, and an earlier comment
+in the probe claiming the quiet was needed because "7 of 8 ranks read a buffer the bytes had
+not reached" has been corrected: that observation was a bool `all_reduce` saturating, not a
+missing quiet.

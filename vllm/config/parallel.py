@@ -235,6 +235,30 @@ class PredictiveExpertReplicationConfig:
     traffic invalidates the resident set. The separate byte bound is
     `max_concurrent_transfer_bytes`, which is not yet implemented.
     """
+    device_issued_transfer: bool = False
+    """Issue the transfer from a kernel, so the plan never reaches the host.
+
+    **Default False as of 2026-08-30, and not because the design is in doubt.** The path
+    is built and verified in isolation - 112/112 weight tensors byte-identical over all
+    56 ordered rank pairs, 36.7 us to 40.0 us per expert - but inside a real server the
+    put kernel segfaults NVSHMEM's proxy thread at the startup EPLB rearrange. Bisected
+    with three server runs: the barrier alone is fine, the drain alone is fine, and
+    `put_expert` is not. Enabling this today loses the worker, so it stays off until
+    that is understood. The host path still serves, and still measures what it costs.
+
+    This is the difference between the feature costing more than perfect expert
+    balance could ever return and not. A **host-issued** put takes its peer, source
+    pointer and byte count as host integers consumed at enqueue — the same constraint
+    `ncclSend` has — so the host must read a device tensor, so it must wait: measured
+    at 5.28 ms per predicted layer, 70% of everything prediction adds, against a
+    ceiling of about 5% of a prefill step.
+
+    Needs NVSHMEM with NVLink. Where that is unavailable the host path is used
+    instead, with a warning naming what was missing, because a silent fallback here
+    produces a run that looks correct and measures the thing it was meant to replace.
+    Measured at 36.7 us to 40.0 us per 9.00 MiB expert against 53.7 us host-issued, so
+    it is not a trade.
+    """
     static_replica_placement: str | None = None
     """Install a fixed replica at startup, as `"<logical expert>:<target rank>"`.
 

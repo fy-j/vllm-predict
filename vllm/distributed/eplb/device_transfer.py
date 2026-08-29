@@ -34,6 +34,7 @@ it happens before any forward, and nothing in it depends on a plan.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -177,6 +178,10 @@ extern "C" __global__ void drain_expert(
 
 _GRID_CHUNKS_PER_TENSOR = 16
 _BLOCK = 512
+
+# Debug only, for bisecting a crash between the kernels and the barrier. `full` is
+# the real path; `no-barrier` produces wrong bytes on purpose and must not serve.
+_STAGE = os.environ.get("VLLM_PREDICTIVE_DEVICE_TRANSFER_STAGE", "full")
 
 
 def _nvshmem_build_paths() -> tuple[list[str], Path]:
@@ -395,16 +400,23 @@ class DeviceExpertTransfer:
             np.uint64(self._staging.data_ptr()),
             np.int32(self._ep_rank),
         )
-        launch(
-            core_stream, config, self._put, *common, np.int32(self._per_rank_experts)
-        )
+        if _STAGE not in ("barrier-only", "drain-only"):
+            launch(
+                core_stream,
+                config,
+                self._put,
+                *common,
+                np.int32(self._per_rank_experts),
+            )
         # Arrival. Collective and stream-ordered, so no host involvement and no per-rank
         # decision about whether data landed — and safe to be collective because the
         # plan is identical on every rank by construction.
         import nvshmem.bindings as bindings
 
-        bindings.barrier_all_on_stream(stream.cuda_stream)
-        launch(core_stream, config, self._drain, *common, np.int32(replica_row))
+        if _STAGE != "no-barrier":
+            bindings.barrier_all_on_stream(stream.cuda_stream)
+        if _STAGE not in ("barrier-only", "put-only"):
+            launch(core_stream, config, self._drain, *common, np.int32(replica_row))
 
     def _core_stream(self, stream: torch.cuda.Stream):
         """Wrap torch's stream for `cuda.core`, rather than creating another one.
