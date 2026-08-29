@@ -2243,3 +2243,65 @@ looked like a placing arm and the stock baseline was faulted for having no dump 
 activation. Fixed by classifying on the budget with the repeat suffix stripped, with tests for
 both directions. A guard that cries wolf is a guard that gets deleted, so this counts as a
 defect in the guard rather than a nuisance.
+
+## Ticket 05, 2026-08-30: the one-sided transfer lands, and the recorded ordering claim was wrong
+
+`probe_replica_transfer.py`, 8x H100 SXM, driving the production `OneSidedExpertTransfer`
+and `ReplicaTransferEngine` rather than a reimplementation, over all 56 ordered rank pairs.
+
+| check | result |
+|---|---|
+| transport up after NCCL | 8 PEs, 9.00 MiB staging buffer |
+| replica row byte-identical, every rank pair | **112/112** weight tensors |
+| same, barrier removed (control) | **61/112** — 51 wrong |
+| put + barrier + staging copy, one expert | **p50 53.7 us** (49.3 / 68.5) |
+| slowed transfer, exposed wait | 0.456 ms against 0.013 ms unslowed |
+
+**A plain CUDA event does not tell a consumer that a peer's put landed, and this project
+had it recorded as verified.** `probe_nvshmem.py` checked it with a `dist.barrier()` inside
+the region under test, so the barrier established arrival and the event was never
+load-bearing. Ticket 05 inherited the claim, and the transfer would have shipped reading
+whatever the row happened to hold — plausible floats, wrong logits, nothing raised. The
+control arm above is the direct measurement: **51 of 112 tensors wrong** with the barrier
+removed and everything else identical.
+
+`nvshmemx_barrier_all_on_stream` fixes it for 13.9 us of the 53.7 us span, with no host
+involvement. It is collective, which is a feature here rather than a cost: the plan is
+identical on every rank by construction, so every rank issues the same barriers, and that
+avoids the per-rank timing decisions that deadlocked this branch twice. It also replaces a
+collective that was already on this path — pynccl's `execute()` was called once per layer
+on every rank for the same reason.
+
+**43 layers of transfer is 2.3 ms.** The host synchronisation it removes is 5.28 ms *per
+layer*. That is the whole case for the device-planned path, and it is the first time both
+sides of it have been measured on the same machine.
+
+### Three defects found by running it, none of which a unit test would have caught
+
+1. **The exposed-time markers were not timing events.** `torch.cuda.Event()` without
+   `enable_timing=True` refuses `elapsed_time`, so the accounting ticket 08 needs raised
+   `ValueError` on all 8 ranks. The drain event correctly does *not* ask for timing — a
+   timed event costs a device write on every record, and that one is on the per-forward
+   path.
+2. **The slowed-transfer arm measured nothing.** The extra puts were queued *after* the
+   transfer's drain event, so the wait saw only its own overhead: 0.012 ms, printed as a
+   pass. Moving the delay in front of the transfer took it to 0.456 ms. A threshold guessed
+   from the transfer time then produced a false failure at 0.433 vs a made-up 0.588 ms bar,
+   so the bar is now the measured unslowed wait.
+3. **The probe printed `FAIL` and exited 0.** Fixed by counting failures in `report`.
+
+### Teardown: two things that look like transfer bugs and are not
+
+NVSHMEM keeps its own reference count beside Python's. Dropping the last reference to the
+symmetric buffer leaves the allocation tracked, so `finalize` reports every buffer leaked
+and then segfaults **every rank after all results have printed** — which reads as a
+transfer failure. `free_tensor` before `finalize` is required.
+
+Worth recording because it cost the most time here: I hypothesised that the leak was a race
+in the free's collectivity (nvshmem4py documents `free` as collective, and only on `free`,
+not on the `free_tensor` wrapper), and built a five-script bisection around that. The
+actual cause was that my edit adding `free_tensor` to `close()` had silently failed to
+apply, so the code under test still only dropped the reference. The bisection's "clean"
+arms were the ones that called `free_tensor`; the "leaking" arms were the ones that went
+through `close()`. **Verify that an edit applied before drawing a conclusion from the
+behaviour of the file.**

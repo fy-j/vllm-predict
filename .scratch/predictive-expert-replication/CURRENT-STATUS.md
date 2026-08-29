@@ -30,6 +30,38 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 - **The cost is host synchronisation, not the transfers.** See the section below
   before touching anything.
 
+## Ticket 05 done, 2026-08-30: the transfer is off the host, and one recorded claim was false
+
+`05` is complete, 7/7, measured on 8x H100 with `bench/probe_replica_transfer.py` driving the
+production classes over all 56 ordered rank pairs: **112/112 weight tensors byte-identical**,
+one expert's put + barrier + staging copy at **p50 53.7 us**, and a deliberately slowed
+transfer exposing 0.456 ms against 0.013 ms unslowed. All 43 layers of transfer come to
+2.3 ms against the **5.28 ms per layer** of host synchronisation the device-planned path
+removes.
+
+**Read this before touching the ordering.** The ticket said a plain CUDA event was enough for
+a consumer to know a peer's put had landed, and said it had been verified. It had not:
+`probe_nvshmem.py` put a `dist.barrier()` inside the region it was checking. Removing the
+barrier and changing nothing else leaves **51 of 112 tensors wrong**. Arrival now uses
+`nvshmemx_barrier_all_on_stream` — 13.9 us, no host, collective, which is safe here precisely
+because the plan is rank-identical, and which replaces the pynccl `execute()` that was
+already collective per layer.
+
+Also: NVSHMEM's own reference count means dropping the last Python reference to a symmetric
+buffer is not freeing it. `free_tensor` before `finalize`, or every rank segfaults after the
+results have already printed. And the thing that cost the most time was not any of this — it
+was an edit that silently failed to apply while I reasoned about the resulting behaviour as
+if it had. Verify the edit landed first.
+
+New modules: `expert_staging` (the flat layout both directions must agree on),
+`nvshmem_transfer` (transport plus barrier plus teardown), `replica_transfer` (the three
+orderings and the byte cap). 18 new unit tests, driven through a fake fabric with a real
+`threading.Barrier` so a receiver cannot read before its sender wrote.
+
+Next is `06`: wiring this into the coordinator in place of pynccl, which is where
+`max_concurrent_transfer_bytes` gets its config value and where the host synchronisation
+actually leaves the forward.
+
 ## Where the work stands, 2026-08-29 evening
 
 The spec was rewritten around **Device-planned placement** and the ticket set replaced; the
