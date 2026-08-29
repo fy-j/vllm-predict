@@ -11,9 +11,26 @@ plan already on the device from ticket 04 and the transfer device-initiated from
 publishing is the last host involvement — and routing already consumes the maps it needs as
 device tensors, so a device scatter suffices.
 
-**Blocked by:** 05 — The transfer lands in the replica slot.
+**Blocked by:** 05 — The transfer lands in the replica slot. Done.
 
-**Status:** ready-for-agent
+**Status:** in progress — precondition answered 2026-08-30, wiring not started
+
+**The precondition is answered and it changes the shape of this ticket.** Ticket 05's
+transport cannot reach this ticket's headline criterion, because a **host-issued** put takes
+its peer, its source pointer and its byte count as host integers consumed at enqueue — the
+same constraint that put the 5.28 ms there through `ncclSend`. So the transfer must be issued
+from inside a kernel, and `bench/probe_device_put.py` proves that works here: 8/8 ranks
+receive a payload aimed by a plan the host never read, at **p50 47.6 us against 53.7 us
+host-issued**, so the device-issued route costs nothing in time. The masking alternative —
+issue every put the plan might have chosen — is ruled out at about 230 us per layer, 10 ms
+across 43 layers against a ceiling near 5%.
+
+Two consequences for the work here. `plan_one_layer_on_device` currently returns through the
+host (`int()`, `float()`, `bool()` on device tensors), so it must be made fully tensorised
+even though ticket 04 is closed; the tensor it already returns is the right contract. And the
+put kernel needs a small build-and-register path in the worker, whose seven toolchain traps
+are written down in `bench/RESULTS.md`, 2026-08-30 — each one fails with a message naming the
+wrong cause.
 
 - [ ] A device scatter publishes the **source-local** map pair. Writing the global pair
       instead transfers the replica, describes it correctly, and publishes it where nothing

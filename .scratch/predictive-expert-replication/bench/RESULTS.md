@@ -2305,3 +2305,75 @@ apply, so the code under test still only dropped the reference. The bisection's 
 arms were the ones that called `free_tensor`; the "leaking" arms were the ones that went
 through `close()`. **Verify that an edit applied before drawing a conclusion from the
 behaviour of the file.**
+
+## Ticket 06's precondition, 2026-08-30: a device-issued put works, and is not slower
+
+Ticket 06 asks for no host synchronisation on the per-forward path. Ticket 05's transport
+cannot deliver that on its own, and the reason is worth stating precisely because it is the
+same reason `ncclSend` could not: **a host-issued put takes its peer, its source pointer and
+its byte count as host integers, consumed when the host enqueues.** A plan living on the
+device cannot aim one, whatever stream it goes on. Moving the planner to the device (ticket
+04) removes the planner's host read; the transfer's remains.
+
+Two escapes exist. Issuing every put the plan might have chosen and masking the rest costs
+16 rows to 7 peers, about 63 MiB of egress per rank per layer and roughly 230 us — 10 ms
+across 43 layers, against a ceiling of about 5% of a 95 ms window. That spends the whole
+benefit to save the sync. The other is to issue the put from inside a kernel, which reads the
+plan where it already lives.
+
+`bench/probe_device_put.py`, 8x H100:
+
+| check | result |
+|---|---|
+| device library ships with the wheel | `libnvshmem_device.a`, sm_90 |
+| NVRTC compiles and nvJitLink links it | PASS |
+| device-issued put lands, plan never read on the host | **8/8 ranks** |
+| 9.00 MiB device-issued put + barrier | **p50 47.6 us** (45.3 / 67.0) |
+
+**47.6 us against 53.7 us host-issued**, so the device-issued route is not a trade at all on
+this hardware — it is the same time with the host removed. That was not a given: the first
+version measured **206 us**, because one block was moving 9 MiB with its own load/store units
+rather than the copy engine. Splitting the payload across 32 blocks is what closes it.
+
+### The toolchain recipe, because each step's error names the wrong cause
+
+Seven things had to be right, and six of them fail with a message pointing somewhere else.
+
+1. `nvidia.nvshmem` is a **namespace package**, so `__file__` is None and `Path(None)` raises
+   a `TypeError` about `__fspath__`. Locate it through `__path__`.
+2. NVSHMEM's headers include `cuda_runtime.h`, which NVRTC does not supply. Add
+   `nvidia-cuda-runtime`'s include directory or the compile dies with a "catastrophic error"
+   naming that file, which reads as a broken toolchain.
+3. It then wants `cuda/std/cstdint`, which is libcu++ from `nvidia-cuda-cccl`. A third `-I`,
+   and it only surfaces once the second is supplied.
+4. Link **relocatable PTX against `libnvshmem_device.a`**. The `.bc` files beside it are raw
+   LLVM bitcode and nvJitLink rejects them as both `NVJITLINK_INPUT_LIBRARY` and
+   `NVJITLINK_INPUT_LTOIR`.
+5. `LinkerOptions` has no `relocatable_device_code`; it is a `ProgramOptions` setting.
+6. Build the kernel **after** `nvshmem.init`. `cuda.core` loads the module into its own
+   current context and NVSHMEM registers in the context init bound; build first and the two
+   differ, failing with `CUDA_ERROR_INVALID_HANDLE`.
+7. Register with **`library_init`, not `module_init`**: `cuda.core` produces a `CUlibrary`,
+   and `module_init` rejects it with that same `CUDA_ERROR_INVALID_HANDLE` — two unrelated
+   causes behind one message. `module_finalize` is unusable with anything, because
+   `module_init` never sets the `finalize_handle` it then requires.
+
+And the launch itself: `cuda.core.launch` needs a `cuda.core.Stream`, so torch's stream has to
+be wrapped through the `__cuda_stream__` protocol rather than replaced — launching onto a
+stream torch does not know about would put the transfer outside the ordering everything else
+relies on. Kernel arguments must be **numpy scalars**; `ctypes` values and bare Python ints
+are both rejected, the latter for having no unambiguous width.
+
+### One of my own checks was the bug
+
+The byte check reported "1/8 ranks received their neighbour's payload" and held at 1/8 across
+a kernel rewrite and an added device-side `quiet`. The transfer was correct the whole time:
+`torch.tensor([bool])` gave a **bool** tensor, and `all_reduce` with SUM over bool saturates
+back to bool, so eight agreeing ranks reduce to 1. Two hypotheses were investigated before the
+reduction was. **When a count is stuck at a suspiciously round value, check the counter.**
+
+The device-side `quiet` added while chasing that stays, and the comment blaming it for the 1/8
+has been corrected: the check passes without it. Two passing runs of one payload is not
+evidence that a stream barrier completes a device-issued nbi put, this project has already
+shipped one ordering claim resting on exactly that kind of observation, and the quiet costs
+about 1 us.

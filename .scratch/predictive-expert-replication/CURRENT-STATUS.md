@@ -30,6 +30,26 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 - **The cost is host synchronisation, not the transfers.** See the section below
   before touching anything.
 
+## Ticket 06's precondition answered, 2026-08-30: the put can be issued from a kernel
+
+A **host-issued** put cannot be aimed by a device-resident plan — its peer, source pointer and
+byte count are host integers consumed at enqueue, which is the same constraint `ncclSend` has
+and the reason the 5.28 ms per layer is there. So ticket 06 needs the put issued from inside a
+kernel, and that now works on this machine: 8/8 ranks receive a payload aimed by a plan the
+host never reads, at **p50 47.6 us against 53.7 us host-issued**. Not a trade — the same time
+with the host removed. The masking alternative is ruled out at ~230 us per layer.
+
+The toolchain took seven corrections, six of which fail with a message naming the wrong cause;
+they are listed in `bench/RESULTS.md`, 2026-08-30, and anyone touching this should read them
+before debugging. Also recorded there: a check of mine that read "1/8 ranks" through a kernel
+rewrite while the transfer was correct all along, because `all_reduce` with SUM over a **bool**
+tensor saturates back to bool.
+
+Still to do for `06`: make `plan_one_layer_on_device` return without host reads (it currently
+uses `int()`, `float()` and `bool()` on device tensors, so ticket 04's "on the device" is
+arithmetic-only), build and register the put kernel inside the worker, and publish the
+source-local map pair with a device scatter.
+
 ## Ticket 05 done, 2026-08-30: the transfer is off the host, and one recorded claim was false
 
 `05` is complete, 7/7, measured on 8x H100 with `bench/probe_replica_transfer.py` driving the
