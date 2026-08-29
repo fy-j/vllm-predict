@@ -26,6 +26,7 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import json
 import threading
 import time
 from collections.abc import Sequence
@@ -34,6 +35,7 @@ from dataclasses import dataclass
 import torch
 from torch.distributed import ProcessGroup, all_reduce
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.utils import compute_hash_cached
 from vllm.distributed.parallel_state import (
@@ -54,6 +56,14 @@ from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
 from .eplb_utils import CpuGpuEvent
 from .policy import EPLB_POLICIES, AbstractEplbPolicy, DefaultEplbPolicy
+from .predictive import (
+    bound_layer_count,
+    build_predictive_physical_map,
+    build_source_local_physical_map,
+    registered_prediction_pairs,
+)
+from .predictive_coordinator import PlacementCoordinator
+from .predictive_planner import Placement, apply_replica_maps
 from .rebalance_execute import (
     AsyncEplbLayerResult,
     move_from_buffer,
@@ -61,6 +71,11 @@ from .rebalance_execute import (
 )
 
 logger = init_logger(__name__)
+
+# The MoE kernel pads each expert's token list to a multiple of `BLOCK_SIZE_M`, so a
+# replica taking fewer tokens saves no block and no time. 128 is the bf16 default at the
+# post-allgather counts a prefill step reaches, which is the regime this path targets.
+_MOE_BLOCK_SIZE_M = 128
 
 
 def _compute_eplb_load_stats(
@@ -225,6 +240,12 @@ class EplbModelState:
     pointers remain stable across CUDA-graph replays.  The router kernel
     indexes this list with ``dbo_current_ubatch_id()``.
     """
+    model_config: "ModelConfig | None" = None
+    """
+    The config this state was registered under. Held because the runtime placement
+    path is driven from `step`, which has no config in hand, while `update_mapping`
+    and `publish_source_local_maps` both require one.
+    """
 
 
 class EplbState:
@@ -236,6 +257,8 @@ class EplbState:
         self.parallel_config = parallel_config
         self.device = device
         self.model_states: dict[str, EplbModelState] = {}
+        self._logged_layers: set[int] = set()
+        self._replica_slot_occupant: dict[int, dict[int, int]] = {}
         self.policy: type[AbstractEplbPolicy] = DefaultEplbPolicy
         """
         Selected EPLB algorithm class
@@ -289,6 +312,11 @@ class EplbState:
         self.cuda_device_index: int | None = None
         """
         CUDA device index for the async EPLB worker thread.
+        """
+        self.startup_normalization_ms: float = 0.0
+        """
+        Total time spent installing the predictive fixed layout at startup.
+        Reported separately from serving latency; zero outside predictive mode.
         """
         if self.device.type == "cuda":
             self.cuda_device_index = self.device.index
@@ -491,27 +519,101 @@ class EplbState:
             communicator=communicator,
             num_unpadded_tokens_tensors=num_unpadded_tokens_tensors,
         )
-        self.model_states[model_config.compute_hash()] = model_state
+        model_state.model_config = model_config
+        self.model_states[compute_hash_cached(model_config)] = model_state
+
+        if self.predictive_enabled:
+            # The configuration validator checks the model-shape fingerprint;
+            # the device can only be checked where a device is actually bound.
+            self.parallel_config.predictive_expert_replication_config.validate_fingerprint(
+                device_name=current_platform.get_device_name(
+                    self.device.index if self.device.index is not None else 0
+                )
+            )
+            self.startup_normalization_ms += self.normalize_predictive_layout(
+                model_config
+            )
+
+    @property
+    def predictive_enabled(self) -> bool:
+        """Whether the predictive controller owns placement instead of Native EPLB."""
+        return self.parallel_config.predictive_expert_replication_config.enabled
+
+    def build_predictive_layout(self, model: MixtureOfExperts) -> torch.Tensor:
+        """Build the fixed predictive layout for a registered model.
+
+        Args:
+            model: The registered mixture-of-experts model.
+
+        Returns:
+            A `[num_moe_layers, num_physical_experts]` physical-to-logical map.
+
+        Raises:
+            ValueError: If the model's physical layout cannot hold the canonical
+                rows plus the configured replica slots.
+        """
+        ep_size = get_ep_group().device_group.size()
+        predictive_config = self.parallel_config.predictive_expert_replication_config
+        replica_slots = predictive_config.replica_slots_per_rank
+        canonical_per_rank = model.num_logical_experts // ep_size
+        expected_local = canonical_per_rank + replica_slots
+        if model.num_local_physical_experts != expected_local:
+            raise ValueError(
+                f"Predictive expert replication expects {canonical_per_rank} "
+                f"canonical + {replica_slots} inactive physical rows per rank, "
+                f"but the model has {model.num_local_physical_experts}."
+            )
+        layout = build_predictive_physical_map(
+            num_layers=len(model.expert_weights),
+            num_logical_experts=model.num_logical_experts,
+            ep_size=ep_size,
+            replica_slots_per_rank=replica_slots,
+            device=self.device,
+        )
+        placement = predictive_config.parsed_static_replica_placement
+        if placement is not None:
+            # A validation aid: pre-place one replica so source-rank routing can
+            # be exercised before any transfer machinery exists.
+            logical, target_rank = placement
+            if not 0 <= logical < model.num_logical_experts:
+                raise ValueError(
+                    f"static_replica_placement expert {logical} is outside "
+                    f"[0, {model.num_logical_experts})."
+                )
+            if not 0 <= target_rank < ep_size:
+                raise ValueError(
+                    f"static_replica_placement rank {target_rank} is outside "
+                    f"[0, {ep_size})."
+                )
+            if logical // canonical_per_rank == target_rank:
+                raise ValueError(
+                    f"static_replica_placement puts expert {logical} on rank "
+                    f"{target_rank}, which already owns it canonically. Both "
+                    f"copies would live on one rank, so the routing assertions "
+                    f"would pass without any cross-rank replica being exercised."
+                )
+            layout.view(len(model.expert_weights), ep_size, expected_local)[
+                :, target_rank, canonical_per_rank
+            ] = logical
+        return layout
 
     def normalize_predictive_layout(self, model_config: ModelConfig) -> float:
-        """Synchronously install canonical rows and one inactive row per rank."""
-        model_state = self.model_states[model_config.compute_hash()]
+        """Install the fixed predictive layout before the server reports ready.
+
+        Rearranges the natively loaded rows into canonical ownership, clears the
+        inactive replica rows, and republishes the routing maps. This is startup
+        work and is deliberately excluded from request-path accounting.
+
+        Args:
+            model_config: Identifies which `EplbModelState` to normalize.
+
+        Returns:
+            Wall-clock duration in milliseconds.
+        """
+        model_state = self.model_states[compute_hash_cached(model_config)]
         model = model_state.model
         ep_group = get_ep_group().device_group
-        num_local_experts = model.num_local_physical_experts
-        canonical_per_rank = model.num_logical_experts // ep_group.size()
-        assert model.num_logical_experts % ep_group.size() == 0
-        assert num_local_experts == canonical_per_rank + 1
-
-        layout = torch.full_like(model_state.physical_to_logical_map, -1)
-        for rank in range(ep_group.size()):
-            start = rank * num_local_experts
-            layout[:, start : start + canonical_per_rank] = torch.arange(
-                rank * canonical_per_rank,
-                (rank + 1) * canonical_per_rank,
-                device=self.device,
-                dtype=layout.dtype,
-            )
+        layout = self.build_predictive_layout(model)
 
         start_time = time.perf_counter()
         rearrange_expert_weights_inplace(
@@ -522,12 +624,405 @@ class EplbState:
             ep_group,
             model_state.communicator,
         )
-        local_slot = canonical_per_rank
-        for layer_weights in model.expert_weights:
+        # Inactive rows must not hold stale canonical weights: a later replica
+        # transfer is the only thing allowed to make them readable.
+        local_layout = layout.view(len(model.expert_weights), ep_group.size(), -1)
+        for layer_index, layer_weights in enumerate(model.expert_weights):
+            # Per layer, not layer 0 applied to all: tickets 07 and 08 place
+            # replicas per layer, and a row inactive in layer 0 but placed in
+            # layer 3 would otherwise keep layer 3's stale canonical weights
+            # readable, violating the invariant this loop exists to hold.
+            inactive_rows = (
+                (local_layout[layer_index, ep_group.rank()] < 0).nonzero().flatten()
+            )
             for weight in layer_weights:
-                weight[local_slot].zero_()
+                weight[inactive_rows] = 0
         self.update_mapping(model_config, layout)
-        return (time.perf_counter() - start_time) * 1000
+        self.publish_source_local_maps(model_config)
+        self.verify_replica_weight_equality(model_config)
+        if envs.VLLM_PREDICTIVE_PLACE_PER_FORWARD:
+            self.attach_placement_coordinator(model_config)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        if ep_group.rank() == 0:
+            logger.info(
+                "Predictive expert replication normalized %s to %d canonical + "
+                "%d inactive rows per rank in %.2f ms.",
+                model_state.model_name,
+                model.num_logical_experts // ep_group.size(),
+                model.num_local_physical_experts
+                - model.num_logical_experts // ep_group.size(),
+                elapsed_ms,
+            )
+        return elapsed_ms
+
+    def verify_replica_weight_equality(self, model_config: ModelConfig) -> None:
+        """Assert every physical copy of a logical expert holds the same weights.
+
+        This is what makes an output comparison interpretable. Routing a logical
+        expert to a second copy regroups tokens inside the expert GEMM, which
+        perturbs reduction order, so logprobs move slightly even when nothing is
+        wrong. Arguing about whether a given shift is noise or a defect is
+        unnecessary if the copies are provably identical: the arithmetic is then
+        the same and only its order differs.
+
+        Compares position-weighted checksums rather than shipping weights around,
+        so the cost is a couple of small collectives at startup. Position
+        weighting catches a permuted copy, which a plain sum would not.
+
+        Args:
+            model_config: Identifies which `EplbModelState` to verify.
+
+        Raises:
+            RuntimeError: If two copies of one logical expert disagree, which
+                means a transfer or the layout is wrong.
+        """
+        model_state = self.model_states[compute_hash_cached(model_config)]
+        model = model_state.model
+        ep_group = get_eplb_group().device_group
+        ep_size = ep_group.size()
+        num_layers = len(model.expert_weights)
+        local_rows = model.num_local_physical_experts
+
+        local = torch.zeros(
+            (num_layers, local_rows), dtype=torch.float64, device=self.device
+        )
+        for layer_index, layer_weights in enumerate(model.expert_weights):
+            for weight in layer_weights:
+                flat = weight.reshape(local_rows, -1).to(torch.float64)
+                position = torch.arange(
+                    1, flat.shape[1] + 1, dtype=torch.float64, device=flat.device
+                )
+                local[layer_index] += (flat * position).sum(dim=1)
+
+        gathered = torch.zeros(
+            (ep_size, num_layers, local_rows), dtype=torch.float64, device=self.device
+        )
+        torch.distributed.all_gather_into_tensor(gathered, local, group=ep_group)
+        # [ep_size, layers, local] -> [layers, ep_size * local], matching the
+        # physical row numbering the maps use.
+        checksums = gathered.permute(1, 0, 2).reshape(num_layers, -1).cpu()
+
+        physical_to_logical = model_state.physical_to_logical_map.cpu()
+        mismatches: list[str] = []
+        compared = 0
+        for layer_index in range(num_layers):
+            rows_by_logical: dict[int, list[int]] = {}
+            for row, logical in enumerate(physical_to_logical[layer_index].tolist()):
+                if logical >= 0:
+                    rows_by_logical.setdefault(logical, []).append(row)
+            for logical, rows in rows_by_logical.items():
+                if len(rows) < 2:
+                    continue
+                compared += 1
+                values = [checksums[layer_index, row].item() for row in rows]
+                spread = max(values) - min(values)
+                if spread != 0.0:
+                    mismatches.append(
+                        f"layer {layer_index} expert {logical} rows {rows} "
+                        f"checksum spread {spread:.6e}"
+                    )
+        if mismatches:
+            raise RuntimeError(
+                "Physical copies of a logical expert are not identical, so an "
+                "output comparison could not distinguish reduction-order noise "
+                f"from a real defect: {mismatches[:5]}"
+            )
+        if ep_group.rank() == 0:
+            # Report how much was actually compared. With no replica placed there
+            # is nothing to compare and this check passes without checking
+            # anything, which would be worse than not having it: a vacuous pass
+            # reads exactly like a real one.
+            logger.info(
+                "Predictive expert replication compared %d replicated "
+                "(layer, expert) pairs across %d layers; all copies identical. "
+                "%s",
+                compared,
+                num_layers,
+                "No replicas are placed, so this check is vacuous."
+                if compared == 0
+                else "",
+            )
+
+    _predictive_stream: torch.cuda.Stream | None = None
+    """Ordered predictive communication stream, spec section 9."""
+
+    _logged_inactive_slot_check: bool = False
+    """Set once the inactive-slot check has reported, so it logs a single line."""
+
+    def verify_inactive_slots_unused(
+        self,
+        model_config: ModelConfig | None = None,
+        reduce_across_ranks: bool = True,
+    ) -> int:
+        """Assert no token was routed to a physical slot holding no logical expert.
+
+        An inactive slot's weights are never written, so a token routed there
+        reads uninitialised memory and produces plausible-looking output instead
+        of an error. The source-local physical map is supposed to make that
+        structurally impossible; this checks that it does.
+
+        A violation raises. Everything else is reported through the return value
+        rather than by raising, because this runs on every forward and two
+        conditions are ordinary rather than wrong: a dummy step's load is zeroed
+        before this point, and a model may carry no inactive slot at all. Raising
+        on either would kill serving over a non-problem.
+
+        Args:
+            model_config: Which model to check. All of them when None.
+            reduce_across_ranks: All-reduce the load over the EP group first, so a
+                slot busy on any rank is caught on every rank. Disable only in
+                tests, where there is no process group.
+
+        Returns:
+            How many inactive slots were verified **against observed traffic** -
+            zero when nothing was recorded, or when no slot is inactive. A caller
+            reporting a pass must require a non-zero count: an all-zero load table
+            makes every slot look idle, and `log_balancedness` (the only thing
+            enabling recording in predictive mode) defaults to False, so counting
+            slots alone would report an authoritative pass from a run that
+            observed no tokens.
+
+        Raises:
+            RuntimeError: If an inactive slot carries load.
+        """
+        if model_config is None:
+            states = list(self.model_states.values())
+        else:
+            states = [self.model_states[compute_hash_cached(model_config)]]
+
+        verified = 0
+        for model_state in states:
+            load = model_state.expert_load_pass.clone()
+            if reduce_across_ranks:
+                torch.distributed.all_reduce(load, group=get_ep_group().device_group)
+            inactive = model_state.physical_to_logical_map < 0
+            count = int(inactive.sum().item())
+            if count == 0:
+                # Nothing to observe for this model. Ordinary for a second model or
+                # a native-EPLB map, so it is not this check's business to object.
+                continue
+            busy = load * inactive.to(load.dtype)
+            total = float(busy.sum().item())
+            if total > 0:
+                layers = torch.nonzero(busy.sum(dim=1) > 0).flatten().tolist()
+                raise RuntimeError(
+                    f"model {model_state.model_name}: inactive physical slots "
+                    f"received {total:.0f} routed tokens across layers {layers}. "
+                    "Their expert weights are uninitialised, so any output that "
+                    "reached them is invalid."
+                )
+            if float(load.sum().item()) <= 0:
+                # No traffic recorded, so an idle inactive slot proves nothing.
+                continue
+            verified += count
+        return verified
+
+    def attach_placement_coordinator(self, model_config: ModelConfig) -> None:
+        """Give every MoE runner the coordinator that drives in-forward placement.
+
+        Built here rather than at model construction because it needs the transfer
+        buffers, the EPLB communicator and the EP group, none of which exist when the
+        layers are built.
+        """
+        model_state = self.model_states[compute_hash_cached(model_config)]
+        predictive = self.parallel_config.predictive_expert_replication_config
+        ep_group = get_ep_group().device_group
+        model = model_state.model
+        coordinator = PlacementCoordinator(
+            ep_size=ep_group.size(),
+            ep_rank=ep_group.rank(),
+            canonical_per_rank=model.num_logical_experts // ep_group.size(),
+            replica_slots_per_rank=predictive.replica_slots_per_rank,
+            num_layers=len(model.expert_weights),
+            lookahead=predictive.prediction_lookahead_layers,
+            budget=predictive.max_transfers_per_forward,
+            max_per_layer=predictive.max_replicas_per_layer,
+            min_tokens_per_expert=float(_MOE_BLOCK_SIZE_M),
+            min_tokens=float(_MOE_BLOCK_SIZE_M),
+            expert_weights=model.expert_weights,
+            expert_buffer=model_state.expert_buffer,
+            communicator=model_state.communicator,
+            stream=self._placement_stream(),
+            publish=lambda layer, placements: self.activate_layer_replicas(
+                model_config, layer, placements
+            ),
+        )
+        for layer in model.moe_layers:
+            layer.placement_coordinator = coordinator
+            # Prediction and placement share one bar. Predicting a forward the
+            # placement gate is certain to reject costs a gate matmul and a small
+            # AllGather per layer for nothing: measured at 7.3% of TPOT.
+            layer.prediction_min_tokens_per_expert = float(_MOE_BLOCK_SIZE_M)
+
+    def _placement_stream(self) -> torch.cuda.Stream:
+        """The ordered predictive communication stream of spec section 9."""
+        if self._predictive_stream is None:
+            self._predictive_stream = torch.cuda.Stream(device=self.device)
+        return self._predictive_stream
+
+    def activate_layer_replicas(
+        self, model_config: ModelConfig, layer: int, placements: list[Placement]
+    ) -> None:
+        """Make one layer's active replicas exactly `placements`.
+
+        `placements` is the layer's complete desired set, so a replica the current plan
+        no longer wants is reverted here. Reversion is a map edit with no transfer, and
+        keeping an unwanted replica is not neutral: it goes on shedding half of an
+        expert that may no longer be hot, onto a rank that may now be the peak. Ticket
+        00 measured cross-forward residency at -20.0%, and with nothing reverting,
+        active replicas accumulated to 47-76 per forward against a transfer budget of
+        43.
+
+        Incremental by construction: only this layer's rows are touched. A full
+        republish rebuilds every logical map and walks all 48 layers, on the prefill
+        step's critical path.
+        """
+        model_state = self.model_states[compute_hash_cached(model_config)]
+        ep_group = get_ep_group().device_group
+        ep_size = ep_group.size()
+        canonical_per_rank = model_state.model.num_logical_experts // ep_size
+        slots = (
+            self.parallel_config.predictive_expert_replication_config
+        ).replica_slots_per_rank
+        view = model_state.physical_to_logical_map.view(
+            -1, ep_size, canonical_per_rank + slots
+        )
+        reverted = self._republish_layer(
+            model_state,
+            layer,
+            ep_group.rank(),
+            placements,
+            canonical_per_rank,
+            slots,
+        )
+        # The layout is what `active_replicas` reads, so a reverted row has to read -1
+        # there too or the layout and the routing maps disagree about what is live.
+        # Clear before setting: a slot handed from one expert to another appears in
+        # both sets, and the placement must win.
+        for target_rank, _expert in reverted:
+            view[layer, target_rank, canonical_per_rank] = -1
+        for placement in placements:
+            view[layer, placement.target_rank, canonical_per_rank] = (
+                placement.logical_expert
+            )
+        # Bounded to the first activation of each layer: 48 lines, not one per forward.
+        # `analyse_e2e.py` treats the presence of this line as the evidence that the
+        # placement path was reached at all, so a run without it cannot be told apart
+        # from a run whose arm was silently inert.
+        if placements and layer not in self._logged_layers:
+            self._logged_layers.add(layer)
+            logger.info(
+                "Predictive expert replication: activated %d replica(s) on layer %d",
+                len(placements),
+                layer,
+            )
+
+    def _republish_layer(
+        self,
+        model_state: EplbModelState,
+        layer: int,
+        source_rank: int,
+        placements: list[Placement],
+        canonical_per_rank: int,
+        replica_slots_per_rank: int,
+    ) -> set[tuple[int, int]]:
+        """Update one layer's routing maps for `placements`, in place.
+
+        Deliberately not a rebuild. `compute_logical_maps` inverts the whole physical
+        layout with a 136-iteration Python loop and an `.item()` that makes its output
+        shape data-dependent — the reason it asserts CPU — and it measured 4.707 ms
+        per layer, 202 ms for a forward touching 43 layers. That ran here, on the
+        activation path, inside the forward. Upstream calls it from `rearrange`, which
+        fires every `step_interval` steps; this path fires per activation, so the two
+        differ in frequency by orders of magnitude and the CPU round trip that is free
+        there is not free here.
+
+        Nothing about a placement needs an inversion: one expert gained one copy at a
+        row that follows from the layout. `apply_replica_maps` writes exactly that,
+        with host-side scalars only, so no device read and no synchronization. A suite
+        of tests asserts it agrees with the inversion, including over 200 randomised
+        placement sequences.
+        """
+        layer_module = model_state.model.moe_layers[layer]
+        layer_state = getattr(layer_module, "eplb_state", None)
+        if not isinstance(layer_state, EplbLayerState):
+            raise RuntimeError(
+                f"MoE layer {layer} has no EPLB layer state, so an activated replica "
+                f"could not be routed to and tokens would keep going to the canonical "
+                f"copy only."
+            )
+        # The **source-local** pair is what `_apply_eplb_mapping` reads:
+        # it prefers `source_local_physical_map` over `logical_to_physical_map`
+        # whenever the former is set, and under this feature it always is. Writing
+        # the other pair transfers the replica, describes it correctly, and publishes
+        # it where nothing reads — replicas activated, zero tokens routed to them,
+        # physical per-rank load equal to canonical ownership to 0.00%. That is a
+        # measured run: 131 replicas per forward removed 0.6% of prefill excess
+        # against an oracle of 35.1%, at 2.2x the baseline TTFT.
+        target_map = layer_state.source_local_physical_map
+        target_count = layer_state.source_local_replica_count
+        if target_map is None or target_count is None:
+            raise RuntimeError(
+                f"MoE layer {layer} has no source-local routing maps to publish into, "
+                f"so an activated replica would never be routed to. "
+                f"`publish_source_local_maps` allocates them before the first forward; "
+                f"reaching here means it did not run."
+            )
+        reverted = apply_replica_maps(
+            logical_to_physical=model_state.logical_to_physical_map[layer],
+            logical_replica_count=model_state.logical_replica_count[layer],
+            source_local=target_map,
+            placements=placements,
+            per_rank_experts=canonical_per_rank,
+            replica_slots_per_rank=replica_slots_per_rank,
+            source_rank=source_rank,
+            slot_occupant=self._replica_slot_occupant.setdefault(layer, {}),
+        )
+        # All-ones, so the shared routing path's per-token replica choice stays a
+        # lookup: with one copy on offer a rank's chunk cannot be split.
+        target_count.fill_(1)
+        return reverted
+
+    def publish_source_local_maps(self, model_config: ModelConfig) -> None:
+        """Give every MoE layer this rank's Source-local physical map.
+
+        Routing reads these instead of the global map, which is what makes it
+        source-rank rather than per-token. Must be called after any placement
+        change, since a stale map would route to a slot that no longer holds the
+        expert it was chosen for.
+
+        Args:
+            model_config: Identifies which `EplbModelState` to publish for.
+        """
+        model_state = self.model_states[compute_hash_cached(model_config)]
+        source_rank = get_ep_group().device_group.rank()
+        for layer_index, layer in enumerate(model_state.model.moe_layers):
+            layer_state = getattr(layer, "eplb_state", None)
+            if not isinstance(layer_state, EplbLayerState):
+                # Skipping would leave this layer on the global map and the shared
+                # path's per-token replica choice, which is the token-level
+                # routing this feature exists to remove, with nothing to show it.
+                raise RuntimeError(
+                    f"MoE layer {layer_index} has no EPLB layer state, so it "
+                    f"cannot be given a source-local physical map and would fall "
+                    f"back to per-token replica selection."
+                )
+            source_map, replica_count = build_source_local_physical_map(
+                model_state.logical_to_physical_map[layer_index],
+                model_state.logical_replica_count[layer_index],
+                source_rank,
+            )
+            # Copy into the existing buffers rather than rebinding. Callers
+            # re-publish after a placement change, and a rebind would leave any
+            # captured graph or cached reference reading the previous allocation,
+            # routing to a slot whose expert has since moved.
+            if layer_state.source_local_physical_map is None:
+                layer_state.source_local_physical_map = source_map
+                layer_state.source_local_replica_count = replica_count
+            else:
+                layer_state.source_local_physical_map.copy_(source_map)
+                assert layer_state.source_local_replica_count is not None
+                layer_state.source_local_replica_count.copy_(replica_count)
 
     def prepare_forward(
         self,
@@ -549,6 +1044,12 @@ class EplbState:
         model_state = self.model_states.get(compute_hash_cached(model_config))
         if model_state is None or model_state.num_unpadded_tokens_tensors is None:
             return
+        if self.predictive_enabled:
+            # Predictive mode never rolls the pass into the sliding window, so it
+            # is the only actual-load record there is. Clear it here, before the
+            # forward, so that after the forward it holds exactly that forward's
+            # load for prediction-accuracy scoring to read.
+            model_state.expert_load_pass.zero_()
         tensors = model_state.num_unpadded_tokens_tensors
         if ubatch_slices is None:
             tensors[0].fill_(num_unpadded_tokens)
@@ -588,6 +1089,8 @@ class EplbState:
         """
         ep_group = get_ep_group().device_group
         if is_profile:
+            # Predictive mode also needs the transfer buffers reserved, so the
+            # profile rearrangement runs for both controllers.
             self.rearrange(is_profile=True)
             return
 
@@ -595,6 +1098,24 @@ class EplbState:
             # Do not record load metrics for dummy steps
             for eplb_model_state in self.model_states.values():
                 eplb_model_state.expert_load_pass.zero_()
+
+        self._run_step_diagnostics()
+
+        if self.predictive_enabled:
+            # Predictive expert replication owns placement. Native EPLB's
+            # historical-load window and periodic rearrangement must not run, or
+            # the two controllers would race on the same physical slots.
+            #
+            # Recording still has to be managed here. This return precedes the
+            # only writer of `should_record_tensor`, which is allocated True, so
+            # leaving it alone would run the per-layer record atomics on every
+            # forward for the whole run with nothing reading the result, and
+            # would inflate the very comparison the feature is measured by.
+            # Recording is therefore enabled only when benchmark mode asked for
+            # it, and the pass is cleared every step so a reader sees one
+            # forward's load rather than everything since startup.
+            self.configure_predictive_recording(log_stats, is_dummy)
+            return
 
         if (
             log_stats
@@ -697,6 +1218,213 @@ class EplbState:
 
         self._update_layer_should_record(log_stats=log_stats)
 
+    def configure_predictive_recording(self, log_stats: bool, is_dummy: bool) -> None:
+        """Manage expert-load recording for a predictive step.
+
+        The predictive branch of `step` returns before the native scheduler that
+        normally maintains the record flag, and that flag is allocated enabled.
+        Left alone it would run the per-layer record atomics on every forward for
+        the whole run with no predictive consumer reading them, inflating the
+        latency comparison the feature is judged by, while `expert_load_pass`
+        grew without bound.
+
+        Recording is therefore enabled only for benchmark mode, which is what
+        prediction-accuracy scoring needs. Clearing the accumulator is *not* done
+        here: `step` runs after the forward, so zeroing it here would wipe the
+        load the forward just recorded and every reader would see zero. The clear
+        belongs before the forward, in `prepare_forward`.
+
+        Args:
+            log_stats: Whether benchmark-mode statistics were requested.
+            is_dummy: Unused; kept so the call site reads symmetrically with the
+                native path, which does distinguish dummy steps.
+        """
+        del is_dummy
+        if self.should_record_tensor is not None:
+            self.should_record_tensor.fill_(log_stats)
+
+    def _run_step_diagnostics(self) -> None:
+        """Dispatch the opt-in per-forward diagnostics.
+
+        Every one of these performs a collective, so **none of them may be
+        conditional on per-rank state**. `is_dummy` in particular differs across
+        DP ranks - an idle rank runs a dummy batch to stay in lockstep - so
+        gating on it makes some ranks enter the collective and others skip it,
+        and the engine deadlocks with every rank waiting on shared memory. A
+        dummy step's load is already zeroed above, so running the checks anyway
+        is correct as well as safe.
+
+        Extracted from `step` so that collective-safety can be tested rather than
+        left as a comment.
+        """
+        if envs.VLLM_EPLB_DUMP_LOAD_PATH:
+            self._dump_logical_expert_load(envs.VLLM_EPLB_DUMP_LOAD_PATH)
+        if envs.VLLM_PREDICTIVE_ACCURACY_DUMP_PATH:
+            self._dump_prediction_accuracy(envs.VLLM_PREDICTIVE_ACCURACY_DUMP_PATH)
+        if envs.VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS:
+            # Raise on the forward that did it, so the log points at the step
+            # rather than at whatever fails downstream of invalid output.
+            checked = self.verify_inactive_slots_unused()
+            if checked and not self._logged_inactive_slot_check:
+                self._logged_inactive_slot_check = True
+                # A silent pass is not evidence. Say how many slots were examined
+                # so a run can be cited as having observed this.
+                logger.info(
+                    "Predictive expert replication: verified %d inactive physical "
+                    "slots carry no routed load, against recorded traffic.",
+                    checked,
+                )
+
+    def _dump_logical_expert_load(self, path: str) -> None:
+        """Append this forward's per-logical-expert load, for offline analysis.
+
+        A diagnostic, opt-in through an environment variable. The balancedness log
+        only reports per-rank aggregates, which cannot answer how concentrated the
+        skew is: whether a rank is hot because one expert dominates, or because all
+        of its experts are mildly above average. Those two cases differ completely
+        in how much replicating a single expert can achieve.
+        """
+        ep_size = get_ep_group().device_group.size()
+        for model_state in self.model_states.values():
+            reduced = self._reduced_load_this_forward(model_state)
+            if get_ep_group().device_group.rank() != 0:
+                continue
+            per_logical = self._logical_from_reduced(model_state, reduced)
+            # Per-rank load needs no logical-to-rank mapping: physical slots are
+            # laid out rank-major, so reshaping is exact where assuming a
+            # contiguous expert-to-rank assignment would not be. It must come from
+            # the **reduced** tensor: the raw one holds only this rank's own tokens.
+            per_rank = reduced.reshape(reduced.shape[0], ep_size, -1).sum(dim=-1)
+            # Summed over experts, a layer's load is its token-expert assignment
+            # count. Recorded so the analysis can place each forward on a batch-size
+            # axis instead of inferring prefill from decode by a magnitude
+            # threshold, which is a guess the data does not have to leave open.
+            unpadded = model_state.num_unpadded_tokens_tensors
+            record = {
+                "rank_load": per_rank.tolist(),
+                "logical_load": per_logical.tolist(),
+                "assignments_per_layer": per_logical.sum(dim=1).tolist(),
+                "local_unpadded_tokens": (
+                    [int(t.item()) for t in unpadded] if unpadded else None
+                ),
+                "ep_size": ep_size,
+            }
+            # Keep the layer axis. Summing it first lets each layer's peak rank
+            # cancel against the others, which understates the imbalance that
+            # matters: every layer is its own collective and waits for its own
+            # slowest rank, so the critical path is the sum of per-layer peaks.
+            with open(path, "a") as handle:
+                handle.write(json.dumps(record) + "\n")
+
+    def _reduced_load_this_forward(self, model_state: EplbModelState) -> torch.Tensor:
+        """All-reduce this forward's physical expert load over the EP group.
+
+        Returns:
+            A `[num_moe_layers, num_physical_experts]` tensor of global load, the
+            same on **every** rank — the planner needs it everywhere, because a plan
+            that differs by rank pairs a sender with no receiver. Both the per-rank
+            and the per-logical views must be taken from this tensor: recording
+            happens in the router on each rank's own tokens, so an un-reduced copy
+            is "how one rank's tokens spread across the ranks", which is a different
+            quantity and differs by a factor of the EP size. Deriving one view from
+            the reduced tensor and the other from the raw one produced that error.
+        """
+        load = model_state.expert_load_pass.clone()
+        torch.distributed.all_reduce(load, group=get_ep_group().device_group)
+        return load
+
+    def _logical_load_this_forward(
+        self, model_state: EplbModelState
+    ) -> torch.Tensor | None:
+        """Reduce this forward's physical expert load to per-logical counts.
+
+        The load is all-reduced over the EP group first, so the result is the
+        global count for each logical expert rather than this rank's share.
+        Inactive physical rows, marked `-1`, contribute nothing.
+
+        Args:
+            model_state: The model whose `expert_load_pass` to reduce.
+
+        Returns:
+            A `[num_moe_layers, num_logical_experts]` tensor on EP rank 0, or None
+            on every other rank, which has nothing to report.
+        """
+        load = self._reduced_load_this_forward(model_state)
+        if get_ep_group().device_group.rank() != 0:
+            return None  # only rank 0 writes the diagnostic dumps
+        return self._logical_from_reduced(model_state, load)
+
+    @staticmethod
+    def _logical_from_reduced(
+        model_state: EplbModelState, reduced: torch.Tensor
+    ) -> torch.Tensor:
+        """Fold an already-reduced physical load onto logical experts.
+
+        Pure: performs no collective, so a caller that already reduced does not
+        reduce again. Inactive physical rows, marked `-1`, contribute nothing.
+        """
+        physical_to_logical = model_state.physical_to_logical_map
+        num_logical = model_state.model.num_logical_experts
+        per_logical = torch.zeros(
+            reduced.shape[0], num_logical, dtype=reduced.dtype, device=reduced.device
+        )
+        valid = physical_to_logical.clamp(min=0)
+        per_logical.scatter_add_(
+            1, valid, reduced * (physical_to_logical >= 0).to(reduced.dtype)
+        )
+        return per_logical
+
+    def _dump_prediction_accuracy(self, path: str) -> None:
+        """Append each cross-layer prediction beside its target layer's load.
+
+        The accuracy question is a comparison of two tensors that both already
+        exist: the predicted logical-expert counts a source layer produced during
+        this forward, and the target layer's own recorded load from the same
+        forward. Both are written raw and every metric is computed offline, so no
+        accuracy policy runs on the serving path.
+
+        Diagnostic and opt-in. It synchronizes with the host, which is acceptable
+        only because it is off unless the environment variable is set.
+        """
+        pairs = registered_prediction_pairs()
+        if not pairs:
+            return
+        expected_layers = bound_layer_count()
+        for model_state in self.model_states.values():
+            per_logical = self._logical_load_this_forward(model_state)
+            if per_logical is None:
+                continue
+            # The registry holds one model's runners. Scoring them against another
+            # model's load - a MoE drafter under speculative decoding, say - would
+            # silently mix the two into one average that reads as poor accuracy.
+            # The layer count is the discriminator, taken from the tensor in hand.
+            if expected_layers is not None and per_logical.shape[0] != expected_layers:
+                continue
+            actual = per_logical.tolist()
+            records = []
+            for source_index, target_index, runner in pairs:
+                snapshot = runner.predicted_load_snapshot
+                if snapshot is None:
+                    # This layer ran no prediction in this forward, for instance
+                    # a padding-only or dummy pass.
+                    continue
+                if target_index >= len(actual):
+                    continue
+                records.append(
+                    {
+                        "model": model_state.model_name,
+                        "source": source_index,
+                        "target": target_index,
+                        # Summed over source ranks so both sides count the same
+                        # population: the actual load is likewise a global count.
+                        "predicted": snapshot.sum(dim=0).tolist(),
+                        "actual": actual[target_index],
+                    }
+                )
+            if records:
+                with open(path, "a") as handle:
+                    handle.write(json.dumps({"pairs": records}) + "\n")
+
     def _should_record_current_step(self, log_stats: bool = False) -> bool:
         """Return whether expert-load recording should be enabled this step.
 
@@ -773,6 +1501,18 @@ class EplbState:
             rank_mapping (dict[int, int] | None): The rank mapping
                 when scaling is done in EEP.
         """
+
+        if self.predictive_enabled and not is_profile:
+            # Predictive expert replication reuses the leading row of
+            # `expert_buffer` as its one-expert staging workspace. That reuse is
+            # only safe because nothing else touches the buffer during serving,
+            # so a native rearrangement on the request path is an invariant
+            # violation rather than a slow path.
+            raise RuntimeError(
+                "Native expert rearrangement must not run while Predictive "
+                "expert replication is enabled: the predictive staging "
+                "workspace shares the expert transfer buffer."
+            )
 
         ep_group = get_ep_group().device_group
         ep_rank = ep_group.rank()
@@ -1175,6 +1915,21 @@ class EplbLayerState:
     """
     Reference to the parent :class:`EplbModelState`'s tensor list so the
     router can read the correct per-[u]batch unpadded token count.
+    """
+    source_local_physical_map: torch.Tensor | None = None
+    """
+    Source-local physical map for this rank: ``[num_logical_experts, 1]``, the one
+    physical row this source rank routes each logical expert to.
+
+    Set only under Predictive expert replication. Its presence is what switches
+    routing from the shared path's per-token replica choice to source-rank
+    routing: offering a single copy leaves nothing for a per-token decision to
+    split, so a source rank's chunk cannot be divided across copies.
+    """
+    source_local_replica_count: torch.Tensor | None = None
+    """
+    All-ones counterpart to :attr:`source_local_physical_map`, which pins the
+    single offered copy. Kept beside the map so both are swapped together.
     """
 
     def set_layer_state(

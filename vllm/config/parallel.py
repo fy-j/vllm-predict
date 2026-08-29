@@ -3,9 +3,9 @@
 
 import json
 import os
-from pathlib import Path
 import socket
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import regex as re
@@ -117,48 +117,235 @@ class EPLBConfig:
         return self
 
 
+PREDICTIVE_COST_PROFILE_FINGERPRINT_KEYS = (
+    "model",
+    "dtype",
+    "ep_size",
+    "num_logical_experts",
+    "device_name",
+)
+"""Fingerprint entries a cost profile must pin so a profile measured on another
+model, dtype, EP size, or GPU cannot be silently reused."""
+
+PREDICTIVE_COST_PROFILE_COST_KEYS = (
+    "expert_compute_us_per_token",
+    "attention_window_us",
+    "transfer_latency_us",
+    "usable_transfer_bandwidth_bytes_per_us",
+)
+"""Static microbenchmark costs the deterministic planner converts to time.
+
+`usable_transfer_bandwidth_bytes_per_us` is measured while token dispatch and
+combine are running. An idle point-to-point figure would systematically
+overstate benefit, because the token collectives and the expert transfer share
+one interconnect.
+"""
+
+
+def _parse_static_replica_placement(value: str) -> tuple[int, int]:
+    """Parse `"<logical expert>:<target rank>"`.
+
+    Raises:
+        ValueError: If the value is not two non-negative integers separated by a
+            colon, since a silently ignored placement would make a routing test
+            pass for the wrong reason.
+    """
+    parts = value.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            f"static_replica_placement must be '<logical expert>:<target rank>'; "
+            f"got {value!r}."
+        )
+    try:
+        logical, target = int(parts[0]), int(parts[1])
+    except ValueError as exc:
+        raise ValueError(
+            f"static_replica_placement must be two integers; got {value!r}."
+        ) from exc
+    if logical < 0 or target < 0:
+        raise ValueError(
+            f"static_replica_placement must be non-negative; got {value!r}."
+        )
+    return logical, target
+
+
 @config
 class PredictiveExpertReplicationConfig:
     """Configuration for predictive expert replication."""
 
     enabled: bool = False
+    """Whether to run the predictive replica controller. Off by default."""
     cost_profile_path: str | None = None
+    """Path to the offline cost profile. Required when `enabled`."""
     replica_slots_per_rank: int = Field(default=1, ge=1)
+    """Inactive replica slots reserved per EP rank. The PoC accepts 1."""
+    prediction_lookahead_layers: int = Field(default=2, ge=1)
+    """Distance in sparse MoE layers from the predicting layer to its target.
+
+    A value of `n` means layer `i` predicts layer `i + n`, so `n - 1` layers run
+    in between. The transfer-hiding window is therefore one Attention block plus
+    `n - 1` whole layers, which is what the cost model sizes against.
+
+    A smaller lookahead predicts more accurately but leaves a shorter overlap
+    window for the expert-weight transfer. On an interconnect where one expert
+    costs more than one layer's Attention, a lookahead above 1 is required for
+    the transfer to be hidden at all.
+    """
+    prediction_skip_first_layers: int = Field(default=3, ge=0)
+    """Leading sparse MoE layers that predict nothing.
+
+    Cross-layer prediction is unreliable in the earliest layers, so they are
+    excluded rather than allowed to drive placement.
+    """
+    max_concurrent_transfer_bytes: int | None = Field(default=None, gt=0)
+    """Cap on expert-weight bytes in flight. Defaults to one expert.
+
+    This, not a per-forward count, is the binding interconnect constraint: two
+    approved transfers can otherwise overlap the same layer's token dispatch.
+    """
+    max_replicas_per_layer: int = Field(default=2, ge=1)
+    """Distinct logical experts a layer may replicate, each to its own target rank.
+
+    Replicating one expert onto several ranks cannot help beyond that expert's own
+    share of the peak rank, so the policy places several *different* experts
+    instead. Measured concentration puts the median need at two.
+    """
+    max_transfers_per_forward: int = Field(default=4, ge=1)
+    """Cap on expert transfers per forward, counted across all layers.
+
+    Counts transfers, not layers: a layer placing `max_replicas_per_layer`
+    replicas costs that many transfers, and the interconnect budget binds on
+    transfers.
+    """
+    static_replica_placement: str | None = None
+    """Install a fixed replica at startup, as `"<logical expert>:<target rank>"`.
+
+    A validation aid, not a serving feature: it places the replica during startup
+    normalization so source-rank routing can be exercised end to end before any
+    weight-transfer machinery exists. Leave unset for normal operation.
+    """
     hot_stable_steps: int = Field(default=2, ge=1)
+    """Consecutive hot observations before an occupied slot is replaced."""
     min_residency_steps: int = Field(default=4, ge=1)
-    hot_load_ratio: float = Field(default=1.0, gt=0)
+    """Minimum forwards a replica stays resident, amortizing its transfer."""
+    hot_load_ratio: float = Field(default=1.5, gt=0)
+    """Candidate pre-filter only: predicted load over the layer mean.
+
+    The authoritative gate is the policy's positive-benefit test, so this exists
+    only to avoid evaluating every logical expert on every layer.
+    """
+
+    cost_profile: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    """Parsed `cost_profile_path` contents. Populated by validation."""
+
+    parsed_static_replica_placement: tuple[int, int] | None = Field(
+        default=None, exclude=True
+    )
+    """Parsed `static_replica_placement` as `(logical expert, target rank)`."""
 
     @model_validator(mode="after")
     def _validate_predictive_config(self) -> Self:
         if not self.enabled:
             return self
-        if self.replica_slots_per_rank != 1:
+        if self.max_replicas_per_layer > 7:
             raise ValueError(
-                "Predictive expert replication supports one slot per rank."
+                f"max_replicas_per_layer must leave a rank for the canonical "
+                f"owner; with 8 EP ranks the maximum is 7, got "
+                f"{self.max_replicas_per_layer}."
             )
-        if self.hot_stable_steps != 2:
-            raise ValueError(
-                "Predictive expert replication requires hot_stable_steps=2."
-            )
-        if self.min_residency_steps != 4:
-            raise ValueError(
-                "Predictive expert replication requires min_residency_steps=4."
+        for field_name, only_supported in (
+            ("replica_slots_per_rank", 1),
+            ("hot_stable_steps", 2),
+            ("min_residency_steps", 4),
+        ):
+            if getattr(self, field_name) != only_supported:
+                raise ValueError(
+                    f"Predictive expert replication requires "
+                    f"{field_name}={only_supported}; "
+                    f"got {getattr(self, field_name)}."
+                )
+        if self.static_replica_placement is not None:
+            self.parsed_static_replica_placement = _parse_static_replica_placement(
+                self.static_replica_placement
             )
         if not self.cost_profile_path:
             raise ValueError(
                 "Predictive expert replication requires cost_profile_path."
             )
+        self.cost_profile = self._load_cost_profile(self.cost_profile_path)
+        return self
+
+    @staticmethod
+    def _load_cost_profile(path: str) -> dict[str, Any]:
         try:
-            profile = json.loads(Path(self.cost_profile_path).read_text())
+            profile = json.loads(Path(path).read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(
-                "Predictive expert replication cost profile must be readable JSON."
+                f"Predictive expert replication cost profile {path} must be "
+                f"readable JSON: {exc}"
             ) from exc
         if not isinstance(profile, dict):
             raise ValueError(
-                "Predictive expert replication cost profile must be a JSON object."
+                f"Predictive expert replication cost profile {path} must be a "
+                f"JSON object."
             )
-        return self
+
+        fingerprint = profile.get("fingerprint")
+        if not isinstance(fingerprint, dict):
+            raise ValueError(
+                f"Predictive expert replication cost profile {path} must "
+                f"contain a `fingerprint` object."
+            )
+        missing = [
+            key
+            for key in PREDICTIVE_COST_PROFILE_FINGERPRINT_KEYS
+            if key not in fingerprint
+        ]
+        if missing:
+            raise ValueError(
+                f"Predictive expert replication cost profile {path} fingerprint "
+                f"is missing {missing}."
+            )
+
+        for key in PREDICTIVE_COST_PROFILE_COST_KEYS:
+            value = profile.get(key)
+            if not isinstance(value, int | float) or isinstance(value, bool):
+                raise ValueError(
+                    f"Predictive expert replication cost profile {path} needs a "
+                    f"numeric `{key}`; got {value!r}."
+                )
+            if value <= 0:
+                raise ValueError(
+                    f"Predictive expert replication cost profile {path} needs a "
+                    f"positive `{key}`; got {value!r}."
+                )
+        return profile
+
+    def validate_fingerprint(self, **expected: Any) -> None:
+        """Reject a cost profile measured on a different runtime.
+
+        Only the supplied entries are compared, so the config validator can
+        check model shape while the worker separately checks the bound device.
+
+        Args:
+            **expected: Fingerprint entries the running system requires, keyed
+                as in `PREDICTIVE_COST_PROFILE_FINGERPRINT_KEYS`.
+
+        Raises:
+            ValueError: If any supplied entry disagrees with the profile.
+        """
+        fingerprint = self.cost_profile["fingerprint"]
+        mismatched = {
+            key: {"profile": fingerprint[key], "runtime": value}
+            for key, value in expected.items()
+            if fingerprint[key] != value
+        }
+        if mismatched:
+            raise ValueError(
+                f"Predictive expert replication cost profile "
+                f"{self.cost_profile_path} does not match this runtime: "
+                f"{mismatched}."
+            )
 
 
 @config

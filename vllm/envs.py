@@ -297,6 +297,10 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+    VLLM_EPLB_DUMP_LOAD_PATH: str | None = None
+    VLLM_PREDICTIVE_ACCURACY_DUMP_PATH: str | None = None
+    VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS: bool = False
+    VLLM_PREDICTIVE_PLACE_PER_FORWARD: int = 0
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -2046,6 +2050,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_COMPILE_CACHE_SAVE_FORMAT", "binary", ["binary", "unpacked"]
     ),
     # Flag to control the v2 model runner. If unset, use config defaults.
+    # Diagnostic: append per-logical-expert load for each forward to this file.
+    "VLLM_EPLB_DUMP_LOAD_PATH": lambda: os.getenv("VLLM_EPLB_DUMP_LOAD_PATH", None),
+    # Diagnostic: append cross-layer predicted load beside the target layer's
+    # actual load, for each forward, to this file. Ticket 06 reads it offline.
+    "VLLM_PREDICTIVE_ACCURACY_DUMP_PATH": lambda: os.getenv(
+        "VLLM_PREDICTIVE_ACCURACY_DUMP_PATH", None
+    ),
+    # Verification: fail the forward if a token reached a physical slot holding no
+    # logical expert. Off by default because it synchronizes with the host.
+    "VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS": lambda: bool(
+        int(os.getenv("VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS", "0"))
+    ),
+    # Bring-up arm for in-forward placement; 0 is off. The transfer budget itself
+    # comes from `max_transfers_per_forward`, per the spec — this only decides whether
+    # the path runs at all, so an unvalidated path cannot perturb a prediction-accuracy
+    # run that merely wants the read-only predict path.
+    "VLLM_PREDICTIVE_PLACE_PER_FORWARD": lambda: int(
+        os.getenv("VLLM_PREDICTIVE_PLACE_PER_FORWARD", "0")
+    ),
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),

@@ -1592,8 +1592,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 
-        # Update the EPLB meta.
-        self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
+        # Update the EPLB meta. A dummy forward carries no real tokens, so publish
+        # a zero unpadded count: otherwise expert-load recording and predictive
+        # counting attribute dummy work to real experts.
+        self.eplb.prepare_forward(
+            self.model_config, 0 if dummy_run else input_batch.num_tokens
+        )
 
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL

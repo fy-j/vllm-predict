@@ -201,6 +201,14 @@ class BaseRouter(FusedMoERouter):
             if eplb_state.num_unpadded_tokens_tensors is None:
                 raise ValueError("EPLB requires num_unpadded_tokens_tensors != None")
 
+    def select_logical_experts(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        _, topk_ids = self._compute_routing(hidden_states, router_logits, None)
+        return topk_ids
+
     def _apply_eplb_mapping(self, topk_ids: torch.Tensor) -> torch.Tensor:
         """Apply EPLB mapping to convert logical expert IDs to physical expert IDs."""
         if self.eplb_state is not None:
@@ -210,10 +218,20 @@ class BaseRouter(FusedMoERouter):
             assert eplb_state.logical_replica_count is not None
             assert eplb_state.should_record_tensor is not None
             assert eplb_state.num_unpadded_tokens_tensors is not None
+            # Under Predictive expert replication a source-local map offers this
+            # rank exactly one copy per logical expert, which turns the shared
+            # path's per-token replica choice into a lookup and gives source-rank
+            # routing. Every other caller keeps the previous behaviour.
+            physical_map = eplb_state.logical_to_physical_map
+            replica_count = eplb_state.logical_replica_count
+            if eplb_state.source_local_physical_map is not None:
+                assert eplb_state.source_local_replica_count is not None
+                physical_map = eplb_state.source_local_physical_map
+                replica_count = eplb_state.source_local_replica_count
             return eplb_map_to_physical_and_record(
                 topk_ids=topk_ids,
-                logical_to_physical_map=eplb_state.logical_to_physical_map,
-                logical_replica_count=eplb_state.logical_replica_count,
+                logical_to_physical_map=physical_map,
+                logical_replica_count=replica_count,
                 expert_load_view=eplb_state.expert_load_view,
                 record_enabled=eplb_state.should_record_tensor,
                 num_unpadded_tokens=eplb_state.num_unpadded_tokens_tensors[

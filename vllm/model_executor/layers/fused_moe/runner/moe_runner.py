@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 import torch.nn.functional as F
@@ -15,7 +15,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
-from vllm.distributed.eplb.predictive import PredictiveLoadSnapshot
+from vllm.distributed.eplb.predictive import CrossLayerLoadPredictor
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,
@@ -225,6 +225,21 @@ def _unpack(
         return (None, result)
 
 
+class _PlacementCoordinator(Protocol):
+    """What the MoE forward needs of the placement coordinator.
+
+    Narrower than the real class and declared here rather than imported, which keeps
+    the fused_moe package independent of the eplb one. Typing it at all is the point:
+    as `object` it hid every call, including a rename of the publish entry point.
+    """
+
+    def plan_and_launch(self) -> list: ...
+
+    def activate_and_publish(self, layer: int) -> list: ...
+
+    def record_prediction(self, source_layer: int, predicted: torch.Tensor) -> None: ...
+
+
 class MoERunner(MoERunnerInterface):
     """
     Standard MoE runner implementation for executing Mixture of Experts layers.
@@ -272,8 +287,13 @@ class MoERunner(MoERunnerInterface):
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
         self.enable_dbo = enable_dbo
-        self.predictive_load: PredictiveLoadSnapshot | None = None
+        self.load_predictor: CrossLayerLoadPredictor | None = None
+        self.moe_layer_index: int | None = None
+        self.placement_coordinator: _PlacementCoordinator | None = None
+        self.prediction_min_tokens_per_expert: float = 0.0
         self.predicted_load_snapshot: torch.Tensor | None = None
+        """Global predicted-load snapshot for the target MoE, valid only between
+        this layer's dispatch and the target layer's forward."""
 
         # When both gates are present and FSE is enabled, fuse their
         # weight matrices into [num_experts + num_shared, hidden] so one
@@ -630,6 +650,42 @@ class MoERunner(MoERunnerInterface):
             fused_out,
         )
 
+    def _prediction_is_worth_it(self) -> bool:
+        """Whether this forward can benefit from a placement at all.
+
+        Below one block per expert the MoE kernel pads every expert to the same block
+        count, so the imbalance costs nothing and no placement can save anything —
+        ticket 00's inequality. Predicting anyway costs a gate matmul and a small
+        AllGather per layer for a result that is certain to be discarded: measured at
+        7.3% of TPOT on a run where the placement gate rejected every forward.
+
+        The count must be one every rank agrees on. `num_tokens_across_dp_cpu` is the
+        result of the DP coordination all-reduce, so it is identical on every rank and
+        already on the host. The **local** token count is not usable here: it differs
+        by rank under DP, and `start_snapshot` performs an AllGather, so a per-rank
+        decision would hang the engine — the failure this branch has hit twice.
+
+        Returns:
+            True when the forward is large enough to be worth predicting, and when the
+            token count cannot be established, which keeps the diagnostic paths that
+            run without DP metadata working.
+        """
+        if self.prediction_min_tokens_per_expert <= 0.0:
+            return True
+        context = get_forward_context()
+        dp_metadata = getattr(context, "dp_metadata", None)
+        if dp_metadata is None:
+            return True
+        across = getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
+        if across is None:
+            return True
+        total = int(across.sum())
+        config = self.moe_config
+        per_expert = (
+            total * config.experts_per_token / max(1, config.num_logical_experts)
+        )
+        return per_expert > self.prediction_min_tokens_per_expert
+
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token
         redistribution.
@@ -887,9 +943,25 @@ class MoERunner(MoERunnerInterface):
             else:
                 router_logits, _ = self.gate(hidden_states)
 
+        # In-forward placement, before this layer routes anything. Two things happen
+        # here and the order matters: a plan recorded at the previous layer is launched
+        # now, so its async snapshot copy has had a layer of compute to land in; and any
+        # transfer aimed at *this* layer is waited for and activated, so this layer's
+        # routing sees the replica rather than the canonical copy alone.
+        if self.placement_coordinator is not None:
+            self.placement_coordinator.plan_and_launch()
+            # Unconditional: an empty desired set is what reverts a replica the last
+            # forward left on this layer. Gating on a non-empty activation left stale
+            # replicas live on every layer that planned nothing this forward.
+            assert self.moe_layer_index is not None
+            self.placement_coordinator.activate_and_publish(self.moe_layer_index)
+
+        # Cross-layer prediction reads source-local hidden states before token
+        # dispatch, so the counts carry source-rank provenance.
         predicted_counts = None
-        if self.predictive_load is not None:
-            predicted_counts = self.predictive_load.predict(hidden_states)
+        if self.load_predictor is not None and self._prediction_is_worth_it():
+            self.predicted_load_snapshot = None
+            predicted_counts = self.load_predictor.predict_local_counts(hidden_states)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
@@ -900,7 +972,8 @@ class MoERunner(MoERunnerInterface):
                 router_logits,
             )
             if predicted_counts is not None:
-                self.predictive_load.start(predicted_counts)
+                assert self.load_predictor is not None
+                self.load_predictor.start_snapshot(predicted_counts)
 
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
@@ -909,18 +982,74 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            if self.predictive_load is not None:
-                self.predicted_load_snapshot = self.predictive_load.finish()
+            if predicted_counts is not None:
+                assert self.load_predictor is not None
+                self.predicted_load_snapshot = self.load_predictor.finish_snapshot()
+                # Record only; planning here would need a host sync inside the forward.
+                if (
+                    self.placement_coordinator is not None
+                    and self.predicted_load_snapshot is not None
+                ):
+                    # Asserted rather than skipped: a coordinator without an index is
+                    # a wiring error, and skipping would make it look like a forward
+                    # that simply had nothing to predict.
+                    assert self.moe_layer_index is not None
+                    self.placement_coordinator.record_prediction(
+                        self.moe_layer_index, self.predicted_load_snapshot
+                    )
             return self._maybe_combine(
                 shared_output,
                 hidden_states,
             )
 
-    def set_predictive_target(self, target: "MoERunner") -> None:
-        """Bind the adjacent MoE's gate and logical router for prediction."""
-        assert target.gate is not None
-        self.predictive_load = PredictiveLoadSnapshot(
-            target.gate, target.router, target.moe_config.num_experts
+    def bind_prediction_target(self, target: "MoERunner") -> None:
+        """Bind the sparse MoE this layer predicts, `prediction_lookahead_layers` ahead.
+
+        The target's gate module and router selection semantics are retained by
+        reference so ordinary weight loading stays authoritative.
+
+        Args:
+            target: The adjacent sparse MoE runner whose load is predicted.
+
+        Raises:
+            ValueError: If the target cannot be predicted from this layer, or if
+                this layer runs a configuration the predictive path does not
+                support.
+        """
+        if target.gate is None:
+            raise ValueError(
+                "Predictive expert replication needs the target MoE to own its "
+                "gate module."
+            )
+        if self.moe_config.is_sequence_parallel:
+            raise ValueError(
+                "Predictive expert replication does not support sequence-parallel "
+                "MoE, whose hidden states are not source-rank complete."
+            )
+        eplb_layer_state = self.router.eplb_state
+        if eplb_layer_state is None:
+            raise ValueError(
+                "Predictive expert replication requires Expert replication "
+                "infrastructure to be provisioned on this MoE layer."
+            )
+        # `select_logical_experts` is only read-only for routers whose routing
+        # computation has no side effect and needs no extra input. Two in-tree
+        # routers break that: a zero-expert router writes consume-once state, and
+        # a hash-table router needs `input_ids` that the read-only path does not
+        # forward and would silently route differently without. Reject them here
+        # rather than let prediction corrupt routing or the target layer's state.
+        unsupported_router = type(target.router).__name__
+        if unsupported_router in ("ZeroExpertRouter", "FusedTopKBiasRouter"):
+            raise ValueError(
+                f"Predictive expert replication cannot read {unsupported_router} "
+                f"speculatively: its routing computation is stateful or needs "
+                f"inputs the read-only path does not carry."
+            )
+        self.load_predictor = CrossLayerLoadPredictor(
+            target_gate=target.gate,
+            target_router=target.router,
+            num_logical_experts=target.moe_config.num_logical_experts,
+            eplb_layer_state=eplb_layer_state,
         )
 
     #########################################################

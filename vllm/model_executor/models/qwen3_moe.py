@@ -39,6 +39,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.distributed.eplb.predictive import bind_moe_prediction_targets
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -467,15 +468,21 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             lambda prefix: decoder_layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
-        if vllm_config.parallel_config.predictive_expert_replication_config.enabled:
-            sparse_moes = [
-                layer.mlp
-                for layer in self.layers
-                if isinstance(layer, Qwen3MoeDecoderLayer)
-                and isinstance(layer.mlp, Qwen3MoeSparseMoeBlock)
-            ]
-            for source, target in zip(sparse_moes, sparse_moes[1:]):
-                source.experts.set_predictive_target(target.experts)
+        predictive_config = (
+            vllm_config.parallel_config.predictive_expert_replication_config
+        )
+        if predictive_config.enabled:
+            bind_moe_prediction_targets(
+                [
+                    layer.mlp.experts
+                    if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock)
+                    else None
+                    for layer in self.layers
+                    if isinstance(layer, Qwen3MoeDecoderLayer)
+                ],
+                lookahead=predictive_config.prediction_lookahead_layers,
+                skip_first_layers=predictive_config.prediction_skip_first_layers,
+            )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size

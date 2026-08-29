@@ -42,6 +42,31 @@ class FusedMoERouter(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
+    @abstractmethod
+    def select_logical_experts(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Return the logical expert ids this router's selection semantics would
+        choose, without any placement or bookkeeping side effect.
+
+        Unlike `select_experts`, this never applies the EPLB logical-to-physical
+        mapping, never records expert load, and never writes routing replay
+        state, so a caller may evaluate it speculatively. Predictive expert
+        replication uses it to read the *target* layer's routing decision from
+        the current layer's hidden states.
+
+        Args:
+            hidden_states: Hidden states to route.
+            router_logits: Logits produced by the gate for `hidden_states`.
+
+        Returns:
+            Logical expert ids, shaped `[num_tokens, top_k]`.
+        """
+        raise NotImplementedError
+
     def select_experts(
         self,
         hidden_states: torch.Tensor,

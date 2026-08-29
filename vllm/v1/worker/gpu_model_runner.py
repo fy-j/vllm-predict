@@ -6239,6 +6239,15 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
+            # A dummy forward carries no real tokens. Publishing a zero
+            # unpadded-token count keeps expert-load recording and predictive
+            # counting from attributing dummy work to any expert, while the
+            # forward still participates in every collective.
+            if self.eplb_state is not None:
+                self.eplb_state.prepare_forward(
+                    self.model_config, 0, ubatch_slices_padded
+                )
+
             with (
                 self.maybe_randomize_inputs(
                     input_ids, inputs_embeds, randomize_inputs=randomize_inputs

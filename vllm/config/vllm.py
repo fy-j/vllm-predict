@@ -456,6 +456,14 @@ class VllmConfig:
 
     @model_validator(mode="after")
     def configure_predictive_expert_replication(self) -> "VllmConfig":
+        """Derive Expert replication infrastructure settings from
+        `additional_config.predictive_expert_replication`.
+
+        Predictive mode reuses the EPLB slots, maps, transfer buffers, and
+        separate EPLB communicator, but not Native EPLB's placement
+        controller. Because this runs after `ParallelConfig` validation, the
+        EPLB preconditions that validator enforces are re-checked here.
+        """
         if not isinstance(self.additional_config, dict):
             return self
         raw_config = self.additional_config.get("predictive_expert_replication")
@@ -468,48 +476,128 @@ class VllmConfig:
         self.parallel_config.predictive_expert_replication_config = predictive_config
         if not predictive_config.enabled:
             return self
-        if self.parallel_config.enable_eplb:
+
+        parallel_config = self.parallel_config
+        if parallel_config.enable_eplb:
             raise ValueError(
                 "Native EPLB and Predictive expert replication are mutually exclusive."
             )
-        if self.parallel_config.eplb_config.num_redundant_experts:
-            raise ValueError(
-                "Predictive expert replication manages redundant expert slots."
-            )
-
+        self._validate_predictive_runtime_scope()
         ep_size = (
-            self.parallel_config.tensor_parallel_size
-            * self.parallel_config.prefill_context_parallel_size
-            * self.parallel_config.data_parallel_size
+            parallel_config.tensor_parallel_size
+            * parallel_config.prefill_context_parallel_size
+            * parallel_config.data_parallel_size
         )
-        if (
-            self.parallel_config.tensor_parallel_size != 1
-            or self.parallel_config.prefill_context_parallel_size != 1
-            or self.parallel_config.data_parallel_size != 8
-            or not self.parallel_config.enable_expert_parallel
-            or self.parallel_config.enable_dbo
-            or self.parallel_config.all2all_backend != "allgather_reducescatter"
-        ):
-            raise ValueError(
-                "Predictive expert replication requires TP=1, PCP=1, DP=8, "
-                "expert parallelism, DBO disabled, and allgather_reducescatter."
+        num_logical_experts = self._validate_predictive_model_scope(ep_size)
+        if num_logical_experts is not None:
+            predictive_config.validate_fingerprint(
+                model=self.model_config.model,
+                dtype=str(self.model_config.dtype).removeprefix("torch."),
+                ep_size=ep_size,
+                num_logical_experts=num_logical_experts,
             )
-        if self.model_config is not None:
-            if (
-                "Qwen3MoeForCausalLM" not in self.model_config.architectures
-                or self.model_config.dtype != torch.bfloat16
-                or self.model_config.get_num_experts() != 128
-                or not self.model_config.enforce_eager
-            ):
-                raise ValueError(
-                    "Predictive expert replication supports Qwen3-30B-A3B BF16 only."
-                )
 
-        self.parallel_config.enable_eplb = True
-        self.parallel_config.eplb_config.num_redundant_experts = ep_size
-        self.parallel_config.eplb_config.use_async = False
-        self.parallel_config.eplb_config.communicator = "pynccl"
+        # Provision Expert replication infrastructure without Native EPLB's
+        # controller. `use_async` must stay off: the async rebalance worker is
+        # Native EPLB's placement path, and NCCL communicators are documented
+        # as incompatible with it.
+        parallel_config.enable_eplb = True
+        parallel_config.eplb_config.num_redundant_experts = (
+            ep_size * predictive_config.replica_slots_per_rank
+        )
+        parallel_config.eplb_config.use_async = False
+        parallel_config.eplb_config.communicator = "pynccl"
         return self
+
+    def _validate_predictive_runtime_scope(self) -> None:
+        """Enforce the approved predictive PoC runtime scope (spec 13)."""
+        from vllm.platforms import current_platform
+
+        parallel_config = self.parallel_config
+        if not current_platform.is_cuda_alike():
+            raise ValueError(
+                "Predictive expert replication requires a CUDA or ROCm platform."
+            )
+        unsupported = []
+        if parallel_config.tensor_parallel_size != 1:
+            unsupported.append(f"TP={parallel_config.tensor_parallel_size} (need 1)")
+        if parallel_config.prefill_context_parallel_size != 1:
+            unsupported.append(
+                f"PCP={parallel_config.prefill_context_parallel_size} (need 1)"
+            )
+        if parallel_config.pipeline_parallel_size != 1:
+            unsupported.append(f"PP={parallel_config.pipeline_parallel_size} (need 1)")
+        if parallel_config.data_parallel_size != 8:
+            unsupported.append(f"DP={parallel_config.data_parallel_size} (need 8)")
+        if not parallel_config.enable_expert_parallel:
+            unsupported.append("expert parallelism disabled")
+        if parallel_config.enable_dbo:
+            unsupported.append("DBO enabled")
+        if parallel_config.all2all_backend != "allgather_reducescatter":
+            unsupported.append(
+                f"all2all_backend={parallel_config.all2all_backend} "
+                "(need allgather_reducescatter)"
+            )
+        if self.speculative_config is not None:
+            unsupported.append("speculative decoding enabled")
+        if unsupported:
+            raise ValueError(
+                "Predictive expert replication does not support: "
+                f"{', '.join(unsupported)}."
+            )
+
+    def _validate_predictive_model_scope(self, ep_size: int) -> int | None:
+        """Enforce the approved predictive model scope.
+
+        Returns:
+            The model's logical expert count, or None when no `model_config` is
+            attached (configuration-only construction).
+        """
+        if self.model_config is None:
+            return None
+        unsupported = []
+        if "Qwen3MoeForCausalLM" not in self.model_config.architectures:
+            unsupported.append(f"architectures={self.model_config.architectures}")
+        if self.model_config.dtype != torch.bfloat16:
+            unsupported.append(f"dtype={self.model_config.dtype} (need bfloat16)")
+        if not self.model_config.enforce_eager:
+            unsupported.append("eager execution disabled")
+        num_logical_experts = self.model_config.get_num_experts()
+        if num_logical_experts % ep_size != 0:
+            unsupported.append(
+                f"{num_logical_experts} logical experts do not divide EP size {ep_size}"
+            )
+        if unsupported:
+            raise ValueError(
+                "Predictive expert replication supports Qwen3-30B-A3B BF16 in "
+                f"eager mode only, but got: {', '.join(unsupported)}."
+            )
+
+        # Bound-check the static placement here rather than in the worker: both
+        # numbers it needs are known now, and failing here costs a second instead
+        # of minutes spent loading the model onto every GPU first.
+        predictive = self.parallel_config.predictive_expert_replication_config
+        placement = predictive.parsed_static_replica_placement
+        if placement is not None:
+            logical, target_rank = placement
+            canonical_per_rank = num_logical_experts // ep_size
+            if not 0 <= logical < num_logical_experts:
+                raise ValueError(
+                    f"static_replica_placement expert {logical} is outside "
+                    f"[0, {num_logical_experts})."
+                )
+            if not 0 <= target_rank < ep_size:
+                raise ValueError(
+                    f"static_replica_placement rank {target_rank} is outside "
+                    f"[0, {ep_size})."
+                )
+            if logical // canonical_per_rank == target_rank:
+                raise ValueError(
+                    f"static_replica_placement puts expert {logical} on rank "
+                    f"{target_rank}, which already owns it canonically, so no "
+                    f"cross-rank replica would be exercised."
+                )
+        return num_logical_experts
 
     def compute_hash(self) -> str:
         """

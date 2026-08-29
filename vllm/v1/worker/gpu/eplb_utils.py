@@ -44,27 +44,11 @@ class EPLBController:
         self.state: EplbState | None = None
         self.suppressed = False
         self._has_registered_models = False
-        self.startup_normalization_ms = 0.0
-
-    @property
-    def predictive_enabled(self) -> bool:
-        config = getattr(
-            self.parallel_config, "predictive_expert_replication_config", None
-        )
-        return bool(config is not None and config.enabled)
-
-    @property
-    def infrastructure_enabled(self) -> bool:
-        return self.parallel_config.enable_eplb
-
-    @property
-    def native_eplb_enabled(self) -> bool:
-        return self.infrastructure_enabled and not self.predictive_enabled
 
     def prepare_load(self) -> None:
         self.state = None
         self._has_registered_models = False
-        if self.infrastructure_enabled:
+        if self.parallel_config.enable_eplb:
             self.state = EplbState(self.parallel_config, self.device)
 
     def maybe_register_speculator(
@@ -77,7 +61,7 @@ class EPLBController:
         if (
             speculator is None
             or not hasattr(speculator, "model")
-            or not self.infrastructure_enabled
+            or not self.parallel_config.enable_eplb
             or load_dummy_weights
         ):
             return False
@@ -107,7 +91,7 @@ class EPLBController:
         model_config: Any,
         load_dummy_weights: bool,
     ) -> bool:
-        if not self.infrastructure_enabled or load_dummy_weights:
+        if not self.parallel_config.enable_eplb or load_dummy_weights:
             return False
 
         moe_model = get_mixture_of_experts_model(model)
@@ -119,24 +103,11 @@ class EPLBController:
         )
         assert self.state is not None
         self.state.add_model(moe_model, model_config)
-        if self.predictive_enabled:
-            self.startup_normalization_ms = self.state.normalize_predictive_layout(
-                model_config
-            )
-            logger.info(
-                "Predictive expert replication startup normalization took %.2f ms.",
-                self.startup_normalization_ms,
-            )
         self._has_registered_models = True
         return True
 
     def maybe_start_async_loop(self, eplb_models_added: bool) -> None:
-        if (
-            self.native_eplb_enabled
-            and eplb_models_added
-            and self.state is not None
-            and self.state.is_async
-        ):
+        if eplb_models_added and self.state is not None and self.state.is_async:
             self.state.start_async_loop()
 
     def step(
@@ -145,7 +116,7 @@ class EPLBController:
         is_profile: bool = False,
     ) -> None:
         if (
-            not self.native_eplb_enabled
+            not self.parallel_config.enable_eplb
             or self.suppressed
             or self.state is None
             or not self._has_registered_models
@@ -158,13 +129,18 @@ class EPLBController:
             log_stats=self.parallel_config.eplb_config.log_balancedness,
         )
 
+    @property
+    def startup_normalization_ms(self) -> float:
+        """Predictive layout normalization time, excluded from serving latency."""
+        return self.state.startup_normalization_ms if self.state is not None else 0.0
+
     def prepare_forward(
         self,
         model_config: ModelConfig,
         num_unpadded_tokens: int,
         ubatch_slices: list | None = None,
     ) -> None:
-        if self.state is None or not self.infrastructure_enabled:
+        if self.state is None or not self.parallel_config.enable_eplb:
             return
         self.state.prepare_forward(model_config, num_unpadded_tokens, ubatch_slices)
 
