@@ -40,13 +40,25 @@ from pathlib import Path
 from analyse_e2e import is_connected, summarize
 
 
+def _budget_of(arm: str) -> str:
+    """The budget an arm name refers to, with any repeat suffix removed.
+
+    Repeated runs label arms `off-r1`, `0-r2` and so on, and every check below is about
+    the budget, not the pass. Comparing the whole label against `"off"` made each repeat
+    look like a placing arm, so the guard faulted the stock baseline for having no dump
+    and no activation, failing a run whose nine arms were healthy. A guard that cries
+    wolf gets deleted.
+    """
+    return arm.split("-r")[0]
+
+
 def _arm_records_load(arm: str) -> bool:
     """Whether this arm is expected to write an expert-load dump.
 
     The stock arm has no EPLB recording by design, so an absent dump there is the
     correct outcome rather than the failure it is on every other arm.
     """
-    return arm != "off"
+    return _budget_of(arm) != "off"
 
 
 def _arm_should_place(arm: str) -> bool:
@@ -57,7 +69,7 @@ def _arm_should_place(arm: str) -> bool:
     number, and an arithmetic test on it under `set -u` aborts a runner *after* the arm
     has served its whole benchmark, which is how this was learned.
     """
-    return arm not in ("off", "0")
+    return _budget_of(arm) not in ("off", "0")
 
 
 def check(results_dir: Path, arms: list[str], require_trace: Path | None) -> list[str]:

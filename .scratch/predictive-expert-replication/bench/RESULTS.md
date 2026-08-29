@@ -2172,3 +2172,74 @@ Three things I had written here are corrected by this:
 So at concurrency 8: ceiling 6.71%, prediction costs 22.8%, placing costs 50.3% — 3.4x and
 7.5x the ceiling. Both are properties of the wrong operating point, and both are being
 re-measured at the knee.
+
+## At the knee, with a ruler that works: the first readable numbers
+
+Concurrency 16, three passes per arm, arms interleaved within each pass, plus one profiled
+three-arm run at the same point. `report_arm_spread.py` and the profile agree, and for the
+first time the effect exceeds the measurement's own noise.
+
+### TTFT, three passes each
+
+| arm | mean TTFT | median | p99 | req/s | own spread | vs off |
+| --- | --- | --- | --- | --- | --- | --- |
+| feature disabled | 172.48 ms | 161.86 | 315.42 | 92.31 | **4.9%** | — |
+| prediction only | 198.46 ms | 190.16 | 307.05 | 79.65 | 4.5% | **+15.1%** |
+| placing | 344.97 ms | 210.17 | **3406.86** | 45.93 | 14.0% | **+100.0%** |
+
+**The baseline's own spread is 4.9%**, so this method resolves effects above roughly 5% and
+both of these clear it. Every earlier TTFT figure in this file was a single pass at
+concurrency 8 and had no such floor to be judged against.
+
+The placed arm's mean and median diverge sharply — 345 against 210 — because its p99 is
+3407 ms. The tail is the cost, not a uniform slowdown.
+
+### The same run, profiled: the mechanism is visibly working
+
+| arm | window wall-clock | occupancy | expert GEMM | share of window |
+| --- | --- | --- | --- | --- |
+| feature disabled | 94.6 ms | 72% | 10.01 ms | 10.58% |
+| prediction only | 115.7 ms | 99% | 10.93 ms | 9.45% |
+| placing | 160.4 ms | 86% | **6.88 ms** | 4.29% |
+
+**Balancing shortens the expert GEMM from 10.01 ms to 6.88 ms**, a 3.13 ms saving against a
+perfect-balance ceiling of 4.70 ms — so the placement recovers **67% of the ceiling**. That is
+the first direct sight of this feature doing the thing it was built to do, and it is well
+above the 24%-of-excess figure carried until now, which was measured on token counts rather
+than on time.
+
+The prediction arm reaching 99% occupancy is worth noting on its own: prediction fills the
+window with work rather than lengthening the idle parts.
+
+### The accounting, and what ticket 06 decides
+
+    realised benefit, expert GEMM shortened        3.13 ms   (67% of the 4.70 ms ceiling)
+    cost today, prediction only                 +21.10 ms   = 7x the benefit
+    cost today, placing                         +65.80 ms   = 21x the benefit
+
+    after 06, prediction's residual              +3.10 ms   extrapolated at 0.147, the
+                                                            measured share of per-layer cost
+                                                            that is not the host sync
+    versus the benefit                            3.13 ms
+
+**Prediction's residual after ticket 06 comes out equal to the benefit, to within 1%.** Do not
+read that as a positive margin: the extrapolation carries far more uncertainty than 1%, so the
+honest statement is that prediction alone would be **indistinguishable from break-even**.
+
+The deciding term is the one that cannot be extrapolated: placing costs **+44.7 ms beyond
+prediction**, and after 06 that becomes a one-sided put with no host involvement. Whether its
+residual is nearer 1 ms or nearer 20 ms is what ticket 06 measures, and it is the difference
+between a feature that pays and one that does not.
+
+So the direction of the answer to "should TTFT improve once the host is out of the loop" is:
+the benefit is real, larger than previously credited, and about the same size as the residual
+overhead. It is a coin flip that only 06 settles.
+
+### A false alarm in the guard, fixed
+
+The nine-arm run failed with `MEASURED NOTHING` on healthy data. Repeated runs label arms
+`off-r1`, `0-r2`, and the guard compared the whole label against `"off"`, so every repeat
+looked like a placing arm and the stock baseline was faulted for having no dump and no
+activation. Fixed by classifying on the budget with the repeat suffix stripped, with tests for
+both directions. A guard that cries wolf is a guard that gets deleted, so this counts as a
+defect in the guard rather than a nuisance.

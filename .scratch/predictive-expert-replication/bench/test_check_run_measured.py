@@ -162,3 +162,34 @@ def test_a_trace_with_step_annotations_counts_them(tmp_path):
 def test_a_missing_trace_directory_counts_zero(tmp_path):
     """No traces and empty traces are the same failure for the caller."""
     assert count_step_annotations(tmp_path / "absent") == 0
+
+
+def test_repeat_suffixed_arms_are_classified_by_their_budget(tmp_path):
+    """A repeated run labels arms `off-r1`, `0-r2`; the checks are about the budget.
+
+    Comparing the whole label against "off" made every repeat look like a placing arm,
+    so the guard faulted the stock baseline for having no dump and no activation,
+    failing a run whose nine arms were healthy. Pinned, because a guard that cries wolf
+    gets deleted.
+    """
+    _arm(tmp_path, "off-r1", placements=0, dump=False)
+    _arm(tmp_path, "0-r1", placements=0)
+    _arm(tmp_path, "43-r1", placements=344)
+    _arm(tmp_path, "off-r2", placements=0, dump=False)
+    _arm(tmp_path, "0-r2", placements=0)
+    _arm(tmp_path, "43-r2", placements=344)
+
+    problems = check(
+        tmp_path, ["off-r1", "0-r1", "43-r1", "off-r2", "0-r2", "43-r2"], None
+    )
+
+    assert problems == []
+
+
+def test_a_repeat_suffixed_placed_arm_is_still_checked(tmp_path):
+    """Stripping the suffix must not stop the real checks applying to each pass."""
+    _arm(tmp_path, "43-r2", placements=0)
+
+    problems = check(tmp_path, ["43-r2"], None)
+
+    assert any("inert" in p for p in problems)
