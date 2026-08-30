@@ -86,6 +86,51 @@ logger = init_logger(__name__)
 _MOE_BLOCK_SIZE_M_FALLBACK = 128
 
 
+def agree_across_ranks(
+    ok: bool,
+    group,
+    device: torch.device,
+    all_reduce=None,
+) -> bool:
+    """Reduce one rank's yes-or-no to the answer every rank will act on.
+
+    The device-issued path's setup contains collectives — `broadcast_object_list` for
+    NVSHMEM's unique id, then `nvshmem.init` across every PE — so a rank cannot decide
+    on its own to skip it. It used to: the setup sat in a per-rank `try/except` whose
+    handler fell back to the host path, which gives two failure shapes. A rank that
+    raises *before* the broadcast leaves every other rank waiting in it forever, so the
+    server hangs at startup with one exception in one rank's log. A rank that raises
+    *after* it is worse — the others have a working device path and go on aiming
+    one-sided puts at a peer that has fallen back, so the weights and the routing maps
+    stop describing the same thing and nothing raises.
+
+    `MIN`, so one dissenting rank takes the whole group to the host path. Every rank
+    must reach this call, including the ones that failed: skipping it *is* the
+    deadlock.
+
+    Args:
+        ok: This rank's own answer.
+        group: The process group to agree over, normally the EP group.
+        device: Where to put the one-element flag.
+        all_reduce: Injected for testing; defaults to `torch.distributed.all_reduce`.
+
+    Returns:
+        True only if every rank passed True.
+    """
+    if all_reduce is None:
+        from torch.distributed import ReduceOp
+        from torch.distributed import all_reduce as torch_all_reduce
+
+        def all_reduce(tensor, op=None, group=None):  # noqa: ANN001
+            torch_all_reduce(tensor, op=ReduceOp.MIN, group=group)
+
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int64, device=device)
+    all_reduce(flag, group=group)
+    # A host read, which is what it is for: this gates a Python branch. It costs one
+    # synchronisation at startup, not on the per-forward path.
+    return bool(int(flag.item()))
+
+
 def resolve_moe_block_size_m(
     model: MixtureOfExperts,
     top_k: int,
@@ -1022,17 +1067,29 @@ class EplbState:
 
         predictive = self.parallel_config.predictive_expert_replication_config
         model = model_state.model
-        reason = nvshmem_unavailable_reason()
-        if reason is not None:
+
+        def fall_back(why: str, *args) -> None:
+            """Say loudly why the host-issued path is being used instead.
+
+            Loudly because a silent fallback here produces a run that looks correct
+            while measuring the very cost the device path exists to remove, which has
+            happened on this branch more than once.
+            """
             logger.warning(
                 "Predictive expert replication: falling back to the host-issued "
                 "transfer because %s. The host synchronisation this path removes is "
                 "5.28 ms per predicted layer, so the feature is expected to cost more "
                 "than it returns in this configuration.",
-                reason,
+                why % args if args else why,
             )
-            return None
 
+        reason = nvshmem_unavailable_reason()
+
+        # Everything from here to the first agreement is **local**: no collective may
+        # run before every rank has committed to the same answer, because a rank that
+        # skips one leaves the others waiting in it. That was the shape of the bug this
+        # structure replaces.
+        local_ok = reason is None
         # Publishing needs the source-local maps, which the placement path writes into
         # rather than rebuilding. They are allocated here so a layer cannot be reached
         # with them unset.
@@ -1051,11 +1108,13 @@ class EplbState:
         layout = model_state.physical_to_logical_map.view(
             -1, ep_group.size(), per_local
         )
+        pointers: list = []
+        maps: list = []
+        staging_stride = 0
         try:
             pointers = [
                 WeightPointers.build(tensors) for tensors in model.expert_weights
             ]
-            maps = []
             for index, layer_module in enumerate(model.moe_layers):
                 layer_state = layer_module.eplb_state
                 maps.append(
@@ -1069,13 +1128,48 @@ class EplbState:
                         layout=layout[index],
                     )
                 )
+            staging_stride = max(p.total_bytes for p in pointers)
+        except Exception:
+            # Caught, not returned on: this rank still has to reach the agreement below,
+            # because the ranks that got further are about to enter a broadcast and one
+            # absent participant hangs all of them.
+            logger.exception(
+                "Predictive expert replication: this rank could not prepare the "
+                "device-issued transfer, so every rank will use the host-issued path."
+            )
+            local_ok = False
+
+        # Two per-layer lists built from two different attributes and indexed by the
+        # same number. A length mismatch would have the weights and the routing maps
+        # describing different layers, which routes tokens to a row holding another
+        # expert's weights and raises nothing.
+        if local_ok and len(pointers) != len(maps):
+            logger.error(
+                "Predictive expert replication: %d weight layers against %d MoE "
+                "layers, so the device path cannot index them together.",
+                len(pointers),
+                len(maps),
+            )
+            local_ok = False
+
+        # The first agreement. Everything above is local, everything below collective.
+        if not agree_across_ranks(local_ok, ep_group, self.device):
+            fall_back(
+                "at least one rank could not prepare it (this rank: %s)",
+                reason or ("prepared" if local_ok else "see the traceback above"),
+            )
+            return None
+
+        # Now the collective half, and its failures are caught the same way for the same
+        # reason: a rank that returns early here leaves the others putting into a peer
+        # with no symmetric heap, which is worse than a deadlock because nothing raises.
+        transfer = None
+        try:
             # Two buffers, not one: the transfer alternates between them by layer
             # parity, because `barrier_all` orders arrival and not this rank's next put
-            # against the peer's local drain out of the same workspace. One extra expert
-            # of symmetric memory, 9.00 MiB on this model, against a silent corruption
-            # of
-            # a replica row.
-            staging_stride = max(p.total_bytes for p in pointers)
+            # against the peer's local drain out of that workspace. One extra expert of
+            # symmetric memory, 9.00 MiB on this model, against a silent corruption of a
+            # replica row.
             staging = self._symmetric_staging(ep_group, staging_stride, buffers=2)
             transfer = DeviceExpertTransfer(
                 staging=staging,
@@ -1085,24 +1179,22 @@ class EplbState:
         except Exception:
             logger.exception(
                 "Predictive expert replication: the device-issued transfer could not "
-                "be set up, so the host-issued path is used. This is not a silent "
-                "fallback: the run below measures the host synchronisation."
+                "be set up on this rank, so every rank will use the host-issued path."
             )
-            return None
 
-        # Two per-layer lists, built from two different attributes, and indexed by the
-        # same number. A length mismatch would have the weights and the routing maps
-        # describing different layers, which routes tokens to a row holding another
-        # expert's weights and raises nothing.
-        if len(pointers) != len(maps):
-            logger.error(
-                "Predictive expert replication: %d weight layers against %d MoE "
-                "layers, so the device path cannot index them together. Falling back "
-                "to the host-issued transfer.",
-                len(pointers),
-                len(maps),
-            )
+        if not agree_across_ranks(transfer is not None, ep_group, self.device):
+            # Release what this rank did open, so a fallback does not leave a symmetric
+            # heap alive into interpreter exit — which segfaults every rank after the
+            # results have printed, per `OneSidedExpertTransfer.close`'s own docstring.
+            if transfer is not None:
+                transfer.close()
+            if self._one_sided is not None:
+                self._one_sided.close()
+                self._one_sided = None
+            fall_back("at least one rank could not initialise NVSHMEM")
             return None
+        # The agreement said every rank has one, so this rank does.
+        assert transfer is not None
 
         logger.info(
             "Predictive expert replication: device-issued transfer active on %d "

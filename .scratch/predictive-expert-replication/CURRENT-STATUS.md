@@ -108,17 +108,27 @@ places nothing. And both fused kernels now reject a non-unit innermost stride ra
 reading the wrong elements, since they index directly and every equality test builds
 contiguous tensors.
 
+**Fixed after the review: the device path is now agreed across ranks.** It was decided per
+rank inside a `try/except` whose handler fell back to the host path, and the setup contains
+collectives — `broadcast_object_list` for NVSHMEM's unique id, then `nvshmem.init` across
+every PE. So a rank that raised *before* the broadcast left every other rank waiting in it
+forever, and one that raised *after* it left the others aiming one-sided puts at a peer that
+had fallen back, with the weights and the routing maps no longer describing the same thing
+and nothing raising.
+
+`agree_across_ranks` now reduces each rank's own answer with `MIN`, twice: once after the
+purely local preparation and before any collective runs, and once after the collective half,
+so a late failure takes the whole group to the host path instead of half of it. **A rank that
+failed still reaches the agreement** — that is the point; skipping it is the deadlock. A
+group that falls back closes whatever it opened, so a symmetric heap does not survive into
+interpreter exit. Four unit tests drive the helper with an injected all-reduce, including the
+one that matters: a single dissenting rank takes everyone to the host path.
+
 **Open, most serious first.**
 
-*The device-path setup wraps collectives in a per-rank `try/except`.* `_symmetric_staging`
-does `broadcast_object_list` and `nvshmem.init`; a rank that raises earlier — in
-`WeightPointers.build`, say — falls back to the host path while every other rank blocks in
-that broadcast forever. A failure *after* the broadcast is worse: the others keep putting
-into a peer with no symmetric heap. The availability decision has to be all-reduced before
-any rank commits. Nothing has hit this because the setup succeeds or fails identically on
-every rank so far.
-
-*Neither NVSHMEM object is ever closed*, unchanged from the previous review: `close()` and
+*Neither NVSHMEM object is ever closed on the success path*, unchanged from the previous
+review — the fallback path now closes what it opened, but a healthy run still reaches exit
+with the heap live: `close()` and
 `library_finalize` have no caller outside probes, and both docstrings say the symmetric heap
 surviving into interpreter exit segfaults every rank after the results have printed.
 

@@ -1902,3 +1902,54 @@ def test_the_device_path_rejects_a_per_layer_cap_it_does_not_implement(tmp_path)
     )
     predictive = config.parallel_config.predictive_expert_replication_config
     assert predictive.max_replicas_per_layer == 2
+
+
+class TestTheDevicePathIsAgreedAcrossRanks:
+    """Whether to use the device-issued transfer must be one decision, not eight.
+
+    The setup contains collectives — `broadcast_object_list` for NVSHMEM's UID, then
+    `nvshmem.init` across every PE — and it used to sit inside a per-rank `try/except`
+    whose handler returned "use the host path instead". Two failure shapes follow. A
+    rank that raises *before* the broadcast leaves every other rank waiting in it
+    forever, so the server hangs at startup with one exception in one log. A rank that
+    raises *after* it is worse: the others have a working device path and keep aiming
+    one-sided puts at a peer that has fallen back, so the weights and the routing maps
+    stop describing the same thing and nothing raises.
+
+    The fix is an agreement, so this tests the agreement: every rank contributes its own
+    answer, the minimum wins, and a single dissenting rank takes the whole group to the
+    host path.
+    """
+
+    def _agree(self, local, peers):
+        """Run the real helper with an all-reduce that stands in for `peers`."""
+        from vllm.distributed.eplb.eplb_state import agree_across_ranks
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            # MIN over this rank's answer and the peers', which is what the real
+            # ReduceOp.MIN computes.
+            tensor.fill_(min([int(tensor.item())] + [int(p) for p in peers]))
+
+        return agree_across_ranks(
+            local,
+            group=object(),
+            device=torch.device("cpu"),
+            all_reduce=fake_all_reduce,
+        )
+
+    def test_every_rank_saying_yes_takes_the_device_path(self):
+        assert self._agree(True, peers=[1, 1, 1]) is True
+
+    def test_one_rank_saying_no_takes_the_whole_group_to_the_host_path(self):
+        """The point of the whole exercise: no rank may go it alone."""
+        assert self._agree(True, peers=[1, 0, 1]) is False
+
+    def test_a_rank_that_failed_still_answers_rather_than_returning_early(self):
+        """A rank that skips the agreement is the deadlock this replaces."""
+        assert self._agree(False, peers=[1, 1, 1]) is False
+
+    def test_the_answer_is_a_bool_not_a_tensor(self):
+        """It gates a Python branch, so it has to be read out here — startup, not a
+        forward, so the one synchronisation is free."""
+        got = self._agree(True, peers=[1])
+        assert got is True and isinstance(got, bool)
