@@ -219,6 +219,7 @@ def main() -> int:
         transfer=transfer,
         device=device,
         stream=stream,
+        staging_stride=pointers.total_bytes,
     )
     # One full pass first, for the same reason `torch.stack` is warmed above: the
     # planner is dozens of operations and the first use of each loads its kernel, which
@@ -226,6 +227,11 @@ def main() -> int:
     coordinator.note_forward_token_load(1024.0)
     coordinator.record_prediction(0, predicted)
     coordinator.plan_and_launch()
+    # This probe checks the transport, not the publish, so it never calls
+    # `activate_and_publish` — and the coordinator now refuses to open a forward with a
+    # plan still pending, which is the invariant doing its job. Drop it here rather than
+    # building routing maps the probe has no use for.
+    coordinator._pending.clear()
     torch.accelerator.synchronize()
     dist.barrier()
 
@@ -250,6 +256,7 @@ def main() -> int:
     still_queued = not launched.query()
     torch.cuda.current_stream().wait_stream(stream)
     torch.accelerator.synchronize()
+    coordinator._pending.clear()
     dist.barrier()
     if rank == 0:
         report(

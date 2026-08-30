@@ -1061,9 +1061,14 @@ class EplbState:
                         layout=layout[index],
                     )
                 )
-            staging = self._symmetric_staging(
-                ep_group, max(p.total_bytes for p in pointers)
-            )
+            # Two buffers, not one: the transfer alternates between them by layer
+            # parity, because `barrier_all` orders arrival and not this rank's next put
+            # against the peer's local drain out of the same workspace. One extra expert
+            # of symmetric memory, 9.00 MiB on this model, against a silent corruption
+            # of
+            # a replica row.
+            staging_stride = max(p.total_bytes for p in pointers)
+            staging = self._symmetric_staging(ep_group, staging_stride, buffers=2)
             transfer = DeviceExpertTransfer(
                 staging=staging,
                 ep_rank=ep_group.rank(),
@@ -1112,9 +1117,12 @@ class EplbState:
             transfer=transfer,
             device=self.device,
             stream=self._placement_stream(),
+            staging_stride=staging_stride,
         )
 
-    def _symmetric_staging(self, ep_group, expert_bytes: int) -> torch.Tensor:
+    def _symmetric_staging(
+        self, ep_group, expert_bytes: int, buffers: int = 1
+    ) -> torch.Tensor:
         """One symmetric staging buffer for this worker, allocated once.
 
         NVSHMEM is initialised here rather than earlier because it has to come after
@@ -1137,6 +1145,7 @@ class EplbState:
                 rank=ep_group.rank(),
                 world_size=ep_group.size(),
                 expert_bytes=expert_bytes,
+                buffers=buffers,
                 device=self.device,
                 broadcast_uid=broadcast_uid,
             )

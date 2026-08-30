@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
 # the vLLM project
 """Move one expert's weights with a one-sided put, so the host never learns the plan.
@@ -96,13 +99,16 @@ class OneSidedExpertTransfer:
         expert_bytes: int,
         device: torch.device,
         broadcast_uid,
+        buffers: int = 1,
     ):
         """Initialise NVSHMEM and allocate the staging buffer.
 
         Args:
             rank: This rank's id within the group the put addresses.
             world_size: That group's size.
-            expert_bytes: Staging buffer size, from `staging_workspace_bytes`.
+            expert_bytes: One expert's staging bytes, from `staging_workspace_bytes`.
+                Kept as one expert whatever `buffers` says, since it is also the
+                default cap on bytes in flight.
             device: The device torch is using. **Must** be the device NVSHMEM binds to:
                 `cuda.core.Device()` with no argument takes cuda.core's current device,
                 which does not follow `torch.cuda.set_device`, and the mismatch surfaces
@@ -110,6 +116,10 @@ class OneSidedExpertTransfer:
             broadcast_uid: Callable taking the rank-0 unique id and returning the same
                 object on every rank. Injected rather than importing a process group
                 here, so the bootstrap can be exercised without one.
+            buffers: How many expert-sized staging buffers to allocate back to back. The
+                device path asks for two and alternates by layer parity, because
+                `barrier_all` orders arrival and not one rank's next put against the
+                peer's drain out of the same workspace.
 
         Raises:
             RuntimeError: If NVSHMEM is unavailable, with the reason.
@@ -142,12 +152,13 @@ class OneSidedExpertTransfer:
         # resource, and everything else needs it to exist. Allocating the staging buffer
         # is that allocation, so nothing here has to force it separately.
         self.expert_bytes = expert_bytes
-        self._staging = nvshmem.tensor((expert_bytes,), dtype=torch.uint8)
+        self._staging = nvshmem.tensor((expert_bytes * buffers,), dtype=torch.uint8)
         self._nvshmem = nvshmem
         self._rank = rank
         logger.info(
-            "One-sided expert transfer ready: %d PEs, %.2f MiB staging buffer.",
+            "One-sided expert transfer ready: %d PEs, %d x %.2f MiB staging buffer.",
             nvshmem.n_pes(),
+            buffers,
             expert_bytes / 2**20,
         )
 

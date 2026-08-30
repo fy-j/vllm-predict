@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
 # the vLLM project
 """Move an expert's weights from a kernel, so the plan never reaches the host.
@@ -370,6 +373,7 @@ class DeviceExpertTransfer:
         pointers: WeightPointers,
         replica_row: int,
         stream: torch.cuda.Stream,
+        staging_offset: int = 0,
     ) -> None:
         """Move the planned expert into the target's replica row.
 
@@ -384,6 +388,10 @@ class DeviceExpertTransfer:
             replica_row: The physical row to land in. A host constant, since it is
                 `per_rank_experts + slot` for every rank and every layer.
             stream: The predictive stream.
+            staging_offset: Byte offset of the staging buffer to use. Alternated by the
+                caller so a later layer's put cannot land in the buffer an earlier
+                layer's drain is still reading — `barrier_all` orders arrival, not this
+                rank's next put against the peer's local drain.
         """
         from cuda.core import launch
 
@@ -397,7 +405,10 @@ class DeviceExpertTransfer:
             np.uint64(pointers.row_bytes.data_ptr()),
             np.uint64(pointers.row_strides.data_ptr()),
             np.int32(count),
-            np.uint64(self._staging.data_ptr()),
+            # Shifted here rather than inside the kernels: the base is a host argument
+            # already, and a symmetric allocation translates any offset within itself to
+            # the peer correctly, so alternating buffers costs the kernels nothing.
+            np.uint64(self._staging.data_ptr() + staging_offset),
             np.int32(self._ep_rank),
         )
         if _STAGE not in ("barrier-only", "drain-only"):

@@ -110,7 +110,22 @@ class DevicePlacementCoordinator:
         stream: torch.cuda.Stream | None = None,
         event_factory: Callable[[], torch.cuda.Event] | None = None,
         slot: int = 0,
+        staging_stride: int = 0,
     ):
+        """See the class docstring; only `staging_stride` needs a note here.
+
+        Args:
+            staging_stride: Bytes between the two staging buffers the transfer
+                alternates between: one expert of the largest layer. Zero disables the
+                alternation and is rejected: a silently shared workspace is the failure
+                this argument exists to prevent, and it corrupts a replica row without
+                raising anything.
+        """
+        if staging_stride <= 0:
+            raise ValueError(
+                f"staging_stride must be one expert's bytes so consecutive layers can "
+                f"alternate staging buffers; got {staging_stride}."
+            )
         self.ep_size = ep_size
         self.ep_rank = ep_rank
         self.canonical_per_rank = canonical_per_rank
@@ -125,6 +140,7 @@ class DevicePlacementCoordinator:
         self.stream = stream
         self.slot = slot
         self.replica_row = replica_row_of(canonical_per_rank, slot)
+        self.staging_stride = staging_stride
         self._event_factory = event_factory or torch.cuda.Event
         self.last_event: torch.cuda.Event | None = None
 
@@ -304,11 +320,24 @@ class DevicePlacementCoordinator:
             if self.stream is not None:
                 self.stream.wait_event(barrier)
             if not _SKIP_TRANSFER:
+                # Alternating staging buffers by layer parity. The sequence per layer is
+                # put, barrier, drain, and `barrier_all` orders *arrival*, not this
+                # rank's
+                # next put against the peer's local drain: once the barrier releases,
+                # one
+                # rank can be issuing layer `L+1`'s put while the other still runs layer
+                # `L`'s drain out of the same workspace. At EP=2 the target is always
+                # the
+                # other rank, so every consecutive placed pair is a candidate. Two
+                # layers
+                # apart share a buffer again and are ordered by the barrier of the layer
+                # between them.
                 self.transfer.transfer(
                     transfer_plan,
                     self.pointers[target],
                     self.replica_row,
                     self.stream or torch.cuda.current_stream(),
+                    staging_offset=(target % 2) * self.staging_stride,
                 )
             event = self._event_factory()
             event.record(self.stream)

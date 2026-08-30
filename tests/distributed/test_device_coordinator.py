@@ -59,7 +59,7 @@ class DelayedReader:
         self.late_read: torch.Tensor | None = None
         self.done: torch.cuda.Event | None = None
 
-    def transfer(self, plan, pointers, replica_row, stream) -> None:
+    def transfer(self, plan, pointers, replica_row, stream, staging_offset=0) -> None:
         self.address = plan.data_ptr()
         with torch.cuda.stream(stream):
             torch.cuda._sleep(_DELAY_CYCLES)
@@ -117,6 +117,7 @@ def test_the_transfer_reads_the_planned_expert_and_not_what_replaced_it():
         transfer=reader,
         device=device,
         stream=torch.cuda.Stream(),
+        staging_stride=1 << 20,
     )
 
     predicted = hot_load(device)
@@ -196,9 +197,10 @@ def test_the_per_forward_path_never_waits_for_the_device():
         min_tokens_per_expert=1.0,
         pointers=[None] * NUM_LAYERS,
         maps=[layer_maps(device) for _ in range(NUM_LAYERS)],
-        transfer=type("Noop", (), {"transfer": lambda *_: None})(),
+        transfer=type("Noop", (), {"transfer": lambda *_, **__: None})(),
         device=device,
         stream=torch.cuda.Stream(),
+        staging_stride=1 << 20,
     )
     predicted = hot_load(device)
 
@@ -245,7 +247,9 @@ def test_each_layer_keeps_its_own_plan_while_several_are_in_flight():
     seen: list[tuple[int, list[int]]] = []
 
     class Recorder:
-        def transfer(self, plan, pointers, replica_row, stream) -> None:
+        def transfer(
+            self, plan, pointers, replica_row, stream, staging_offset=0
+        ) -> None:
             seen.append((plan.data_ptr(), plan.tolist()))
 
     coordinator = DevicePlacementCoordinator(
@@ -263,6 +267,7 @@ def test_each_layer_keeps_its_own_plan_while_several_are_in_flight():
         transfer=Recorder(),
         device=device,
         stream=torch.cuda.Stream(),
+        staging_stride=1 << 20,
     )
     coordinator.note_forward_token_load(1024.0)
     for source_layer in (0, 1):
@@ -305,9 +310,10 @@ def test_a_plan_left_over_from_a_previous_forward_is_an_invariant_violation():
         min_tokens_per_expert=1.0,
         pointers=[None] * NUM_LAYERS,
         maps=[layer_maps(device) for _ in range(NUM_LAYERS)],
-        transfer=type("Noop", (), {"transfer": lambda *_: None})(),
+        transfer=type("Noop", (), {"transfer": lambda *_, **__: None})(),
         device=device,
         stream=torch.cuda.Stream(),
+        staging_stride=1 << 20,
     )
     predicted = hot_load(device)
 
@@ -341,9 +347,10 @@ def test_a_target_refuses_a_plan_produced_in_another_forward():
         min_tokens_per_expert=1.0,
         pointers=[None] * NUM_LAYERS,
         maps=[layer_maps(device) for _ in range(NUM_LAYERS)],
-        transfer=type("Noop", (), {"transfer": lambda *_: None})(),
+        transfer=type("Noop", (), {"transfer": lambda *_, **__: None})(),
         device=device,
         stream=torch.cuda.Stream(),
+        staging_stride=1 << 20,
     )
     predicted = hot_load(device)
     coordinator.note_forward_token_load(1024.0)
@@ -373,9 +380,10 @@ def test_a_plan_produced_and_consumed_in_one_forward_is_accepted():
         min_tokens_per_expert=1.0,
         pointers=[None] * NUM_LAYERS,
         maps=[layer_maps(device) for _ in range(NUM_LAYERS)],
-        transfer=type("Noop", (), {"transfer": lambda *_: None})(),
+        transfer=type("Noop", (), {"transfer": lambda *_, **__: None})(),
         device=device,
         stream=torch.cuda.Stream(),
+        staging_stride=1 << 20,
     )
     predicted = hot_load(device)
 
@@ -424,7 +432,9 @@ def test_the_transfer_waits_for_the_compute_stream_before_reading_anything():
     seen: list[torch.Tensor] = []
 
     class ReadsTheMarker:
-        def transfer(self, plan, pointers, replica_row, transfer_stream) -> None:
+        def transfer(
+            self, plan, pointers, replica_row, transfer_stream, staging_offset=0
+        ) -> None:
             with torch.cuda.stream(transfer_stream):
                 seen.append(marker.clone())
 
@@ -443,6 +453,7 @@ def test_the_transfer_waits_for_the_compute_stream_before_reading_anything():
         transfer=ReadsTheMarker(),
         device=device,
         stream=stream,
+        staging_stride=1 << 20,
     )
     predicted = hot_load(device)
     # Warm every kernel this path uses, or the first use of each blocks the host long
@@ -465,4 +476,59 @@ def test_the_transfer_waits_for_the_compute_stream_before_reading_anything():
     assert seen and int(seen[0]) == 7, (
         f"the transfer read {int(seen[0]) if seen else 'nothing'} where the compute "
         f"stream had written 7, so it ran ahead of work already enqueued there"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_consecutive_layers_do_not_share_one_staging_buffer():
+    """A later layer's put must not land in the buffer an earlier drain still reads.
+
+    The sequence per layer is put, barrier, drain. `barrier_all` orders arrival, not the
+    rank's *next* put against the peer's local drain — after the barrier releases, one
+    rank can be issuing layer `L+1`'s put while the other still runs layer `L`'s
+    drain out of the same one-expert-wide workspace. At EP=2 the target is always the
+    other rank, so every consecutive placed pair is a candidate; the practical margin is
+    a whole layer of compute, which is why byte checks have never caught it.
+
+    Alternating by layer parity closes it, and two layers apart are ordered by the
+    barrier of the layer in between. Asserted on the offset the transfer is handed,
+    because the corruption it prevents is silent.
+    """
+    device = torch.device("cuda")
+    offsets: list[int] = []
+
+    class RecordsTheOffset:
+        def transfer(
+            self, plan, pointers, replica_row, stream, staging_offset=0
+        ) -> None:
+            offsets.append(staging_offset)
+
+    coordinator = DevicePlacementCoordinator(
+        ep_size=EP_SIZE,
+        ep_rank=0,
+        canonical_per_rank=PER_RANK,
+        replica_slots_per_rank=1,
+        num_layers=NUM_LAYERS,
+        lookahead=1,
+        budget=NUM_LAYERS,
+        min_tokens=MIN_TOKENS,
+        min_tokens_per_expert=1.0,
+        pointers=[None] * NUM_LAYERS,
+        maps=[layer_maps(device) for _ in range(NUM_LAYERS)],
+        transfer=RecordsTheOffset(),
+        device=device,
+        stream=torch.cuda.Stream(),
+        staging_stride=1 << 20,
+    )
+    predicted = hot_load(device)
+    coordinator.note_forward_token_load(1024.0)
+    for source_layer in range(NUM_LAYERS - 1):
+        coordinator.record_prediction(source_layer, predicted)
+        coordinator.plan_and_launch()
+        coordinator.activate_and_publish(source_layer + 1)
+    torch.accelerator.synchronize()
+
+    assert len(offsets) == NUM_LAYERS - 1
+    assert all(a != b for a, b in zip(offsets, offsets[1:])), (
+        f"consecutive layers were handed the same staging offset: {offsets}"
     )

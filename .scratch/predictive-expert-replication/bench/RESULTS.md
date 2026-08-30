@@ -2728,3 +2728,24 @@ because they are counts of work the host does regardless of ordering, but **the 
 the barrier's duration distribution should be re-measured before either is quoted again.**
 A smoke run on the fixed code is healthy: both workers arm, 88 layer-launches, 8 replicas
 placed, no crash.
+
+### The staging ordering hazard is closed, 2026-08-30
+
+The review's open finding — a later layer's put landing in the workspace an earlier layer's
+drain was still reading — is fixed by alternating two staging buffers by layer parity. Two
+layers apart share a buffer again and are ordered by the barrier of the layer between them,
+so two is enough. It costs one extra expert of symmetric memory, **9.00 MiB per rank**.
+
+`expert_bytes` deliberately still means *one* expert, because it is also the default cap on
+bytes in flight; the transport takes a separate `buffers` count. `staging_stride` has no
+usable default — zero would disable the alternation silently, and a silently shared
+workspace is precisely what this fixes — so it is rejected.
+
+Re-verified on hardware: `probe_device_transfer.py` 4/4 byte-identical at p50 40.6 us,
+`probe_plan_lifetime.py` 4/4, and a 2-rank server armed on both workers with 88
+layer-launches and 8 replicas placed.
+
+One thing the fix caught immediately, which is the invariant from ticket 07 doing its job:
+`probe_plan_lifetime.py` launches without ever publishing, so the second forward it opened
+raised "ended with a pending plan for layer(s) [2]". The probe checks the transport and has no
+routing maps, so it now drops the entry explicitly rather than leaving a real check disarmed.
