@@ -179,7 +179,7 @@ class PredictiveExpertReplicationConfig:
     """Path to the offline cost profile. Required when `enabled`."""
     replica_slots_per_rank: int = Field(default=1, ge=1)
     """Inactive replica slots reserved per EP rank. The PoC accepts 1."""
-    prediction_lookahead_layers: int = Field(default=2, ge=1)
+    prediction_lookahead_layers: int = Field(default=1, ge=1)
     """Distance in sparse MoE layers from the predicting layer to its target.
 
     A value of `n` means layer `i` predicts layer `i + n`, so `n - 1` layers run
@@ -190,6 +190,13 @@ class PredictiveExpertReplicationConfig:
     window for the expert-weight transfer. On an interconnect where one expert
     costs more than one layer's Attention, a lookahead above 1 is required for
     the transfer to be hidden at all.
+
+    **Default 1 since ticket 07 moved the launch to the predicting layer's MoE tail.**
+    One Attention block is 37.5 us at 512 tokens per rank and more at prefill chunk
+    sizes, against a 33.0 us one-sided put, so a single block hides the transfer here.
+    2 existed only to buy the *host* planner a layer of compute for its snapshot copy to
+    land in, and it costs prediction accuracy to do it. With `device_issued_transfer`
+    off the launch cannot move, so 1 leaves no window at all and is rejected.
     """
     prediction_skip_first_layers: int = Field(default=3, ge=0)
     """Leading sparse MoE layers that predict nothing.
@@ -299,6 +306,18 @@ class PredictiveExpertReplicationConfig:
                 f"max_replicas_per_layer must leave a rank for the canonical "
                 f"owner; with 8 EP ranks the maximum is 7, got "
                 f"{self.max_replicas_per_layer}."
+            )
+        if self.device_issued_transfer and self.max_replicas_per_layer != 1:
+            # `plan_one_layer_on_device` is the argmax at a cap of 1 and returns one
+            # placement whatever this says, so a higher value would be accepted and
+            # ignored while the host path honours it. Rejected rather than silently
+            # mishandled — `max_transfers_per_forward`'s own documentation tells the
+            # operator to raise the two together.
+            raise ValueError(
+                f"Predictive expert replication's device-issued transfer implements "
+                f"max_replicas_per_layer=1 only, got {self.max_replicas_per_layer}. "
+                f"Set device_issued_transfer=False to use the host path, which honours "
+                f"the cap and pays a host synchronisation per predicted layer."
             )
         for field_name, only_supported in (
             ("replica_slots_per_rank", 1),

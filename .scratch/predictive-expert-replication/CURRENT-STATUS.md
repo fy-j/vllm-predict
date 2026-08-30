@@ -31,6 +31,118 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 - **The cost is host synchronisation, not the transfers.** See the section below
   before touching anything.
 
+## Code review, 2026-08-30 evening: three fixed, four open
+
+A review of the branch's unpushed work found seven issues. Three were fixed on the spot and
+have tests; four are recorded here because they are real and not yet done.
+
+**Fixed. The compute-to-predictive stream barrier was vacuous.** `barrier.record()` sat
+*inside* `with torch.cuda.stream(self.stream)`, so it recorded on the predictive stream and
+`self.stream.wait_event(barrier)` waited on its own work. Two things needed that ordering: the
+plan row is written on the compute stream and read by the kernels on the predictive one, so
+the put could read it before the write landed — the same "`pe` is not a rank" segfault
+arriving through *visibility* rather than through lifetime, which the plan-buffer fix did not
+address; and `drain_expert` overwrites a replica row the previous forward's MoE may still be
+reading. **This project has shipped this exact mistake once before**, on the snapshot copy,
+where it made ranks plan from partly-filled buffers and deadlocked the engine with no error.
+Now recorded on the compute stream explicitly, and pinned by a test that writes a value on the
+compute stream behind a 100 ms delay and asserts the transfer reads it: before the fix it read
+0 where 7 had been written.
+
+**Fixed. The NVSHMEM fallback landed on the configuration the validator forbids.** With
+`prediction_lookahead_layers=1` and `device_issued_transfer=True` — both defaults now — a
+worker that finds no NVSHMEM fell back to the host coordinator, whose launch is a layer later
+and whose wait is the next statement: zero window plus a host synchronisation, reached with
+only a warning. It now raises, naming the three ways out.
+
+**Fixed. `max_replicas_per_layer > 1` was accepted and ignored on the device path.**
+`plan_one_layer_on_device` returns one placement whatever the cap says, while the host path
+honours it, so a device run compared against a host run would differ for a reason nothing
+logged. Rejected in configuration validation instead.
+
+**Open, and a correctness hazard: nothing orders one layer's put against the previous
+layer's drain on the shared staging buffer.** The sequence per layer is put, barrier, drain.
+After the barrier releases, rank X proceeds toward layer `L+1`'s put while rank Y is still
+running layer `L`'s drain, and the symmetric staging buffer is one expert wide and shared by
+every layer. `barrier_all` orders arrival, not X's *next* put against Y's local drain. At EP=2
+the target is always the other rank, so every consecutive placed pair is a candidate. The
+practical margin is large — a whole layer of compute plus about 1 ms of host work separates
+the barrier from the next put, against a 1.1 us drain — which is why 112/112 byte checks and
+384 greedy tokens have not caught it. Not ordered is still not safe. The fix is double-buffered
+staging, two experts wide, alternating by layer parity; a second barrier after the drain would
+also work and costs another collective per layer, which the cost measurements above argue
+against. `replica_transfer.py`'s docstring already promises this ordering and its
+`_last_drain` is recorded but never used.
+
+**Open: neither NVSHMEM object is ever closed.** `OneSidedExpertTransfer.close()` and
+`DeviceExpertTransfer.close()` both document that skipping them segfaults at interpreter exit
+— "after the work has finished and every result has been printed, which looks like a transfer
+bug and is not one" — and nothing in `vllm/` calls either. `EplbState` has no shutdown hook.
+Now that the device path is the default, every worker that builds it leaks the symmetric heap
+and the registered kernel library into shutdown. Also: if `DeviceExpertTransfer` construction
+raises, `_one_sided` is already initialised and stays that way while the run falls back.
+
+**Open: `static_replica_placement` and the device residency table disagree.** The startup
+layout writes the static expert into every layer's replica slot, but `LayerResidency` starts
+at `(-1, -1)`, so the first placement on that `(layer, rank)` computes no revert and leaves
+the static expert's logical map pointing at a row now holding another expert. Debug knob only
+— but its entire purpose is validating routing.
+
+**Open by choice: a leftover pending plan raises on the *next* forward.** The check lives in
+`note_forward_token_load`, so a forward that never reaches its target layer is reported one
+forward later, against a healthy forward. Ticket 07 asks for an invariant violation rather
+than a fallback, so it stays a `RuntimeError`; the message names the forward and the layers,
+which is what makes it readable. Worth revisiting if it ever fires in a way that hides a
+different cause.
+
+## Ticket 07, 2026-08-30 evening: the window moved, and the cost centre is now named
+
+The launch is at the predicting layer's MoE **tail**, so the overlap window is the target
+layer's Attention; `prediction_lookahead_layers` defaults to **1** and reachable layers went
+43 -> 44. Which site launches is the coordinator's decision, because the host planner
+synchronises inside `plan_and_launch` and cannot move — it keeps the old site and still
+rejects a lookahead of 1, where it genuinely has no window.
+
+**At four repeats the stock baseline is finally usable** — 1.6% spread against 56% at two —
+and it says:
+
+| arm | median mean TTFT | vs stock |
+| --- | --- | --- |
+| stock | 257.8 ms | — |
+| prediction only | 264.6 ms | **+2.6%** |
+| placing, device transfer | 340.3 ms | **+32.0%** |
+
+Prediction is nearly free now (+7.6% at DP=8 before). Placement's +29% is the whole gap, and
+a profile says what it is:
+
+    put_expert     p50 1.2 us    total 1.42 ms      the transfer is free
+    drain_expert   p50 1.1 us    total 0.53 ms
+    barrier        p50 5.0 us    p90 1151 us    max 5898 us    total 57.23 ms
+
+`nvshmemx_barrier_all_on_stream` — the arrival mechanism — costs **29x the transfer it
+guards**, 4.40 ms per prefill window, and **87% of it overlaps no compute**. Ticket 05
+measured the same barrier at 13.9 us idle. It is not the barrier's own cost: a barrier cannot
+complete until the peer arrives, so it turns rank arrival skew into blocking time once per
+placed layer, 44 times a forward.
+
+**But the barrier is not the dominant cost, and the CPU side of the same traces says what is.**
+Per MoE layer, placement adds **53 kernel launches and 0.95 ms of host time** — `moe_forward`
+goes 1.25 ms to 2.20 ms of host time per layer, launches 30.1 to 83.4 — and about 48 of those
+53 are tiny elementwise and reduce kernels from `plan_one_layer_on_device`,
+`publish_plan_on_device` and the device-side residency and budget bookkeeping. Over 44 placed
+layers that is roughly **42 ms of host work per forward**, the right order for placement's
++76 ms. The engine is eager, so every one of them is a host dispatch: 2365 launches per prefill
+window against 826, and the placed window carries 35 ms of kernel time in 159 ms.
+
+**This is ticket 03's defect in a new place**, and the same fix applies: fuse the plan, the
+publish and the bookkeeping into one kernel. The plan is an argmax over 128 integers and the
+publish is a handful of scatter writes. Making the plan device-side removed 5.28 ms per layer
+of host *synchronisation* and put 0.95 ms per layer of host *dispatch* back — the right trade
+at DP=8 where the sync dominated, a bad one here.
+
+Pairwise arrival is still worth doing; it buys 4.40 ms per forward, not the 42. Neither is
+done.
+
 ## Ticket 06, 2026-08-30 afternoon: the crash is fixed and the device path runs end to end
 
 **The segfault was the plan's ownership, not the transport.** `plan_and_launch` built the

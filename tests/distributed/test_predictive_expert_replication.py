@@ -1666,23 +1666,37 @@ class TestPredictionIsSkippedWhenNoPlacementCanFollow:
         assert self._call(runner, context)
 
 
-def test_lookahead_of_one_is_rejected_until_the_launch_point_moves(tmp_path):
-    """A lookahead of 1 currently gives an overlap window of zero, not one Attention.
+def test_lookahead_of_one_is_the_default_now_that_the_launch_moved(tmp_path):
+    """Ticket 07: one is the shortest prediction distance and the most accurate one.
 
-    `plan_and_launch` and `activate_and_publish` are adjacent statements at the head of
-    the
-    MoE forward, so at lookahead 1 the transfer aimed at *this* layer is issued on one
-    line
-    and awaited on the next, with no compute in between. The value reads like the
-    obvious
-    choice — it is the shortest prediction distance and the most accurate — which is
-    exactly
-    why it has to fail loudly rather than quietly cost the full transfer. Ticket 07
-    lifts
-    this once the launch moves to the predicting layer's MoE tail.
+    It was rejected while the launch sat at the head of the following layer's MoE,
+    because there the launch and the wait are adjacent statements and the window is
+    zero. With the launch at the predicting layer's tail the window is the target
+    layer's Attention — 37.5 us at 512 tokens per rank against a 33.0 us put — which is
+    the shape the design asked for, and 2 only ever existed to buy the host planner a
+    layer of latency to hide its snapshot copy in.
+    """
+    config = _build(tmp_path)
+
+    predictive = config.parallel_config.predictive_expert_replication_config
+    assert predictive.prediction_lookahead_layers == 1
+
+
+def test_lookahead_of_one_is_still_rejected_on_the_host_issued_path(tmp_path):
+    """The host planner cannot move to the tail, so there it still has no window.
+
+    `PlacementCoordinator.plan_and_launch` synchronises on the snapshot copy, and at the
+    predicting layer's tail that stalls the very layer that issued the copy. So the host
+    path keeps launching at the following layer's MoE head, where a lookahead of 1 makes
+    the launch and the wait adjacent statements with no compute in between — the whole
+    transfer exposed, plus a host synchronisation. Rejected rather than quietly slow.
     """
     with pytest.raises(ValueError, match="overlap window is zero"):
-        _build(tmp_path, prediction_lookahead_layers=1)
+        _build(
+            tmp_path,
+            prediction_lookahead_layers=1,
+            device_issued_transfer=False,
+        )
 
 
 def test_lookahead_of_two_remains_accepted(tmp_path):
@@ -1691,6 +1705,104 @@ def test_lookahead_of_two_remains_accepted(tmp_path):
 
     predictive = config.parallel_config.predictive_expert_replication_config
     assert predictive.prediction_lookahead_layers == 2
+
+
+class TestTheLaunchSiteFollowsTheCoordinator:
+    """Where the transfer is launched is what sets the overlap window's length.
+
+    Ticket 07. At the predicting layer's MoE **tail** the window is the target layer's
+    Attention, which is the shape the design asked for. At the head of the *following*
+    layer's MoE — where it was — the window is that layer's whole MoE as well, one layer
+    wider than intended, and at lookahead 1 it collapses to nothing because the launch
+    and the wait become adjacent statements.
+
+    The two coordinators cannot share a site: the host one synchronises on the snapshot
+    copy inside `plan_and_launch`, so at the tail it stalls the layer that just issued
+    the copy. So the coordinator declares where it wants to be called and the runner
+    obeys, which is also why this is asserted through the runner's own methods rather
+    than by reading the forward body.
+    """
+
+    def _runner(self, tail: bool, layer: int = 3):
+        calls: list[tuple[str, object]] = []
+
+        def note(load):
+            calls.append(("note", load))
+
+        def launch():
+            calls.append(("launch", None))
+            return []
+
+        def publish(index):
+            calls.append(("publish", index))
+            return []
+
+        def record(index, predicted):
+            calls.append(("record", index))
+
+        coordinator = SimpleNamespace(
+            launch_at_predicting_layer_tail=tail,
+            note_forward_token_load=note,
+            plan_and_launch=launch,
+            activate_and_publish=publish,
+            record_prediction=record,
+        )
+        runner = SimpleNamespace(
+            placement_coordinator=coordinator,
+            moe_layer_index=layer,
+            _forward_tokens_per_expert=lambda: 1024.0,
+        )
+        return runner, calls
+
+    def _before_routing(self, runner):
+        from vllm.model_executor.layers.fused_moe.runner import moe_runner as mod
+
+        mod.MoERunner._placement_before_routing(runner)
+
+    def _after_snapshot(self, runner, snapshot=None):
+        from vllm.model_executor.layers.fused_moe.runner import moe_runner as mod
+
+        mod.MoERunner._placement_after_snapshot(
+            runner, snapshot if snapshot is not None else torch.ones(4)
+        )
+
+    def test_the_device_path_launches_after_recording_its_own_prediction(self):
+        runner, calls = self._runner(tail=True)
+
+        self._before_routing(runner)
+        self._after_snapshot(runner)
+
+        assert calls == [("publish", 3), ("record", 3), ("launch", None)], (
+            "the launch must follow this layer's own prediction, so the transfer runs "
+            "during the target layer's Attention"
+        )
+
+    def test_the_host_path_launches_before_this_layer_routes(self):
+        runner, calls = self._runner(tail=False)
+
+        self._before_routing(runner)
+        self._after_snapshot(runner)
+
+        assert calls == [("launch", None), ("publish", 3), ("record", 3)], (
+            "the host path must keep launching a layer later, because its planner "
+            "synchronises and would stall the predicting layer"
+        )
+
+    def test_the_target_layers_head_publishes_whatever_the_launch_site(self):
+        """Publishing is unconditional: an empty desired set is what reverts."""
+        for tail in (True, False):
+            runner, calls = self._runner(tail=tail)
+            self._before_routing(runner)
+            assert ("publish", 3) in calls
+
+    def test_the_forward_is_opened_at_its_first_moe_layer_only(self):
+        runner, calls = self._runner(tail=True, layer=0)
+        self._before_routing(runner)
+        assert ("note", 1024.0) in calls
+
+        runner, calls = self._runner(tail=True, layer=1)
+        self._before_routing(runner)
+        assert not any(name == "note" for name, _ in calls)
 
 
 class TestTheBlockSizeComesFromTheKernel:
@@ -1769,3 +1881,24 @@ class TestTheBlockSizeComesFromTheKernel:
             resolve_moe_block_size_m(broken, top_k=8, num_batched_tokens=4096)
             == _MOE_BLOCK_SIZE_M_FALLBACK
         )
+
+
+def test_the_device_path_rejects_a_per_layer_cap_it_does_not_implement(tmp_path):
+    """A knob the device planner ignores must not be silently accepted.
+
+    `plan_one_layer_on_device` is the argmax at a cap of 1 and returns one placement
+    whatever the cap says, while the host path honours it — so a run configured with 2
+    and compared against a host run would differ for a reason nothing logs.
+    """
+    with pytest.raises(ValueError, match="max_replicas_per_layer=1 only"):
+        _build(tmp_path, max_replicas_per_layer=2)
+
+    # And the host path still takes it, which is what makes the rejection specific.
+    config = _build(
+        tmp_path,
+        max_replicas_per_layer=2,
+        device_issued_transfer=False,
+        prediction_lookahead_layers=2,
+    )
+    predictive = config.parallel_config.predictive_expert_replication_config
+    assert predictive.max_replicas_per_layer == 2

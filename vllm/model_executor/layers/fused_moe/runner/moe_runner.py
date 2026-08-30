@@ -233,6 +233,14 @@ class _PlacementCoordinator(Protocol):
     as `object` it hid every call, including a rename of the publish entry point.
     """
 
+    launch_at_predicting_layer_tail: bool
+    """Where this coordinator wants its transfer launched.
+
+    True leaves the target layer's Attention as the overlap window, which is the shape
+    the design asks for. False launches a layer later — one whole MoE layer wider — and
+    is what a coordinator whose planner synchronises has to do.
+    """
+
     def note_forward_token_load(self, tokens_per_expert: float) -> None: ...
 
     def plan_and_launch(self) -> list: ...
@@ -957,27 +965,7 @@ class MoERunner(MoERunnerInterface):
             else:
                 router_logits, _ = self.gate(hidden_states)
 
-        # In-forward placement, before this layer routes anything. Two things happen
-        # here and the order matters: a plan recorded at the previous layer is launched
-        # now, so its async snapshot copy has had a layer of compute to land in; and any
-        # transfer aimed at *this* layer is waited for and activated, so this layer's
-        # routing sees the replica rather than the canonical copy alone.
-        if self.placement_coordinator is not None:
-            # Open the forward at its first MoE layer. Suppression cannot be derived
-            # from the snapshot: on a decode forward prediction is skipped below, so
-            # nothing is ever recorded, so the coordinator never reaches its own
-            # snapshot check and kept the previous prefill forward's answer — which
-            # made every decode and every dummy forward revert all 48 layers.
-            if self.moe_layer_index == 0:
-                per_expert = self._forward_tokens_per_expert()
-                if per_expert is not None:
-                    self.placement_coordinator.note_forward_token_load(per_expert)
-            self.placement_coordinator.plan_and_launch()
-            # Unconditional: an empty desired set is what reverts a replica the last
-            # forward left on this layer. Gating on a non-empty activation left stale
-            # replicas live on every layer that planned nothing this forward.
-            assert self.moe_layer_index is not None
-            self.placement_coordinator.activate_and_publish(self.moe_layer_index)
+        self._placement_before_routing()
 
         # Cross-layer prediction reads source-local hidden states before token
         # dispatch, so the counts carry source-rank provenance.
@@ -1008,22 +996,64 @@ class MoERunner(MoERunnerInterface):
             if predicted_counts is not None:
                 assert self.load_predictor is not None
                 self.predicted_load_snapshot = self.load_predictor.finish_snapshot()
-                # Record only; planning here would need a host sync inside the forward.
-                if (
-                    self.placement_coordinator is not None
-                    and self.predicted_load_snapshot is not None
-                ):
-                    # Asserted rather than skipped: a coordinator without an index is
-                    # a wiring error, and skipping would make it look like a forward
-                    # that simply had nothing to predict.
-                    assert self.moe_layer_index is not None
-                    self.placement_coordinator.record_prediction(
-                        self.moe_layer_index, self.predicted_load_snapshot
-                    )
+                self._placement_after_snapshot(self.predicted_load_snapshot)
             return self._maybe_combine(
                 shared_output,
                 hidden_states,
             )
+
+    def _placement_before_routing(self) -> None:
+        """Wait for this layer's replica and publish it, before anything routes.
+
+        The wait belongs here whatever the launch site: the replica has to be live
+        before this layer's routing reads the maps, and immediately after the previous
+        layer's Attention is the latest point at which that can happen.
+
+        A coordinator that launches a layer later is launched from here too, as the
+        statement before the wait. That is one whole MoE layer of extra window, and it
+        is not a choice: a planner that synchronises on its snapshot copy cannot be
+        called at the predicting layer's tail without stalling it.
+        """
+        coordinator = self.placement_coordinator
+        if coordinator is None:
+            return
+        # Open the forward at its first MoE layer. Suppression cannot be derived from
+        # the snapshot: on a decode forward prediction is skipped, so nothing is ever
+        # recorded, so the coordinator never reaches its own snapshot check and kept the
+        # previous prefill forward's answer — which made every decode and every dummy
+        # forward revert all 48 layers.
+        if self.moe_layer_index == 0:
+            per_expert = self._forward_tokens_per_expert()
+            if per_expert is not None:
+                coordinator.note_forward_token_load(per_expert)
+        if not coordinator.launch_at_predicting_layer_tail:
+            coordinator.plan_and_launch()
+        # Unconditional: an empty desired set is what reverts a replica the last forward
+        # left on this layer. Gating on a non-empty activation left stale replicas live
+        # on every layer that planned nothing this forward.
+        assert self.moe_layer_index is not None
+        coordinator.activate_and_publish(self.moe_layer_index)
+
+    def _placement_after_snapshot(self, snapshot: torch.Tensor) -> None:
+        """Record this layer's prediction, and launch its transfer if the plan can.
+
+        Ticket 07's whole change is the second half. With the plan, the transfer and the
+        publish all on the device, launching here leaves exactly the target layer's
+        Attention between the launch and the wait — 37.5 us per Attention block at 512
+        tokens per rank against a 33.0 us one-sided put, and more at prefill chunk
+        sizes. Launching at the following layer's MoE head instead adds that layer's
+        whole MoE to the window, which hides the transfer just as well and costs a
+        prediction distance of 2 to do it, where 1 is the accurate one.
+        """
+        coordinator = self.placement_coordinator
+        if coordinator is None or snapshot is None:
+            return
+        # Asserted rather than skipped: a coordinator without an index is a wiring
+        # error, and skipping would look like a forward that had nothing to predict.
+        assert self.moe_layer_index is not None
+        coordinator.record_prediction(self.moe_layer_index, snapshot)
+        if coordinator.launch_at_predicting_layer_tail:
+            coordinator.plan_and_launch()
 
     def bind_prediction_target(self, target: "MoERunner") -> None:
         """Bind the sparse MoE this layer predicts, `prediction_lookahead_layers` ahead.

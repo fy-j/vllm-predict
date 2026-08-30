@@ -2600,3 +2600,131 @@ being compared across invocations — which, given the 56% drift above, would ha
 machine states. And it now runs both the server and the bench client from `.venv/bin/python`:
 the `vllm` console script runs under system python, where the bench extra's pandas vanished
 with the pod restart, and where the working tree is off `sys.path` anyway.
+
+## Ticket 07, 2026-08-30: the window moved, and it exposed the real cost centre
+
+The launch is now at the predicting layer's MoE tail, so the overlap window is the target
+layer's Attention and `prediction_lookahead_layers` defaults to 1. Reachable layers went
+43 -> 44, because a lookahead of 1 leaves one fewer trailing layer unbound.
+
+### Four repeats finally give a usable baseline, and prediction is nearly free
+
+DP=2, Korean prompts, 120 requests at concurrency 16, `OUT_LEN=1`, three arms x 4 repeats
+interleaved. **The stock arm's spread fell to 1.6% at four repeats**, against 56% at two —
+so this is the first run on this node whose baseline can be compared against at all.
+
+| arm | mean TTFT per repeat | median | spread | p99 median | vs stock |
+| --- | --- | --- | --- | --- | --- |
+| `off`, stock | 257.1 / 258.4 / 257.3 / 261.2 ms | 257.8 ms | 1.6% | 435.2 ms | — |
+| `0`, prediction only | 248.9 / 261.9 / 268.4 / 267.2 ms | 264.6 ms | 7.4% | 395.1 ms | **+2.6%** |
+| `43:device`, placing | 342.4 / 343.9 / 338.2 / 303.7 ms | 340.3 ms | 11.8% | 432.4 ms | **+32.0%** |
+
+**Prediction with its infrastructure now costs +2.6% of mean TTFT**, against +7.6% measured
+at DP=8. Placement adds the other +29%, and the goal of parity with stock stands or falls on
+that number, not on prediction's.
+
+### The profile says the transfer is free and the *arrival barrier* is not
+
+Two torch profiles at DP=2, prediction-only against placing, restricted to the
+`execute_context` prefill windows. Per-kernel, inside those windows, on the placing arm:
+
+| kernel | calls | p50 | p90 | max | total | per prefill window |
+| --- | --- | --- | --- | --- | --- | --- |
+| `put_expert` | 176 | **1.2 us** | 37.3 us | 47.9 us | 1.42 ms | 0.11 ms |
+| `drain_expert` | 176 | **1.1 us** | 1.3 us | 28.1 us | 0.53 ms | 0.04 ms |
+| `barrier_on_stream_kernel_threadgroup` | 176 | 5.0 us | **1151.4 us** | **5898.2 us** | **57.23 ms** | **4.40 ms** |
+
+So the transfer this project spent four design rounds on costs **1.95 ms of the whole
+window** across both kernels, and `nvshmemx_barrier_all_on_stream` — the arrival mechanism —
+costs **29 times that**. Ticket 05 measured the same barrier at **13.9 us** in isolation;
+under load its p90 is 1.15 ms and its maximum 5.9 ms. That is not the barrier's own cost. It
+is **rank arrival skew, made blocking**: a barrier cannot complete until the peer reaches it,
+so every placed layer couples the ranks' timelines once, 44 times per forward.
+
+And it is not hidden by the window it was supposed to sit in. Of the barrier's 57.23 ms,
+**1.5% is concurrent with Attention and 11.0% with the expert GEMM** — 87% overlaps no
+compute at all, because the compute stream is waiting on the transfer event, which waits on
+the barrier, which waits on the other rank.
+
+The attributed prefill step grows accordingly, 48.6 ms to 150.9 ms on dp1, with NCCL per
+layer going 166 us to 1415 us while MoE per layer *falls* 368 us to 181 us. The placement is
+working and the coupling costs more than it returns.
+
+**The fix this points at is pairwise arrival.** Only the target rank needs to know its
+sender's put landed, and the plan is rank-identical, so each rank can compute whether it is
+that target on the device. NVSHMEM's put-with-signal plus a signal wait on the receiver
+replaces a global barrier per layer with a dependency between the one pair that has data to
+exchange. 4.40 ms per forward of exposed barrier against a ceiling near 5% of a step is the
+whole reason to do it, and it is the first cost centre this project has found that is both
+dominant and clearly removable.
+
+### Two traps, one of them mine and expensive
+
+**Do not edit the source while a measurement run is in flight.** Each arm starts a fresh
+server, so a syntax error introduced mid-run kills whichever arm starts next. A 12-arm run
+lost its `0` and `43:device` arms of repeat 1 that way and had to be thrown out and redone —
+40 minutes, and the log said only `never ready`.
+
+**And do not reflow prose with a script.** The line-length fixes above were attempted with a
+rewrapper that split an f-string across lines and then, on a second pass with stale line
+numbers, merged a `def` into a docstring. Both produced files that imported fine in the
+editor's view and failed at parse. The 88-column limit is worth hand-editing for.
+
+### Correction, same evening: the barrier is exposed but it is not the dominant cost
+
+The section above named the arrival barrier as the cost centre. That was premature — it is
+4.40 ms per forward and real, but the +29% is mostly something else, and the CPU side of the
+same two traces says what. Per-layer figures, which is the normalisation that matters here
+because the two arms' windows are not paired (13 against 9, and this project has drawn a
+wrong conclusion from unpaired windows before):
+
+| per MoE layer, rank0 | prediction only | placing | ratio |
+| --- | --- | --- | --- |
+| `vllm::moe_forward` **host** time | 1.25 ms | **2.20 ms** | 1.76x |
+| kernels launched | 30.1 | **83.4** | 2.77x |
+
+**Placement adds about 53 kernel launches per layer and 0.95 ms of host time per layer**,
+which over 44 placed layers is roughly **42 ms of extra host work per forward** — the right
+order for the +76 ms of mean TTFT that placement costs. And the launches are not the
+transfer:
+
+    vectorized_elementwise_kernel   +25.9 per layer
+    unrolled_elementwise_kernel      +8.2
+    elementwise_kernel               +5.3
+    indexSelectSmallIndex            +4.9
+    index_elementwise_kernel         +4.1
+    reduce_kernel                    +3.7
+    put_expert / drain_expert / barrier   0.41 each
+
+So about 48 of the 53 are tiny elementwise and reduce kernels: `plan_one_layer_on_device`,
+`publish_plan_on_device`, and the device-side residency and budget bookkeeping. The engine is
+eager, so each one is also a host-side dispatch, and 2365 launches per prefill window against
+826 is what leaves the GPU idle — the placed arm's window carries **35 ms of kernel time in a
+159 ms window**.
+
+**This is ticket 03's defect in a new place.** Prediction's twelve elementwise steps were
+fused into one Triton kernel for exactly this reason and it recovered 17% of prediction's
+cost. Making the plan device-side removed 5.28 ms per layer of host *synchronisation* and put
+about 0.95 ms per layer of host *dispatch* back — which was the right trade at DP=8, where the
+sync dominated, and is a bad one here. Fusing plan, publish and bookkeeping into one kernel is
+the same bounded piece of work: the plan is an argmax over 128 integers and the publish is a
+handful of scatter writes.
+
+Two consequences worth stating plainly. The pairwise-arrival change described above is still
+worth doing, but it buys 4.40 ms per forward, not the 42. And **the launch count is now the
+feature's dominant cost on both paths**, which is a claim about the mechanism rather than
+about this node's rank count — at DP=8 the same 53 launches per layer are still there,
+underneath a host synchronisation that was 5.5x larger.
+
+### One caveat on every number above
+
+The four-arm TTFT run and both profiles were measured **before** the stream-ordering fix the
+code review found — the compute-to-predictive barrier was recorded on the wrong stream, so the
+predictive stream never actually waited for the compute stream. The fix adds a real dependency
+that was not there while these numbers were taken, and it can move them either way: the
+transfer can no longer start ahead of the plan write, and the drain can no longer overtake the
+previous forward's MoE. The per-layer launch-count and host-time findings are unaffected,
+because they are counts of work the host does regardless of ordering, but **the TTFT table and
+the barrier's duration distribution should be re-measured before either is quoted again.**
+A smoke run on the fixed code is healthy: both workers arm, 88 layer-launches, 8 replicas
+placed, no crash.

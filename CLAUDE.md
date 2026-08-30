@@ -22,9 +22,9 @@ Ticket order is set by each ticket's `Blocked by` field, not by its filename num
 02 config and accounting         terminal          no blockers; removes the lookahead=1 trap
 03 fused Triton counting kernel  blocks 08         (needs 01)  DONE 2026-08-29
 04 device-side plan              blocks 05         (needs 01)
-05 transfer lands in the slot    blocks 06         (needs 04)
-06 no host sync on the path      blocks 07         (needs 05)  ← the one that decides it
-07 window = target's Attention   blocks 08         (needs 06)
+05 transfer lands in the slot    blocks 06         (needs 04)  DONE 2026-08-30
+06 no host sync on the path      blocks 07         (needs 05)  DONE 2026-08-30, 2 items need 8 GPUs
+07 window = target's Attention   blocks 08         (needs 06)  DONE 2026-08-30, profile + accuracy open
 08 three-arm verdict + stop gate blocks 10         (needs 03, 07)
 09 CUDA graph feasibility        terminal          no blockers; exploratory, off the mainline
 10 DeepSeek-V4-Flash             terminal          (needs 08)
@@ -33,6 +33,13 @@ Ticket order is set by each ticket's `Blocked by` field, not by its filename num
 Edges are listed rather than drawn: an ASCII diagram of this silently misaligned its
 edges into neighbouring labels once, and each ticket's `Blocked by` field is
 authoritative anyway.
+
+**`prediction_lookahead_layers` now defaults to 1, and the launch moved** (ticket 07,
+2026-08-30): the transfer is issued at the predicting layer's MoE **tail**, so the overlap
+window is the target layer's Attention and nothing more. Which site launches is the
+coordinator's choice, not the runner's — the host planner synchronises inside
+`plan_and_launch` and so keeps the old site, where a lookahead of 1 has no window at all and
+configuration validation still rejects it. Reachable layers went 43 -> 44.
 
 **This node has 2 H100s, not 8** (since the 2026-08-30 pod restart). `06` is implemented and
 runs end to end there — the segfault that had `device_issued_transfer` off was the plan tensor

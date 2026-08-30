@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
 """In-forward placement with the plan never leaving the device.
 
 Ticket 06. Same three phases and the same layer boundaries as `PlacementCoordinator`,
@@ -87,6 +84,14 @@ class DevicePlacementCoordinator:
         last_event: The most recently recorded transfer event, for tests.
     """
 
+    # Ticket 07. Nothing here waits on the host, so the launch can sit at the tail of
+    # the predicting layer's MoE, right after its snapshot completes — which leaves the
+    # target layer's Attention as the overlap window and nothing else. The host
+    # coordinator declares False for the opposite reason: its `plan_and_launch`
+    # synchronises on the snapshot copy, and at the tail that stalls the layer that
+    # issued it, which is why the launch used to be a whole layer later.
+    launch_at_predicting_layer_tail = True
+
     def __init__(
         self,
         ep_size: int,
@@ -161,10 +166,19 @@ class DevicePlacementCoordinator:
         self._forwards = 0
 
         self._recorded: tuple[int, torch.Tensor] | None = None
-        self._pending: dict[int, tuple[torch.Tensor, torch.cuda.Event]] = {}
+        # Keyed by target layer and stamped with the forward that produced it. The key
+        # means a layer can only be handed a plan aimed at it; the stamp is what says
+        # the
+        # plan is from *this* forward, which matters more now that ticket 07 leaves only
+        # one Attention block between producing a plan and consuming it. A stale plan
+        # names an expert chosen from another forward's load, so activating it sheds
+        # load
+        # onto a rank that may since have become the peak.
+        self._pending: dict[int, tuple[torch.Tensor, torch.cuda.Event, int]] = {}
         self._last_target = -1
         self._suppressed = False
         self._logged_layers: set[int] = set()
+        self._forward_id = 0
 
     def note_forward_token_load(self, tokens_per_expert: float) -> None:
         """Decide once per forward whether placement runs at all.
@@ -178,7 +192,23 @@ class DevicePlacementCoordinator:
         Taken **before** anything is recorded, and from a value every rank agrees on.
         Deriving it from a snapshot instead is what previously made every decode and
         every dummy forward publish an empty set on all 48 layers, reverting everything.
+
+        Raises:
+            RuntimeError: If the previous forward left a plan unconsumed. Every plan is
+                produced and consumed within one forward by construction, so a leftover
+                means a layer that should have waited for its transfer never ran — an
+                invariant violation rather than something to recover from.
         """
+        if self._pending:
+            leftover = sorted(self._pending)
+            self._pending.clear()
+            raise RuntimeError(
+                f"predictive expert replication: forward {self._forward_id} ended with "
+                f"a pending plan for layer(s) {leftover}, which means the transfer was "
+                f"launched and its target layer never waited for it. Every plan is "
+                f"produced and consumed within one forward."
+            )
+        self._forward_id += 1
         self._suppressed = tokens_per_expert <= self.min_tokens_per_expert
         self._forwards += 1
         if self._forwards % _REPORT_EVERY == 0:
@@ -258,14 +288,19 @@ class DevicePlacementCoordinator:
             torch.stack([affordable.to(torch.int64), raw[1], raw[2], raw[3]])
         )
 
+        # Recorded on the compute stream **before** entering the predictive one, and
+        # explicitly, because `record()` takes the current stream and inside
+        # `torch.cuda.stream(self.stream)` that is the predictive stream — so the event
+        # landed there and `self.stream.wait_event(...)` waited on its own work. This
+        # project has shipped that mistake once already, on the snapshot copy, where it
+        # made ranks plan from partly-filled buffers and deadlocked the engine with no
+        # error. Two things need this ordering: the plan row above is written here and
+        # read by the kernels there, and `drain_expert` overwrites a replica row the
+        # previous forward's MoE may still be reading.
+        compute = torch.cuda.current_stream()
+        barrier = self._event_factory()
+        barrier.record(compute)
         with self._transfer_stream():
-            # The predictive stream is ordered behind everything the compute stream has
-            # enqueued, which is how the drain avoids overwriting a replica row the
-            # previous forward's MoE is still reading. Nothing in stream ordering
-            # connects the two otherwise, and a per-layer read event would be the same
-            # wait taken later.
-            barrier = self._event_factory()
-            barrier.record()
             if self.stream is not None:
                 self.stream.wait_event(barrier)
             if not _SKIP_TRANSFER:
@@ -278,7 +313,7 @@ class DevicePlacementCoordinator:
             event = self._event_factory()
             event.record(self.stream)
         self.last_event = event
-        self._pending[target] = (publish_plan, event)
+        self._pending[target] = (publish_plan, event, self._forward_id)
         if target not in self._logged_layers:
             self._logged_layers.add(target)
             logger.info(
@@ -305,7 +340,15 @@ class DevicePlacementCoordinator:
             # No prediction was ever recorded for this layer, so it has never held a
             # replica and there is nothing to revert.
             return []
-        plan, event = pending
+        plan, event, produced_in = pending
+        if produced_in != self._forward_id:
+            raise RuntimeError(
+                f"predictive expert replication: layer {layer} was handed a plan "
+                f"produced in another forward ({produced_in}, now "
+                f"{self._forward_id}). A plan names an expert chosen from one "
+                f"forward's load, so applying it in a later one sheds load onto a rank "
+                f"that may since have become the peak."
+            )
         # A stream wait, not a host one. Everything that consumes the weights is
         # enqueued on the current stream afterwards, so stream ordering is the whole
         # requirement.

@@ -524,23 +524,27 @@ class VllmConfig:
                 "Predictive expert replication requires a CUDA or ROCm platform."
             )
         predictive = parallel_config.predictive_expert_replication_config
-        if predictive.prediction_lookahead_layers == 1:
-            # The launch and the wait are adjacent statements at the head of the MoE
-            # forward, so at a lookahead of 1 the transfer is issued and immediately
-            # waited
-            # for: the overlap window is **zero**, not one Attention block, and the
-            # whole
-            # transfer is exposed plus a host synchronisation. The value that looks most
-            # attractive is currently the worst one, and nothing else rejects it. Lifted
-            # by
-            # ticket 07, which moves the launch to the predicting layer's MoE tail once
-            # the
-            # plan and the transfer are both device-side.
+        if (
+            predictive.prediction_lookahead_layers == 1
+            and not predictive.device_issued_transfer
+        ):
+            # Ticket 07 moved the launch to the predicting layer's MoE tail, which is
+            # what makes a lookahead of 1 mean "one Attention block of window" rather
+            # than none — but only for the device-issued path. The host planner
+            # synchronises on its snapshot copy inside `plan_and_launch`, so it cannot
+            # be called at the tail without stalling the layer that issued the copy, and
+            # it therefore still launches at the head of the *following* layer's MoE.
+            # There the launch and the wait are adjacent statements: the whole transfer
+            # is exposed, plus a host synchronisation. The value that looks most
+            # attractive is the worst one on that path, so it fails loudly rather than
+            # quietly.
             raise ValueError(
-                "Predictive expert replication does not yet support "
-                "prediction_lookahead_layers=1: the transfer is launched and awaited "
-                "at the same point in the forward, so the overlap window is zero and "
-                "the whole transfer is exposed. Use 2 until the launch point moves."
+                "Predictive expert replication does not support "
+                "prediction_lookahead_layers=1 with device_issued_transfer disabled: "
+                "the host-issued path launches the transfer at the head of the "
+                "following layer's MoE and waits for it on the next statement, so the "
+                "overlap window is zero and the whole transfer is exposed. Enable "
+                "device_issued_transfer, or use 2."
             )
 
         unsupported = []

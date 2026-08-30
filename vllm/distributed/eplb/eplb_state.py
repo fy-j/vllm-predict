@@ -952,6 +952,21 @@ class EplbState:
             if coordinator is not None:
                 self._attach(model, coordinator, float(block_size_m))
                 return
+        # The host path launches the transfer at the head of the *following* layer's MoE
+        # and waits for it on the next statement, so at a lookahead of 1 its overlap
+        # window is zero and the whole transfer is exposed on top of a host
+        # synchronisation. Configuration validation rejects that combination — but it
+        # cannot see this fallback, reached when the device path was asked for and
+        # NVSHMEM turned out to be missing. Failing here rather than warning: the
+        # alternative is a server running the one configuration the validator forbids.
+        if predictive.prediction_lookahead_layers == 1:
+            raise RuntimeError(
+                "Predictive expert replication fell back to the host-issued transfer "
+                "with prediction_lookahead_layers=1, where the launch and the wait are "
+                "adjacent statements and the overlap window is zero. Install NVSHMEM "
+                "to use the device-issued path, set prediction_lookahead_layers=2, or "
+                "disable the feature."
+            )
         coordinator = PlacementCoordinator(
             ep_size=ep_group.size(),
             ep_rank=ep_group.rank(),

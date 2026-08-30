@@ -38,9 +38,16 @@ SKIP_FIRST="${SKIP_FIRST:-3}"
 # placing, `43` places. The diff of `off` against `0` is what isolates prediction's own
 # cost, and the comment below explaining that was previously unreachable by default.
 BUDGETS="${BUDGETS:-off 0 43}"
+# Data-parallel size. 8 is where every recorded figure comes from; a smaller value runs and
+# is warned about at startup, because EP size sets the per-rank expert count.
+DP="${DP:-8}"
 
 export PYTHONPATH="$REPO_ROOT"
-RESOLVED=$(python3 -c 'import vllm,sys; sys.stdout.write(vllm.__file__)' 2>/dev/null || true)
+# The venv: `nvshmem.core` lives only there, and the device-issued transfer silently falls
+# back to the host path without it - which would profile the cost this feature removed.
+PY_BIN="${PY_BIN:-$REPO_ROOT/.venv/bin/python}"
+[[ -x "$PY_BIN" ]] || PY_BIN=python3
+RESOLVED=$("$PY_BIN" -c 'import vllm,sys; sys.stdout.write(vllm.__file__)' 2>/dev/null || true)
 case "$RESOLVED" in
   "$REPO_ROOT"/vllm/*) echo "[prof] vLLM from $RESOLVED" ;;
   *) echo "[prof] ABORT: vLLM resolves to '$RESOLVED', not this tree" >&2; exit 1 ;;
@@ -52,12 +59,16 @@ exec 9>"$LOCK"
 flock -w 10800 9 || { echo "[prof] lock not acquired" >&2; exit 3; }
 
 PROFILE="$OUT_DIR/cost-profile-local.json"
-python3 - "$HERE/results/cost-profile.json" "$PROFILE" "$MODEL" <<'PY'
-import json, sys
-src, dst, model = sys.argv[1:4]
-p = json.load(open(src)); p["fingerprint"]["model"] = model
+"$PY_BIN" - "$HERE/results/cost-profile.json" "$PROFILE" "$MODEL" "$DP" <<'PYEOF'
+import json, subprocess, sys
+src, dst, model, ep = sys.argv[1:5]
+p = json.load(open(src))
+device = subprocess.check_output(
+    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True
+).splitlines()[0].strip()
+p["fingerprint"].update(model=model, ep_size=int(ep), device_name=device)
 json.dump(p, open(dst, "w"), indent=2)
-PY
+PYEOF
 
 DOMAIN="${DOMAIN:-ko}"
 PROMPTS="$HERE/results/prompts-$DOMAIN-p1024.jsonl"
@@ -100,9 +111,9 @@ print(json.dumps({'profiler':'torch','torch_profiler_dir':sys.argv[1],
  'torch_profiler_with_flops':False,'ignore_frontend':True}))" "$TRACE_DIR")
 
   VLLM_PREDICTIVE_PLACE_PER_FORWARD="${budget/off/0}" \
-  python3 -m vllm.entrypoints.openai.api_server \
+  "$PY_BIN" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" --port "$PORT" \
-    --data-parallel-size 8 --enable-expert-parallel \
+    --data-parallel-size "$DP" --enable-expert-parallel \
     --all2all-backend allgather_reducescatter --enforce-eager \
     --max-model-len 3072 --gpu-memory-utilization 0.88 \
     --max-num-seqs 64 --seed 0 --uvicorn-log-level warning \
@@ -125,7 +136,7 @@ print(json.dumps({'profiler':'torch','torch_profiler_dir':sys.argv[1],
 
   # Warm up outside the profile: the first forwards JIT kernels and run a single-rank
   # step, which is not the steady state and would dominate a short trace.
-  vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
+  "$PY_BIN" -m vllm.entrypoints.cli.main bench serve --backend openai-chat --endpoint /v1/chat/completions \
     --model "$MODEL" --port "$PORT" \
     --dataset-name custom --dataset-path "$PROMPTS" \
     --custom-output-len "$OUT_LEN" --ignore-eos \
@@ -134,7 +145,7 @@ print(json.dumps({'profiler':'torch','torch_profiler_dir':sys.argv[1],
 
   curl -sf -X POST "http://127.0.0.1:$PORT/start_profile" >/dev/null \
     || echo "[prof] $tag: start_profile failed" >&2
-  vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
+  "$PY_BIN" -m vllm.entrypoints.cli.main bench serve --backend openai-chat --endpoint /v1/chat/completions \
     --model "$MODEL" --port "$PORT" \
     --dataset-name custom --dataset-path "$PROMPTS" \
     --custom-output-len "$OUT_LEN" --ignore-eos \

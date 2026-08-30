@@ -25,12 +25,31 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 import torch
 
-if TYPE_CHECKING:
-    from vllm.distributed.eplb.eplb_communicator import EplbCommunicator
+
+class TransferCommunicator(Protocol):
+    """The four methods `transfer_replicas` needs of an EPLB communicator.
+
+    Structural rather than nominal, because both callers pass something narrower than
+    `EplbCommunicator`: the coordinator declares its own protocol so a test can supply a
+    recorder without a process group, and typing this parameter as the abstract class
+    made that a type error while the code was correct.
+    """
+
+    def set_stream(self, cuda_stream: torch.cuda.Stream | None) -> None: ...
+
+    def add_send(
+        self, tensors: list[torch.Tensor], dst_rank: int, expert_id: int
+    ) -> None: ...
+
+    def add_recv(
+        self, tensors: list[torch.Tensor], src_rank: int, expert_id: int
+    ) -> None: ...
+
+    def execute(self) -> None: ...
 
 
 @dataclass(frozen=True, order=True)
@@ -331,7 +350,7 @@ def transfer_replicas(
     expert_buffer: Sequence[torch.Tensor],
     ep_rank: int,
     per_rank_experts: int,
-    communicator: EplbCommunicator,
+    communicator: TransferCommunicator,
     slot: int = 0,
 ) -> int:
     """Move each placement's weights into its target's inactive row, layer by layer.
@@ -359,7 +378,7 @@ def transfer_replicas(
             layers** — not indexed by layer.
         ep_rank: This rank's id in the EP group.
         per_rank_experts: Canonical rows per rank.
-        communicator: An `EplbCommunicator`.
+        communicator: Anything with the EPLB communicator's four transfer methods.
         slot: Which inactive row to receive into.
 
     Returns:

@@ -280,3 +280,189 @@ def test_each_layer_keeps_its_own_plan_while_several_are_in_flight():
         "overwrote a plan the first may not have read yet"
     )
     assert first_plan != second_plan
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_a_plan_left_over_from_a_previous_forward_is_an_invariant_violation():
+    """Every plan is produced and consumed inside one forward, so none may survive it.
+
+    Ticket 07 shortens the distance between the launch and the wait to a single
+    Attention block, which makes a plan that outlives its forward far more likely to be
+    read by the wrong layer than a fallback anyone would want. It is therefore a
+    violation and not a recovery: a stale plan names an expert chosen from another
+    forward's load, so activating it moves load onto a rank that may now be the peak.
+    """
+    device = torch.device("cuda")
+    coordinator = DevicePlacementCoordinator(
+        ep_size=EP_SIZE,
+        ep_rank=0,
+        canonical_per_rank=PER_RANK,
+        replica_slots_per_rank=1,
+        num_layers=NUM_LAYERS,
+        lookahead=1,
+        budget=NUM_LAYERS,
+        min_tokens=MIN_TOKENS,
+        min_tokens_per_expert=1.0,
+        pointers=[None] * NUM_LAYERS,
+        maps=[layer_maps(device) for _ in range(NUM_LAYERS)],
+        transfer=type("Noop", (), {"transfer": lambda *_: None})(),
+        device=device,
+        stream=torch.cuda.Stream(),
+    )
+    predicted = hot_load(device)
+
+    coordinator.note_forward_token_load(1024.0)
+    coordinator.record_prediction(0, predicted)
+    coordinator.plan_and_launch()
+    # The forward ends without layer 1 ever being visited, which is the sequence a
+    # binding error or an early exit produces.
+    with pytest.raises(RuntimeError, match="pending plan"):
+        coordinator.note_forward_token_load(1024.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_a_target_refuses_a_plan_produced_in_another_forward():
+    """A plan carries the forward it was produced in, and a mismatch raises.
+
+    The plans are keyed by target layer, so a layer can only ever be handed a plan aimed
+    at it — but not necessarily one from this forward. Forward identity is what closes
+    that, and it is checked on the host from a counter, so it costs no device read.
+    """
+    device = torch.device("cuda")
+    coordinator = DevicePlacementCoordinator(
+        ep_size=EP_SIZE,
+        ep_rank=0,
+        canonical_per_rank=PER_RANK,
+        replica_slots_per_rank=1,
+        num_layers=NUM_LAYERS,
+        lookahead=1,
+        budget=NUM_LAYERS,
+        min_tokens=MIN_TOKENS,
+        min_tokens_per_expert=1.0,
+        pointers=[None] * NUM_LAYERS,
+        maps=[layer_maps(device) for _ in range(NUM_LAYERS)],
+        transfer=type("Noop", (), {"transfer": lambda *_: None})(),
+        device=device,
+        stream=torch.cuda.Stream(),
+    )
+    predicted = hot_load(device)
+    coordinator.note_forward_token_load(1024.0)
+    coordinator.record_prediction(0, predicted)
+    coordinator.plan_and_launch()
+    # Forge the sequence the emptiness check would otherwise catch first: the plan stays
+    # pending while a new forward begins.
+    coordinator._forward_id += 1
+
+    with pytest.raises(RuntimeError, match="another forward"):
+        coordinator.activate_and_publish(1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_a_plan_produced_and_consumed_in_one_forward_is_accepted():
+    """The control for the two above: the real sequence must not raise."""
+    device = torch.device("cuda")
+    coordinator = DevicePlacementCoordinator(
+        ep_size=EP_SIZE,
+        ep_rank=0,
+        canonical_per_rank=PER_RANK,
+        replica_slots_per_rank=1,
+        num_layers=NUM_LAYERS,
+        lookahead=1,
+        budget=NUM_LAYERS,
+        min_tokens=MIN_TOKENS,
+        min_tokens_per_expert=1.0,
+        pointers=[None] * NUM_LAYERS,
+        maps=[layer_maps(device) for _ in range(NUM_LAYERS)],
+        transfer=type("Noop", (), {"transfer": lambda *_: None})(),
+        device=device,
+        stream=torch.cuda.Stream(),
+    )
+    predicted = hot_load(device)
+
+    for _ in range(3):
+        coordinator.note_forward_token_load(1024.0)
+        coordinator.record_prediction(0, predicted)
+        coordinator.plan_and_launch()
+        coordinator.activate_and_publish(1)
+    torch.accelerator.synchronize()
+
+
+def test_the_device_coordinator_asks_to_be_launched_at_the_predicting_layers_tail():
+    """The capability the runner dispatches on, stated by the class that has it.
+
+    Cheap to assert and worth pinning: if this flips, the window silently grows by a
+    whole MoE layer and every measurement still looks reasonable.
+    """
+    assert DevicePlacementCoordinator.launch_at_predicting_layer_tail is True
+
+    from vllm.distributed.eplb.predictive_coordinator import PlacementCoordinator
+
+    assert PlacementCoordinator.launch_at_predicting_layer_tail is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_the_transfer_waits_for_the_compute_stream_before_reading_anything():
+    """The transfer must not overtake the work the compute stream has already enqueued.
+
+    Two things depend on it. The plan buffer is written on the compute stream and read
+    by the kernels on the predictive one, so without ordering the put can read a row
+    before the write lands — the same "`pe` is not a rank" that segfaulted NVSHMEM's
+    proxy thread, arriving through visibility instead of through lifetime. And
+    `drain_expert` writes a replica row the previous forward's MoE may still be reading.
+
+    The bug this pins was a vacuous wait: `barrier.record()` inside
+    `with torch.cuda.stream(self.stream)` records on the **predictive** stream, since
+    that is the current one there, so `self.stream.wait_event(barrier)` waited on its
+    own event. This project has shipped that mistake once before, on the snapshot copy.
+
+    Tested by visibility rather than by reading the source: a value written on the
+    compute stream behind a long delay must be the value the transfer sees.
+    """
+    device = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    marker = torch.zeros((), dtype=torch.int64, device=device)
+    seen: list[torch.Tensor] = []
+
+    class ReadsTheMarker:
+        def transfer(self, plan, pointers, replica_row, transfer_stream) -> None:
+            with torch.cuda.stream(transfer_stream):
+                seen.append(marker.clone())
+
+    coordinator = DevicePlacementCoordinator(
+        ep_size=EP_SIZE,
+        ep_rank=0,
+        canonical_per_rank=PER_RANK,
+        replica_slots_per_rank=1,
+        num_layers=NUM_LAYERS,
+        lookahead=1,
+        budget=NUM_LAYERS,
+        min_tokens=MIN_TOKENS,
+        min_tokens_per_expert=1.0,
+        pointers=[None] * NUM_LAYERS,
+        maps=[layer_maps(device) for _ in range(NUM_LAYERS)],
+        transfer=ReadsTheMarker(),
+        device=device,
+        stream=stream,
+    )
+    predicted = hot_load(device)
+    # Warm every kernel this path uses, or the first use of each blocks the host long
+    # enough to drain the delay below and the test passes without ordering anything.
+    coordinator.note_forward_token_load(1024.0)
+    coordinator.record_prediction(0, predicted)
+    coordinator.plan_and_launch()
+    coordinator.activate_and_publish(1)
+    torch.accelerator.synchronize()
+    seen.clear()
+
+    torch.cuda._sleep(200_000_000)  # ~100 ms of compute-stream work in front
+    marker.fill_(7)
+    coordinator.note_forward_token_load(1024.0)
+    coordinator.record_prediction(0, predicted)
+    coordinator.plan_and_launch()
+    coordinator.activate_and_publish(1)
+    torch.accelerator.synchronize()
+
+    assert seen and int(seen[0]) == 7, (
+        f"the transfer read {int(seen[0]) if seen else 'nothing'} where the compute "
+        f"stream had written 7, so it ran ahead of work already enqueued there"
+    )

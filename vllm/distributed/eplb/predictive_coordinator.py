@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """In-forward placement coordination for Predictive expert replication.
 
 Planning from *predicted* load rather than measured load is what makes the transfer
@@ -86,6 +86,15 @@ class PlacementCoordinator:
         communicator: The EPLB communicator; exposed for tests to inspect.
         last_event: The most recently recorded transfer event, for tests.
     """
+
+    # False, and it cannot be otherwise: `plan_and_launch` synchronises on the snapshot
+    # copy, so calling it at the predicting layer's tail stalls the layer that just
+    # issued that copy. Launching a layer later is what buys the copy a layer of compute
+    # to land in, at the cost of an overlap window one whole MoE layer wider than the
+    # design wants — and at `lookahead = 1` of no window at all, which configuration
+    # validation rejects for this path. Ticket 07 moves the launch for the device path
+    # only, where nothing waits on the host.
+    launch_at_predicting_layer_tail = False
 
     def __init__(
         self,
