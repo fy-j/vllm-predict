@@ -124,24 +124,30 @@ group that falls back closes whatever it opened, so a symmetric heap does not su
 interpreter exit. Four unit tests drive the helper with an injected all-reduce, including the
 one that matters: a single dissenting rank takes everyone to the host path.
 
-**Open, most serious first.**
+**Also fixed: NVSHMEM is released at shutdown, and every forward opens the coordinator.**
 
-*Neither NVSHMEM object is ever closed on the success path*, unchanged from the previous
-review — the fallback path now closes what it opened, but a healthy run still reaches exit
-with the heap live: `close()` and
-`library_finalize` have no caller outside probes, and both docstrings say the symmetric heap
-surviving into interpreter exit segfaults every rank after the results have printed.
+`EplbState.close()` closes the registered kernels and then the transport, and
+`GPUModelRunner.shutdown` calls it before dropping the model. It is idempotent and never
+raises: shutdown paths get called twice, a double free there is a segfault, and an exception
+on the way out loses results already produced. Both `close` methods had said in their own
+docstrings that they were required rather than tidy — leaving the symmetric heap alive into
+interpreter exit segfaults every rank *after* every result has printed — and neither had a
+caller outside the probes while the device path became the default.
+
+And `note_forward_token_load` is now called on every forward's first MoE layer, `None`
+included. It used to be called only when the DP token count was available, while
+`_prediction_is_worth_it` returns True in exactly the case where it is not — so such a
+forward predicted and recorded, but suppression kept the previous forward's answer and the
+forward id did not advance, turning off both of ticket 07's invariants. `None` means unknown
+and does not suppress, which keeps the two gates in agreement; their disagreement is what
+made every decode forward revert all 48 layers.
+
+**Open, and both now the smaller half of the list.**
 
 *`resolve_moe_block_size_m` passes no `dtype` or `block_shape`*, so on a quantised MoE the
 resolved `BLOCK_SIZE_M` can be one the kernel never uses — and it logs "resolved" either
 way, which is the guess this function exists to remove. Harmless on BF16 Qwen, which is the
 approved scope, and a trap for DSV4's FP8 in ticket 10.
-
-*A forward with no DP metadata never opens the coordinator.* `note_forward_token_load` is
-called only when `_forward_tokens_per_expert()` returns a value, while
-`_prediction_is_worth_it()` returns True in exactly that case — so such a forward predicts
-and records but leaves `_suppressed` at the previous forward's value and does not advance
-`_forward_id`, disabling both invariants ticket 07 added.
 
 *`replica_transfer.py`'s single staging buffer has the ordering hazard the device path fixed*
 with parity-alternated buffers, and `WeightPointers.build` does not bound-check

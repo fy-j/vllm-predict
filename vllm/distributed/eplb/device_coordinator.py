@@ -204,7 +204,7 @@ class DevicePlacementCoordinator:
         self._logged_layers: set[int] = set()
         self._forward_id = 0
 
-    def note_forward_token_load(self, tokens_per_expert: float) -> None:
+    def note_forward_token_load(self, tokens_per_expert: float | None) -> None:
         """Decide once per forward whether placement runs at all.
 
         Below one `BLOCK_SIZE_M` per expert the MoE kernel pads every expert to the same
@@ -233,7 +233,14 @@ class DevicePlacementCoordinator:
                 f"produced and consumed within one forward."
             )
         self._forward_id += 1
-        self._suppressed = tokens_per_expert <= self.min_tokens_per_expert
+        # `None` means the DP token count was unavailable, which happens on the
+        # diagnostic paths and is exactly where `_prediction_is_worth_it` returns True.
+        # So this must not suppress: the two gates have to agree, and disagreement is
+        # what made every decode forward revert all 48 layers.
+        self._suppressed = (
+            tokens_per_expert is not None
+            and tokens_per_expert <= self.min_tokens_per_expert
+        )
         self._forwards += 1
         if _REPORT_EVERY and self._forwards % _REPORT_EVERY == 0:
             logger.info(

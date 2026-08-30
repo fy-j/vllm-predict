@@ -241,7 +241,7 @@ class _PlacementCoordinator(Protocol):
     is what a coordinator whose planner synchronises has to do.
     """
 
-    def note_forward_token_load(self, tokens_per_expert: float) -> None: ...
+    def note_forward_token_load(self, tokens_per_expert: float | None) -> None: ...
 
     def plan_and_launch(self) -> list: ...
 
@@ -1023,9 +1023,15 @@ class MoERunner(MoERunnerInterface):
         # previous prefill forward's answer — which made every decode and every dummy
         # forward revert all 48 layers.
         if self.moe_layer_index == 0:
-            per_expert = self._forward_tokens_per_expert()
-            if per_expert is not None:
-                coordinator.note_forward_token_load(per_expert)
+            # Unconditionally, `None` included. A forward that never opens the
+            # coordinator leaves suppression at the previous forward's answer and does
+            # not advance its forward id, turning off both ticket 07 invariants — and it
+            # happens
+            # exactly when there is no DP metadata, which is the case where
+            # `_prediction_is_worth_it` returns True. The two gates have to agree: that
+            # agreement is what made the old `_gated` flag unreachable, and disagreement
+            # is what made every decode forward revert all 48 layers.
+            coordinator.note_forward_token_load(self._forward_tokens_per_expert())
         if not coordinator.launch_at_predicting_layer_tail:
             coordinator.plan_and_launch()
         # Unconditional: an empty desired set is what reverts a replica the last forward

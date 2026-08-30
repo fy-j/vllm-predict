@@ -155,7 +155,7 @@ class PlacementCoordinator:
             )
         return self._host_buffer[:size]
 
-    def note_forward_token_load(self, tokens_per_expert: float) -> None:
+    def note_forward_token_load(self, tokens_per_expert: float | None) -> None:
         """Open a forward and decide whether it may change placement at all.
 
         Call once per forward, before its first `plan_and_launch`, with a token count
@@ -179,7 +179,14 @@ class PlacementCoordinator:
                 expert to the same block count, so no placement can save time.
         """
         self._spent = 0
-        self._suppressed = tokens_per_expert <= self.min_tokens_per_expert
+        # `None` means the DP token count was unavailable, which happens on the
+        # diagnostic paths and is exactly where `_prediction_is_worth_it` returns True.
+        # So this must not suppress: the two gates have to agree, and disagreement is
+        # what made every decode forward revert all 48 layers.
+        self._suppressed = (
+            tokens_per_expert is not None
+            and tokens_per_expert <= self.min_tokens_per_expert
+        )
 
     def record_prediction(self, source_layer: int, predicted: torch.Tensor) -> None:
         """Start copying a source layer's predicted load to the host. No planning.
@@ -340,7 +347,7 @@ class PlacementCoordinator:
             barrier = self._event_factory()
             barrier.record(compute)
         with self._transfer_stream():
-            if compute is not None:
+            if compute is not None and self.stream is not None:
                 self.stream.wait_event(barrier)
             transfer_replicas(
                 to_transfer,

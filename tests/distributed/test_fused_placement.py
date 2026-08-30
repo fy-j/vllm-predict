@@ -349,8 +349,9 @@ def test_an_empty_snapshot_places_nothing_rather_than_failing_to_compile():
     """`plan_replicas` returns no placement for this, so the fused path must not crash.
 
     A dummy or padding-only forward is the case, and it is the one the retained planner
-    names in its own docstring. With no experts `per_rank` is 0 and the kernel would fail
-    to compile on `tl.arange(0, 0)` — a crash where the tensor version places nothing.
+    names in its own docstring. With no experts `per_rank` is 0 and the kernel would
+    fail to compile on `tl.arange(0, 0)` — a crash where the tensor version places
+    nothing.
     """
     device = torch.device("cuda")
     transfer = torch.full((4,), 7, dtype=torch.int64, device=device)
@@ -371,10 +372,10 @@ def test_an_empty_snapshot_places_nothing_rather_than_failing_to_compile():
 
 
 def test_a_strided_snapshot_is_refused_rather_than_read_wrong():
-    """The kernel indexes the load directly, so a non-contiguous view would read garbage.
+    """The kernel indexes the load directly, so a strided view would read garbage.
 
     The tensor planner it replaces handles any stride, and every equality test above
-    builds contiguous tensors — so this is exactly the difference a test would not catch.
+    builds contiguous tensors — exactly the difference a test would not catch.
     """
     device = torch.device("cuda")
     strided = torch.zeros((NUM_LOGICAL, 2), dtype=torch.int32, device=device)[:, 0]

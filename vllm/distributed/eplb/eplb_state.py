@@ -883,6 +883,14 @@ class EplbState:
 
     # Quoted, and imported only for type checking: `nvshmem_transfer` imports NVSHMEM at
     # module scope, and this module has to load on a host without it.
+    _device_coordinators: list = []
+    """Device coordinators built by this state, so `close` can release their kernels.
+
+    A list rather than one, because a worker serves one model today and the state is
+    keyed by model — and a class-level default that is mutated would be shared by every
+    instance, so `close` assigns rather than appending in place.
+    """
+
     _one_sided: "OneSidedExpertTransfer | None" = None
     """The worker's NVSHMEM transport, initialised once and shared by every layer.
 
@@ -1202,7 +1210,7 @@ class EplbState:
             len(pointers),
             ep_group.size(),
         )
-        return DevicePlacementCoordinator(
+        coordinator = DevicePlacementCoordinator(
             ep_size=ep_group.size(),
             ep_rank=ep_group.rank(),
             canonical_per_rank=canonical_per_rank,
@@ -1219,6 +1227,52 @@ class EplbState:
             stream=self._placement_stream(),
             staging_stride=staging_stride,
         )
+        # Remembered so `close` can release the kernels this rank registered. Assigned
+        # rather than appended to, because the declaration's default is class-level and
+        # mutating it would share one list across every instance.
+        self._device_coordinators = [
+            *getattr(self, "_device_coordinators", []),
+            coordinator,
+        ]
+        return coordinator
+
+    def close(self) -> None:
+        """Release NVSHMEM, if this worker ever brought it up.
+
+        Both `OneSidedExpertTransfer.close` and `DeviceExpertTransfer.close` say in
+        their own docstrings that they are required rather than tidy: the symmetric heap
+        surviving into interpreter exit segfaults every rank *after* the work has
+        finished and every result has printed, which looks like a transfer bug and is
+        not one, and `library_init` needs its `library_finalize`. Neither had a caller
+        outside the probes, and the device path is the default now.
+
+        Idempotent, and it never raises. Shutdown paths get called more than once, a
+        double free here is a segfault, and an exception on the way out loses results
+        that have already been produced.
+        """
+        for coordinator in getattr(self, "_device_coordinators", []):
+            transfer = getattr(coordinator, "transfer", None)
+            if transfer is None:
+                continue
+            try:
+                transfer.close()
+            except Exception:
+                logger.exception(
+                    "Predictive expert replication: releasing the device-issued "
+                    "transfer's kernels failed; continuing shutdown."
+                )
+        self._device_coordinators = []
+        transport = getattr(self, "_one_sided", None)
+        if transport is None:
+            return
+        self._one_sided = None
+        try:
+            transport.close()
+        except Exception:
+            logger.exception(
+                "Predictive expert replication: shutting NVSHMEM down failed; "
+                "continuing shutdown. Expect a segfault at interpreter exit."
+            )
 
     def _symmetric_staging(
         self, ep_group, expert_bytes: int, buffers: int = 1

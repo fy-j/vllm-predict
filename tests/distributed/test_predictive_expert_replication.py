@@ -1953,3 +1953,136 @@ class TestTheDevicePathIsAgreedAcrossRanks:
         forward, so the one synchronisation is free."""
         got = self._agree(True, peers=[1])
         assert got is True and isinstance(got, bool)
+
+
+class TestTheNvshmemHeapIsReleasedAtShutdown:
+    """The symmetric heap must not survive into interpreter exit.
+
+    `OneSidedExpertTransfer.close`'s own docstring says why: leaving it alive segfaults
+    every rank *after* the work has finished and every result has been printed, which
+    looks like a transfer bug and is not one. `DeviceExpertTransfer.close` is likewise
+    paired with `library_init`. Neither had a caller outside the probes, and the device
+    path is the default now, so every worker that built it reached exit with the heap
+    live.
+    """
+
+    def _state(self, transport=None, coordinator=None):
+        from vllm.distributed.eplb.eplb_state import EplbState
+
+        state = EplbState.__new__(EplbState)
+        state._one_sided = transport
+        state._device_coordinators = [coordinator] if coordinator is not None else []
+        return state
+
+    def _closer(self):
+        calls = []
+
+        class Closer:
+            def close(self_inner):
+                calls.append("closed")
+
+        return Closer(), calls
+
+    def test_it_closes_the_transport_and_the_registered_kernels(self):
+        transport, transport_calls = self._closer()
+        transfer, transfer_calls = self._closer()
+        coordinator = SimpleNamespace(transfer=transfer)
+
+        self._state(transport, coordinator).close()
+
+        assert transport_calls == ["closed"]
+        assert transfer_calls == ["closed"], (
+            "the kernel library is paired with a finalize"
+        )
+
+    def test_closing_twice_is_harmless(self):
+        """Shutdown paths get called twice, and a double free here is a segfault."""
+        transport, calls = self._closer()
+        state = self._state(transport)
+
+        state.close()
+        state.close()
+
+        assert calls == ["closed"], "the second close must not reach the transport"
+
+    def test_a_failure_while_closing_does_not_take_the_process_down(self):
+        """This runs on the way out, where raising loses results already produced."""
+
+        class Angry:
+            def close(self):
+                raise RuntimeError("nvshmem said no")
+
+        state = self._state(Angry())
+        state.close()  # must not raise
+
+    def test_a_state_that_never_built_the_device_path_closes_cleanly(self):
+        self._state().close()
+
+
+class TestAForwardWithoutDpMetadataStillOpensTheForward:
+    """A forward the coordinator never opens disables the invariants ticket 07 added.
+
+    `note_forward_token_load` used to be called only when the DP token count was
+    available, while `_prediction_is_worth_it` returns True in exactly the case where it
+    is not — so such a forward predicts and records, but `_suppressed` keeps the
+    previous forward's answer and `_forward_id` does not advance, which turns off both
+    the stale-plan check and the leftover-plan check. The two gates have to agree: that
+    agreement is what made the old `_gated` flag unreachable, and disagreement is what
+    made every decode forward revert all 48 layers.
+    """
+
+    def _runner(self, tokens_across_dp, layer=0):
+        opened = []
+        coordinator = SimpleNamespace(
+            launch_at_predicting_layer_tail=True,
+            note_forward_token_load=lambda load: opened.append(load),
+            plan_and_launch=lambda: [],
+            activate_and_publish=lambda index: [],
+            record_prediction=lambda index, predicted: None,
+        )
+        mod = importlib.import_module(
+            "vllm.model_executor.layers.fused_moe.runner.moe_runner"
+        )
+        runner = SimpleNamespace(
+            placement_coordinator=coordinator,
+            moe_layer_index=layer,
+            prediction_min_tokens_per_expert=128.0,
+            moe_config=SimpleNamespace(experts_per_token=8, num_logical_experts=128),
+        )
+        runner._forward_tokens_per_expert = lambda: (
+            mod.MoERunner._forward_tokens_per_expert(runner)
+        )
+        dp = (
+            None
+            if tokens_across_dp is None
+            else SimpleNamespace(
+                num_tokens_across_dp_cpu=torch.tensor(tokens_across_dp)
+            )
+        )
+        return runner, SimpleNamespace(dp_metadata=dp), opened
+
+    def _open(self, runner, context):
+        from vllm.model_executor.layers.fused_moe.runner import moe_runner as mod
+
+        original = mod.get_forward_context
+        mod.get_forward_context = lambda: context
+        try:
+            mod.MoERunner._placement_before_routing(runner)
+        finally:
+            mod.get_forward_context = original
+
+    def test_a_forward_with_a_token_count_opens_with_it(self):
+        runner, context, opened = self._runner([4096] * 2)
+        self._open(runner, context)
+        assert opened == [4096 * 2 * 8 / 128]
+
+    def test_a_forward_without_dp_metadata_still_opens_it(self):
+        """With None, meaning "unknown": the coordinator must not be left closed."""
+        runner, context, opened = self._runner(None)
+        self._open(runner, context)
+        assert opened == [None]
+
+    def test_only_the_first_moe_layer_opens_the_forward(self):
+        runner, context, opened = self._runner(None, layer=1)
+        self._open(runner, context)
+        assert opened == []

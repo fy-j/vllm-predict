@@ -6696,6 +6696,11 @@ class GPUModelRunner(
             CUDAGraphWrapper.clear_all_graphs()
             BreakableCUDAGraphWrapper.clear_all_graphs()
             self.encoder_cudagraph_manager = None
+        if self.eplb_state is not None:
+            # Before the model goes: NVSHMEM's symmetric heap must not survive into
+            # interpreter exit, which segfaults every rank after the results have
+            # printed. A no-op unless predictive expert replication brought it up.
+            self.eplb_state.close()
         self.compilation_config.static_forward_context.clear()
         self.model = None  # type: ignore[assignment]
         _ROPE_DICT.clear()
