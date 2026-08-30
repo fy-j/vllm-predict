@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm import envs
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -271,6 +272,9 @@ class CrossLayerLoadPredictor:
         self._local_counts: torch.Tensor | None = None
         self._snapshot_flat: torch.Tensor | None = None
         self._work: torch.distributed.Work | None = None
+        # Only the cost probe uses this; see `start_snapshot`.
+        self._probe_counts: torch.Tensor | None = None
+        self._ep_size_for_probe: int | None = None
 
     def predict_local_counts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Count predicted target-layer tokens per logical expert on this rank.
@@ -336,6 +340,15 @@ class CrossLayerLoadPredictor:
         Call this only after the current layer's token dispatch, so the small collective
         overlaps this layer's local expert GEMM.
         """
+        if envs.VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER:
+            # Cost probe: hold prediction's compute fixed and remove only the
+            # collective, so the +13.5% splits in two. Measured, this AllGather is a
+            # barrier — the last rank to arrive sees 9.4 us and the other seven see 130
+            # to 748 us — so no single rank's kernel time prices it. The snapshot below
+            # is this rank's own counts and is **not** rank-identical, which is why
+            # `reject_snapshot_probe_with_placement` refuses to let placement run.
+            self._probe_counts = local_counts
+            return
         group = get_eplb_group().device_group
         # The gather buffer stays flat: ProcessGroupGloo rejects a pre-shaped `[ep_size,
         # num_logical_experts]` output that NCCL would accept, and the tests exercise
@@ -354,12 +367,32 @@ class CrossLayerLoadPredictor:
             A `[ep_size, num_logical_experts]` count matrix, identical on every
             EP rank, or None when no AllGather is in flight.
         """
+        if envs.VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER:
+            counts = self._probe_counts
+            self._probe_counts = None
+            if counts is None:
+                return None
+            # The planner's shape, filled with this rank's own row. Every downstream
+            # kernel then runs exactly as it does with a real snapshot, which is what
+            # keeps the probe a measurement of the collective alone.
+            return counts.unsqueeze(0).expand(self._probe_ep_size(), -1)
         if self._work is None:
             return None
         self._work.wait()
         self._work = None
         assert self._snapshot_flat is not None
         return self._snapshot_flat.view(-1, self.num_logical_experts)
+
+    def _probe_ep_size(self) -> int:
+        """EP size for the probe's fake snapshot, read once and remembered.
+
+        Taken from the group rather than passed in, so the probe cannot disagree with
+        the real path about how many rows a snapshot has. Cached because it exists to
+        remove per-layer work, not to add a lookup to it.
+        """
+        if self._ep_size_for_probe is None:
+            self._ep_size_for_probe = get_eplb_group().device_group.size()
+        return self._ep_size_for_probe
 
     def _counts_buffer(self, device: torch.device) -> torch.Tensor:
         if self._local_counts is None or self._local_counts.device != device:

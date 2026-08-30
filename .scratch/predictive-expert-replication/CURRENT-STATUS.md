@@ -34,6 +34,63 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 - **The cost is host synchronisation, not the transfers.** See the section below
   before touching anything.
 
+## Ticket 11, 2026-08-30 night: prediction's cost is half barriers and half launches
+
+Read this with the `06` section below; `11` is new and it is the mainline. `06` established
+that placement is *negative cost* and prediction is the entire overhead, and this splits that
+overhead in two by measurement rather than by argument.
+
+`VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER` keeps prediction's compute — gate GEMM, top-k,
+counting kernel — and removes only the 44 per-layer snapshot collectives. Knee, three
+interleaved passes, and the control reproduced the earlier run to within 0.2 points:
+
+| arm | median mean TTFT | vs stock |
+| --- | --- | --- |
+| stock | 169.68 ms | — |
+| prediction, AllGather kept | 192.89 ms | **+13.68%** |
+| prediction, AllGather removed | **181.85 ms** | **+7.17%** |
+
+    prediction adds                        +23.21 ms
+    removing the 44 AllGathers gives back  -11.04 ms   = 47.6%
+    what is left                           +12.17 ms   = launches and compute
+
+**A profile confirms it directly rather than by inference**, which matters because inference
+from one rank is how the previous answer went wrong. Collectives per prefill window go
+**236 -> 192** with the token collectives untouched at 192, and the window goes
+**106.9 -> 97.2 ms** against stock's 88.9. So the window decomposes as stock, plus **8.3 ms**
+of prediction launch and compute at unchanged collective count, plus **9.7 ms** for 44
+barriers — **0.22 ms per barrier** for a 512-byte payload. The window split (54% barriers) and
+the TTFT split (47.6%) agree.
+
+**And it disproves the hypothesis this section was written around.** "The window's length
+tracks the number of collectives, 0.463 against 0.453 ms each, payload-independent" is wrong:
+at the same 192 collectives stock is 88.9 ms and the probe is 97.2 ms. Barriers are one
+additive term of three, not the whole model.
+
+**Lookahead 4 is measured, and the accuracy cost of batching is small.** On `ko` at DP=8,
+replaying predicted-chosen placements against actual load in the prefill regime:
+
+| lookahead | recall@1 | peak-rank recall@1 | count error | **excess removed** | oracle | made worse |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0.9015 | 0.9621 | 0.0581 | **34.9%** | 36.4% | 0 |
+| 2 | 0.8682 | 0.9457 | 0.0856 | **34.4%** | 37.0% | 0 |
+| 3 | 0.8730 | 0.9524 | 0.1089 | **33.5%** | 37.7% | 0 |
+| 4 | 0.8862 | 0.9512 | 0.1333 | **32.1%** | 37.6% | 0 |
+
+Ticket 10's pattern reproduces on a second domain and extends to 4: `count_error` more than
+doubles while the delivered benefit falls **2.8 points**, because peak-rank recall@1 holds at
+~0.95 at every distance and the planner only ever picks from there. Three full-prefill forwards
+per lookahead, so the excess column is a small sample with a monotone trend.
+
+**What this makes worth building, and what it does not reach.** A K=4 grouping — one source
+layer evaluating K target gates on its own hidden states, the K gate GEMMs concatenated into
+one, one collective per group — costs about 1.2 points of excess (0.14 points of TTFT) and buys
+about 9 points. Roughly 70 to 1. But it lands prediction near +4.8% against a ceiling of 5.26%
+and placement's return of ~4%, which is **break-even, not positive**. The launch half is 52%
+of the cost and neither batching nor a device-side reduction touches it — **ticket `09`, CUDA
+graph capture, is now the largest single lever in the project**, held back by the spec's
+eager-execution mandate rather than by any evidence.
+
 ## Ticket 06 closed on 8 GPUs, 2026-08-30 night: placement is no longer the cost
 
 **This node has 8 H100s again** — 8x H100 80GB HBM3, NV18 between all pairs — after a spell
@@ -666,12 +723,23 @@ is correctly built and the arithmetic does not close.
 
 **Two refinements, both from measurement after the verdict was written.**
 
-*The batched cross-layer snapshot is not the escape*, and it was the one I named. The 43
+*~~The batched cross-layer snapshot is not the escape~~, and it was the one I named.* The 43
 prediction AllGathers were traced on this node: own stream, **9.3 us p50, 0.40 ms per
 forward, 4% of the expert-GEMM window they hide in, and a 5% spread between p50 and max**.
 The 5090's two-thousand-fold spread on the same 4 KiB payload — the arrival skew that made
 43 barriers look expensive — does not exist here. Collapsing them to one saves 0.40 ms
-against a 7.6% cost. Closed.
+against a 7.6% cost. ~~Closed.~~
+
+**WITHDRAWN 2026-08-30 night. This paragraph is wrong, and the way it is wrong is the
+lesson.** It reads one rank's trace — `dp0`, 8 windows — and prices a *barrier* by the
+kernel time of a single participant. Re-traced over all 8 ranks and 93 prefill windows, the
+same collective's p50 by rank is **748, 628, 595, 545, 131, 588, 9.4, 425 us**. The 9.4 us
+rank is `dp6`, and `dp6` is the one that arrives **last**: it never waits, so it is the only
+rank that cannot see the cost. Aggregate residency is **18.24 ms per prefill window**, of
+which **1.6%** overlaps real compute — the overlap `start_snapshot`'s docstring intends does
+not happen — and 90.4% is co-resident with the token collectives. The "no arrival skew here"
+conclusion came from the same single-rank view; the skew is exactly what the other seven
+ranks are measuring. Batching is back in scope. See the AllGather section near the top.
 
 *The cost is prediction's compute, and `+7.6%` is an upper bound rather than prediction
 alone.* Arm `0` also enables EPLB actual-load recording and carries the 17-row layout, so

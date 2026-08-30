@@ -131,6 +131,36 @@ def agree_across_ranks(
     return bool(int(flag.item()))
 
 
+def reject_snapshot_probe_with_placement() -> None:
+    """Refuse the snapshot cost probe when placement is armed.
+
+    `VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER` replaces the Global predicted-load
+    snapshot with each rank's own counts, so the ranks no longer derive the same plan.
+    Every rank still launches the transfer kernels and the arrival barrier, so a
+    divergent plan pairs a put with a peer expecting nothing, or writes a replica row
+    whose weights are another expert's while the maps say otherwise. Both are silent.
+
+    A warning is not enough here: the probe's whole purpose is to be run beside the real
+    arms in the same driver, which is exactly the situation where the wrong environment
+    reaches the wrong arm.
+
+    Raises:
+        RuntimeError: If the probe and placement are both armed.
+    """
+    if (
+        envs.VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER
+        and envs.VLLM_PREDICTIVE_PLACE_PER_FORWARD
+    ):
+        raise RuntimeError(
+            "VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER is a cost probe: it feeds the "
+            "planner this rank's own predicted counts instead of the allgathered "
+            "snapshot, so ranks no longer agree on a plan. It cannot be combined with "
+            "VLLM_PREDICTIVE_PLACE_PER_FORWARD="
+            f"{envs.VLLM_PREDICTIVE_PLACE_PER_FORWARD}, which would transfer and "
+            "publish from divergent plans. Run it on the prediction-only arm."
+        )
+
+
 def resolve_moe_block_size_m(
     model: MixtureOfExperts,
     top_k: int,
@@ -775,6 +805,7 @@ class EplbState:
         self.update_mapping(model_config, layout)
         self.publish_source_local_maps(model_config)
         self.verify_replica_weight_equality(model_config)
+        reject_snapshot_probe_with_placement()
         if envs.VLLM_PREDICTIVE_PLACE_PER_FORWARD:
             self.attach_placement_coordinator(model_config)
         elapsed_ms = (time.perf_counter() - start_time) * 1000

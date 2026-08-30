@@ -961,7 +961,7 @@ recorded. At the default budget of 4 it is 0.5% and 1.3%.
 Global allocation still beats a uniform per-layer allowance, but by less than
 reported: 13% relatively at one per layer, 9% at two,
 5% at three (critical path 1.245 against
-1.2258 at two). The earlier 15% to 19% came from the mis-scaled
+1.2258 at two). The earlier 15% to 19% came from the wrongly scaled
 data.
 
 ## 2026-08-25 — borrowing from UltraEP: what transferred and what did not
@@ -2750,7 +2750,6 @@ One thing the fix caught immediately, which is the invariant from ticket 07 doin
 raised "ended with a pending plan for layer(s) [2]". The probe checks the transport and has no
 routing maps, so it now drops the entry explicitly rather than leaving a real check disarmed.
 
-
 ## The fused placement kernels, 2026-08-30: +32.0% becomes about +3%
 
 Two Triton kernels replace the 132 launches a placed layer used to cost — 46 to plan, 19 to
@@ -2862,7 +2861,6 @@ cost figures are now stale and have to be re-run: placement's +22.1% was measure
 kernels per placed layer and a host synchronisation, and prediction's own +7.6% predates
 nothing but is a rank-count effect — the same prediction arm measures **-0.2%** at DP=2,
 because the arrival skew that amplifies launches barely exists between two ranks.
-
 
 ## Ticket 07's last criterion, 2026-08-30: lookahead 1 predicts better, on every metric
 
@@ -3143,3 +3141,97 @@ its enabling half, not its acting half.
 The step from "roughly two prefill windows per TTFT" is an inference from the 88.9 ms window
 against the 167.53 ms mean TTFT, not a measurement, and it is the one soft link in the chain
 above. The excess figures and the TTFT figures either side of it are direct.
+
+## Ticket 11: prediction's cost split by measurement — half barriers, half launches
+
+`spec.md` had ruled batching the per-layer snapshot AllGathers out of scope on "9.3 us each,
+0.40 ms per forward, no arrival skew here to remove". **That is withdrawn.** The figure was
+`dp0`'s kernel time in an 8-window trace, and pricing a *barrier* from one participant's kernel
+time is the error. Per rank, the same collective in the knee profile:
+
+    dp0 748.4   dp1 628.2   dp2 595.2   dp3 545.5
+    dp4 130.7   dp5 588.1   dp6   9.4   dp7 424.5     us, p50
+
+**`dp6` is the rank that arrives last**, so it never waits, and 9.4 us is what the old
+measurement saw. Aggregate residency is 18.24 ms per prefill window, of which **1.6% overlaps
+real compute** — `start_snapshot`'s docstring intends the local expert GEMM to hide it, and a
+545 us barrier cannot hide in a ~190 us GEMM — 90.4% is co-resident with the token collectives
+and 9.6% overlaps nothing. `glossary.md` now separates **Collective residency** from **Barrier
+coupling cost** so this cannot be conflated again.
+
+### The isolating experiment
+
+`VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER` keeps the gate GEMM, the top-k and the counting
+kernel and removes only the collective. It refuses to run with placement armed: its snapshot is
+each rank's own counts, so a plan from it is per-rank, and a per-rank plan pairs a put with a
+peer expecting nothing. Knee, `ko`, 512 requests, CONC=16, three interleaved passes per arm.
+
+| arm | r1 | r2 | r3 | median | vs stock |
+| --- | --- | --- | --- | --- | --- |
+| stock | 168.53 | 170.99 | 169.68 | 169.68 ms | — |
+| prediction, AllGather kept | 192.89 | 190.02 | 199.82 | 192.89 ms | **+13.68%** |
+| prediction, AllGather removed | 181.85 | 180.54 | 184.55 | 181.85 ms | **+7.17%** |
+
+The control reproduced the run an hour earlier to within 0.2 points (+13.68% against +13.53%),
+so the ruler is trustworthy across runs and not only within one.
+
+    prediction adds                        +23.21 ms
+    removing the 44 AllGathers gives back  -11.04 ms   = 47.6% of it
+    what is left                           +12.17 ms   = +7.17%
+
+### The profile that confirms it, and disproves my own hypothesis
+
+Per prefill window, median over 8 ranks:
+
+| arm | collectives | of which snapshot AllGather | window |
+| --- | --- | --- | --- |
+| prediction, kept | 236 | 44 | 106.9 ms |
+| prediction, removed | **192** | **0** | **97.2 ms** |
+| stock | 192 | 0 | 88.9 ms |
+
+Exactly the 44 removed, the 192 token collectives untouched. So the window is stock **plus
+8.3 ms of prediction launch and compute at unchanged collective count, plus 9.7 ms for 44
+barriers = 0.22 ms each** for a 512-byte payload. The window split (54% barriers) and the TTFT
+split (47.6%) agree from two independent measurements.
+
+**"The window tracks the number of collectives, 0.463 against 0.453 ms each,
+payload-independent" is disproved by this**: at the same 192 collectives stock is 88.9 ms and
+the probe is 97.2 ms. That hypothesis came from dividing a whole window by its collective
+count, which charges the barriers for waiting the window already contained. Barriers are one
+additive term of three.
+
+### Lookahead 1 to 4 on `ko`, and why the pooled metrics mislead
+
+Every batching scheme raises the prediction distance, and 4 had never been measured. Scored by
+replaying predicted-chosen placements against actual load in the prefill regime:
+
+| L | recall@1 | peak-rank recall@1 | peak hit | count error | **excess removed** | oracle | worse |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0.9015 | 0.9621 | 0.9242 | 0.0581 | **34.9%** | 36.4% | 0 |
+| 2 | 0.8682 | 0.9457 | 0.8992 | 0.0856 | **34.4%** | 37.0% | 0 |
+| 3 | 0.8730 | 0.9524 | 0.8889 | 0.1089 | **33.5%** | 37.7% | 0 |
+| 4 | 0.8862 | 0.9512 | 0.7561 | 0.1333 | **32.1%** | 37.6% | 0 |
+
+`count_error` more than doubles and the **delivered benefit falls 2.8 points**. Ticket 10's
+finding reproduces on a second domain and extends to 4, and the reason is in the third column:
+peak-rank recall@1 holds at ~0.95 at every distance, and the planner only ever picks from the
+peak rank's own hot experts. Pooled metrics are dominated by cold experts nobody replicates.
+
+Two limits. The excess column rests on **3 full-prefill forwards per lookahead**, the same
+order as ticket 10's 4, with a monotone trend and a baseline stable at 1.859 to 1.873. And
+`accuracy_report.py` reports pooled recall@1 of 0.697 / 0.643 / 0.572 / 0.522 for the same runs
+— a *different restriction*, not a contradiction: pooling includes forwards below the prefill
+bar, where no placement happens. Leading layers below tolerance: L=1 `[4]`, L=2 none, L=3
+`[6, 7]`, L=4 `[7]`.
+
+### The trade, and what it does not reach
+
+    cost of K=4 grouping   ~1.2 points of the 34.9% excess removed, so ~0.14 points of
+                           the ~4% mean TTFT that placement returns
+    benefit                prediction +13.68% -> ~+4.8%, so ~9 points
+    ratio                  roughly 70 to 1
+
+But +4.8% against a 5.26% ceiling and a ~4% return is **break-even, not positive**. The launch
+half is 52% of the cost and no batching or device-side reduction touches it, which makes
+**ticket 09 (CUDA graph capture) the largest single lever left**. It is held back by the spec's
+eager-execution mandate, not by evidence.

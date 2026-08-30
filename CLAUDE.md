@@ -25,10 +25,32 @@ Ticket order is set by each ticket's `Blocked by` field, not by its filename num
 05 transfer lands in the slot    blocks 06         (needs 04)  DONE 2026-08-30
 06 no host sync on the path      blocks 07         (needs 05)  DONE 2026-08-30, 17/17 at DP=8
 07 window = target's Attention   blocks 08         (needs 06)  DONE 2026-08-30
-08 three-arm verdict + stop gate blocks 10         (needs 03, 07)  ← unblocked, and it decides
-09 CUDA graph feasibility        terminal          no blockers; exploratory, off the mainline
+08 three-arm verdict + stop gate blocks 10         (needs 03, 07, 09, 13, 17)  ← BLOCKED, do not write it
+09 CUDA graph feasibility        blocks 08         no blockers; ← the largest single lever
 10 DeepSeek-V4-Flash             terminal          (needs 08)
+11 prediction's collectives      blocks 12,13,14   ANSWERED 2026-08-30; diagnosis only
+12 group of targets per source   blocks 13         no blockers; inert at K=1 by construction
+13 K=4 and what it buys          blocks 08, 14     (needs 12)
+14 snapshot reduction off NCCL   terminal          (needs 13); drop it if 13 leaves nothing
+15 spent budget must not revert  terminal          no blockers; bites the default config
+16 block bar dtype + teardown    terminal          no blockers; two review findings
+17 spec says what was measured   blocks 08         no blockers; docs only
 ```
+
+**`11` is answered and it re-shaped the rest.** `06` showed placement is *negative cost* and
+prediction is the whole overhead; `11` then split prediction's +13.68% by measurement:
+**11.04 ms of 23.21 is its 44 per-layer barriers, 12.17 ms is its launches and compute.** So:
+
+- `12` and `13` attack the barrier half (one source layer predicts K targets, one collective per
+  group). Worth about 9 points of TTFT for about 0.14, but it lands at break-even, not positive.
+- `09` is the **only** ticket that attacks the launch half, which is the larger one at 52%. That
+  is why it moved from "exploratory, off the mainline" to blocking the verdict.
+- `08` is **blocked**. Writing the verdict now would measure a cost `13` and `09` are removing,
+  and its stop gate as worded fires on the sum while placement is returning 70-80% of the
+  ceiling — see the amendment in the ticket.
+- `15` is a real defect at the **default** `max_transfers_per_forward=4`: a spent budget reverts
+  still-valid resident replicas, collapsing coverage from 44 layers to 4 on a traffic shift. It
+  did not affect any recorded measurement, all of which ran at budget 43.
 
 Edges are listed rather than drawn: an ASCII diagram of this silently misaligned its
 edges into neighbouring labels once, and each ticket's `Blocked by` field is
@@ -93,6 +115,38 @@ desynchronisation signature at 8 ranks, which 2 ranks have too little arrival sk
 `08` owns the verdict and it is now unambiguously about prediction's 44 gate GEMMs and 44
 AllGathers per forward, not about placement.
 
+**The snapshot AllGather: the recorded reason for closing the batching question was wrong,
+and the correction matters more than the number.** Traced at DP=8 over 8 ranks and 93
+prefill windows:
+
+- Its p50 is **545 us**, not 9.3 us, and its aggregate residency is **18.24 ms per prefill
+  window**. The recorded 9.3 us was **dp6's** kernel time, and dp6 is the rank that arrives
+  **last** — the one rank that never waits. The other seven see 130 to 748 us. A barrier's
+  cost is never its own duration on the pace-setting rank.
+- **1.6%** of that residency overlaps real compute, though `start_snapshot`'s docstring
+  intends it to hide behind the local expert GEMM. **90.4%** is co-resident with the token
+  collectives and 9.6% overlaps nothing.
+- Prediction adds **no** net compute: per-rank compute-only occupancy is uniform in both arms
+  and the absolute compute time is unchanged (25.8 -> 23.5 ms). The window grows 18 ms and
+  **all of it is waiting.**
+- **Isolated by measurement, and the answer is half and half.**
+  `VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER` keeps prediction's compute and removes only the
+  collective. Three arms, three passes: stock 169.68 ms, prediction 192.89 ms (+13.68%),
+  prediction without the AllGather **181.85 ms (+7.17%)**. So of the 23.21 ms prediction adds,
+  **11.04 ms is the 44 barriers (47.6%) and 12.17 ms is its launches and compute.** A profile
+  confirms the mechanism directly — collectives per window 236 -> 192 with the token
+  collectives untouched, window 106.9 -> 97.2 against stock's 88.9, so 0.22 ms per barrier
+  plus 8.3 ms of launch overhead at unchanged collective count. **My "0.46 ms per collective,
+  payload-independent" hypothesis is disproved by the same profile**: at the same 192
+  collectives, stock is 88.9 ms and the probe 97.2 ms.
+- **Accuracy is not the obstacle it looks like, and lookahead 4 is now measured.** On `ko` at
+  DP=8, replaying predicted placements against actual load: excess removed **34.9 / 34.4 /
+  33.5 / 32.1%** at lookahead 1 / 2 / 3 / 4, with 0 forwards made worse at any distance,
+  while `count_error` more than doubles (0.058 -> 0.133). Peak-rank recall@1 stays ~0.95
+  throughout, which is why the delivered benefit barely moves: the planner only picks from
+  there. So **lookahead 4 costs 2.8 points of 34.9**, and K=4 grouping trades about 0.14
+  points of TTFT for about 9 — roughly 70 to 1.
+
 **`06` is the ticket the arithmetic turns on, not `03`.** Measured on 2026-08-29: of the
 per-source-layer cost, 2.21 ms scales with launch count and 5.28 ms does not, and the
 fixed part is essentially the host synchronisation. `03` cut launches 59% and recovered
@@ -138,8 +192,11 @@ perfect-balance ceiling of
 feature costs **+31.5%**. Ticket 13's device-side transfer removes the host sync and most
 of placement's share, but not prediction's 43 gate matmuls and 43 AllGathers per forward,
 so the ceiling stays under the floor on the fastest interconnect NVIDIA ships — and the
-conclusion transfers to the Ascend port. Batching those AllGathers is **not** the escape:
-traced here they are 9.3 us each, 0.40 ms per forward, 4% of the window they hide in. The
+conclusion transfers to the Ascend port. ~~Batching those AllGathers is **not** the escape:
+traced here they are 9.3 us each, 0.40 ms per forward, 4% of the window they hide in.~~
+**That is withdrawn — see the AllGather section below. The 9.3 us was one rank's kernel
+time, and it was the rank that arrives last, so it is the one rank that cannot see the
+cost.** The
 cost is prediction's ~645 kernel launches per forward, and +7.6% is an upper bound because
 arm `0` also records expert load. The mechanics are sound and improved this
 session (coverage 22 -> all 43 layers, recovered excess 15-17% -> 24.0%); the arithmetic

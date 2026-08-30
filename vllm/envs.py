@@ -301,6 +301,7 @@ if TYPE_CHECKING:
     VLLM_PREDICTIVE_ACCURACY_DUMP_PATH: str | None = None
     VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS: bool = False
     VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS: bool = False
+    VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER: bool = False
     VLLM_PREDICTIVE_PLACE_PER_FORWARD: int = 0
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -2074,6 +2075,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is this branch's most expensive class of bug.
     "VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS": lambda: bool(
         int(os.getenv("VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS", "0"))
+    ),
+    # Cost probe, not a serving option: keep prediction's compute and remove only its
+    # per-layer snapshot AllGather, so the two halves of prediction's cost can be told
+    # apart. The snapshot it substitutes is this rank's own counts, so ranks no longer
+    # agree on a plan; arming placement with it is rejected rather than warned about,
+    # because a per-rank plan pairs a send with no receive.
+    "VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER": lambda: bool(
+        int(os.getenv("VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER", "0"))
     ),
     # Bring-up arm for in-forward placement; 0 is off. The transfer budget itself
     # comes from `max_transfers_per_forward`, per the spec — this only decides whether

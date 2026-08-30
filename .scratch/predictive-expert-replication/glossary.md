@@ -119,6 +119,12 @@ _Avoid_: online calibration, runtime load history
 
 ### Evaluation
 
+**Collective residency**：某个 rank 待在一个集合通信 kernel 里的时长。它主要测的是**这个 rank 比最后到达者早了多少**，所以最后到达的那个 rank 上它接近 0。**绝不能用单个 rank 的这个量给一次集合通信定价**——2026-08-30 实测同一个 prediction snapshot AllGather 在 8 个 rank 上的 p50 是 748/628/595/545/131/588/**9.4**/425 us，那个 9.4 us 的 rank 正是最后到达者。项目曾据此（`dp0` 单 rank）判定"这个 AllGather 只要 9.3 us、没有到达偏斜"，并关掉了批量化这条路，见 `CURRENT-STATUS.md` 2026-08-30 的撤回。
+_Avoid_: 拿它当 collective 的成本；拿单 rank 的它当全组的它
+
+**Barrier coupling cost**：多引入一个集合通信所带来的、**不出现在任何 kernel 时长里**的代价——每多一个 barrier，全组就多一次"等 N 个 rank 里最慢的那个"。它只在窗口总时长随 barrier **个数**的增长里可见。2026-08-30 的两点观测：192 个 token 集合通信对应 88.9 ms 窗口，236 个（加上 44 个 prediction AllGather）对应 106.9 ms，**每个 0.463 对 0.453 ms**，与载荷（hidden states 对 512 字节）无关。这条是假设而非定论，隔离探针是 `VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER`。
+_Avoid_: 把它与 collective residency 混为一谈；bandwidth cost
+
 **Critical-path imbalance**：`Σ_各层(该层最慢 rank 的负载) / Σ_各层(该层均值)`。这是**唯一对应 MoE 总耗时的不均衡指标** —— 每层是独立的集合通信，各自等自己最慢的 rank，所以临界路径是逐层峰值之和。EPLB 自报的 `balancedness` 就是它的倒数。
 _Avoid_: load imbalance（不加限定时含义不明）
 
