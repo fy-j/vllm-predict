@@ -31,6 +31,7 @@ import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch.distributed import ProcessGroup, all_reduce
@@ -64,6 +65,10 @@ from .predictive import (
 )
 from .predictive_coordinator import PlacementCoordinator
 from .predictive_planner import Placement, apply_replica_maps
+
+if TYPE_CHECKING:
+    from .nvshmem_transfer import OneSidedExpertTransfer
+
 from .rebalance_execute import (
     AsyncEplbLayerResult,
     move_from_buffer,
@@ -101,7 +106,9 @@ def resolve_moe_block_size_m(
     about is the largest a prefill step can present, not a decode-sized one.
 
     Args:
-        model: The registered mixture-of-experts model, for its expert shapes.
+        model: The registered mixture-of-experts model. The expert geometry comes
+            from its first MoE layer's config, because the `expert_weights` EPLB
+            registers are flattened per-row views and the lookup needs `(E, K, N)`.
         top_k: Experts per token. Not on the `MixtureOfExperts` interface, so the caller
             takes it from a layer's MoE config.
         num_batched_tokens: The `M` to resolve at, post-allgather.
@@ -115,23 +122,41 @@ def resolve_moe_block_size_m(
         try_get_optimal_moe_config,
     )
 
+    shapes: tuple[tuple[int, ...], ...] = ()
     try:
-        w13, w2 = model.expert_weights[0][0], model.expert_weights[0][1]
+        # From the layer's MoE config, not from `model.expert_weights`. EPLB registers
+        # those as flattened `[rows, numel]` views — measured `(65, 3145728)` and
+        # `(65, 1572864)` on this model — and `try_get_optimal_moe_config` unpacks
+        # `w2_shape` as `(E, K, N)`, so passing them raises "not enough values to
+        # unpack" and every server silently took the fallback. The config is what the
+        # kernel's own `w1` and `w2` were built from, so these are the shapes it will
+        # look its own tuning up with.
+        moe_config = model.moe_layers[0].moe_config
+        experts = moe_config.num_local_experts
+        inter = moe_config.intermediate_size_per_partition
+        hidden = moe_config.hidden_dim
+        shapes = ((experts, 2 * inter, hidden), (experts, hidden, inter))
         config = try_get_optimal_moe_config(
-            w1_shape=tuple(w13.shape),
-            w2_shape=tuple(w2.shape),
+            w1_shape=shapes[0],
+            w2_shape=shapes[1],
             top_k=top_k,
             dtype=dtype,
             M=num_batched_tokens,
         )
         block = int(config["BLOCK_SIZE_M"])
     except Exception:
+        # What it tried is in the message: without it the warning cannot be acted on,
+        # and this failure has already been shipped once as a silent fallback.
         logger.warning(
             "Predictive expert replication could not resolve the MoE BLOCK_SIZE_M from "
-            "the kernel configuration; falling back to %d. The suppression bar "
-            "and the planner's minimum move both use it, so verify it against this "
-            "device's tuned configuration before trusting a result.",
+            "the kernel configuration; falling back to %d. It asked about w1%s and "
+            "w2%s at M=%d. The suppression bar and the planner's minimum move both "
+            "use this number, so verify it against this device's tuned configuration "
+            "before trusting a result.",
             _MOE_BLOCK_SIZE_M_FALLBACK,
+            shapes[0] if shapes else "(unknown)",
+            shapes[1] if shapes else "(unknown)",
+            num_batched_tokens,
             exc_info=True,
         )
         return _MOE_BLOCK_SIZE_M_FALLBACK
@@ -811,7 +836,9 @@ class EplbState:
     _predictive_stream: torch.cuda.Stream | None = None
     """Ordered predictive communication stream, spec section 9."""
 
-    _one_sided: object | None = None
+    # Quoted, and imported only for type checking: `nvshmem_transfer` imports NVSHMEM at
+    # module scope, and this module has to load on a host without it.
+    _one_sided: "OneSidedExpertTransfer | None" = None
     """The worker's NVSHMEM transport, initialised once and shared by every layer.
 
     One symmetric staging buffer per worker, not per layer: at most one expert is in

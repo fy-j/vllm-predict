@@ -34,6 +34,13 @@ Edges are listed rather than drawn: an ASCII diagram of this silently misaligned
 edges into neighbouring labels once, and each ticket's `Blocked by` field is
 authoritative anyway.
 
+**This node has 2 H100s, not 8** (since the 2026-08-30 pod restart). `06` is implemented and
+runs end to end there — the segfault that had `device_issued_transfer` off was the plan tensor
+being freed while the transfer kernels still had it queued, and it is fixed with a regression
+test. The runtime scope check no longer pins DP=8; it warns instead, because **no measured
+figure for this feature survives a change of EP size**. `06`'s two remaining criteria — 24.0%
+of prefill excess on 43 layers, and occupancy against 86.8%/52.9% — need the 8-GPU node back.
+
 **`06` is the ticket the arithmetic turns on, not `03`.** Measured on 2026-08-29: of the
 per-source-layer cost, 2.21 ms scales with launch count and 5.28 ms does not, and the
 fixed part is essentially the host synchronisation. `03` cut launches 59% and recovered

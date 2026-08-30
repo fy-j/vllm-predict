@@ -20,8 +20,9 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 
 - Branch: `feature/predictive-expert-replication`
 - Original vLLM base: `10704541aaf72567fe9d6229b3e3d84d37f2ddba`
-- Tickets `01` `02` `03` `06` `10` implemented and closed. `00` answered for both
-  regimes. `11` `12` open. `04` `05` `07` `08` `09` unstarted.
+- Tickets `01` `02` `03` `04` `05` `10` implemented and closed, and `06` is implemented and
+  running end to end with two measurements outstanding that need 8 GPUs. `00` answered for
+  both regimes. `11` `12` open. `07` `08` `09` unstarted.
 - The feature runs end to end and is **correct**: replicas are transferred, published
   where routing reads, routed to, and reverted. It removes about **15% of prefill
   critical-path excess** against an oracle of 35%.
@@ -30,7 +31,46 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 - **The cost is host synchronisation, not the transfers.** See the section below
   before touching anything.
 
-## Ticket 06, 2026-08-30 night: three pieces done, one crash open
+## Ticket 06, 2026-08-30 afternoon: the crash is fixed and the device path runs end to end
+
+**The segfault was the plan's ownership, not the transport.** `plan_and_launch` built the
+`[4]` plan as a temporary on the compute stream and launched two kernels that read it on the
+predictive stream; the temporary died when the method returned, the allocator handed its
+block to the next allocation on the compute stream — the 5th, measured — and the kernels,
+still queued behind a 40 us transfer, read whatever the forward had put there. `pe` was then
+not a rank. Nothing in `vllm/distributed/eplb/` called `record_stream`. Each layer now has a
+plan row the coordinator owns, so there is no allocation on the path and nothing to recycle.
+
+Demonstrated in three steps rather than argued: a pure-torch consumer on a second stream read
+the poison; the production classes moved expert 11 where the plan said 3; and a recycled block
+naming PE 12345 of 2 killed a rank with **SIGSEGV**, which is the server's crash on demand.
+`device_issued_transfer` now **defaults to True**.
+
+**Running end to end, DP=EP=2** (this node came back from its restart with 2 H100s, not 8):
+both workers arm, all 43 reachable layers per rank launch a device-issued transfer, the device
+counter reports 8 replicas placed, requests are served, no worker dies. With real weights,
+greedy output over 4 prompts x 96 tokens is **identical** to a no-replica reference while
+placement is active — and the host-issued path moves the first-token logprobs *more* than the
+device one (0.34 versus 0.25, against 0.000 for two canonical runs), so the transport
+introduces nothing placement does not.
+
+**Two criteria stay open and both need 8 GPUs:** the 24.0%-of-excess reproduction on 43
+layers, and the occupancy measurement against 86.8% / 52.9%. No TTFT number here is
+comparable to the DP=8 ones; the config validator now says so at startup.
+
+Also fixed on the way: `BLOCK_SIZE_M` was never actually resolved from the kernel — every
+server logged the fallback because EPLB's `expert_weights` are flattened `[rows, numel]` views
+and the unit test's fake supplied three-dimensional ones. And `torch.stack` blocks the host
+50-101 ms on its **first** call in a process while its kernel loads, which is a measurement
+trap rather than a defect, and it made the first version of the lifetime probe pass vacuously.
+Details, including a correction of my own first reading of that, in `bench/RESULTS.md`.
+
+Stale claim corrected: this document said `pre-commit` passes including `mypy-3.12`. Two mypy
+errors were live on the base commit (`_one_sided` typed as `object`, and two unannotated test
+lists); both are fixed now, and `ruff`, `pre-commit` and `mypy` had to be reinstalled after
+the pod restart — for the second time, so expect it again.
+
+## ~~Ticket 06, 2026-08-30 night: three pieces done, one crash open~~ (superseded, above)
 
 **Done and committed.** The plan is fully tensorised (bit-identical to the host planner,
 `set_sync_debug_mode("error")` clean). Publishing is a device scatter, checked against
@@ -39,8 +79,9 @@ stream-ordered barrier: **112/112 weight tensors byte-identical over all 56 orde
 pairs, p50 36.7-40.0 us against 53.7 us host-issued**. Residency and the transfer budget moved
 to the device with them, which they had to — "already resident" is what makes a transfer free.
 
-**Open.** Wired into a real 8-rank server it initialises on every worker, reaches all 48
-layers, and then segfaults inside NVSHMEM's proxy thread at the startup EPLB rearrange.
+**Open at the time — answered on 2026-08-30 afternoon; see the section above.** Wired into a
+real 8-rank server it initialises on every worker, reaches all 48 layers, and then segfaults
+inside NVSHMEM's proxy thread at the startup EPLB rearrange.
 Bisected with four server runs to `put_expert` alone: skipping the transfer is healthy, the
 barrier alone is healthy, barrier plus drain is healthy, full is not. It does not reproduce in
 a standalone script that pipelines 48 transfers per round with NCCL work and no
@@ -49,7 +90,8 @@ weight tensors as the put source. **Next step: print the plan and the resolved s
 from inside the kernel for one layer.** Two hypotheses were reasoned through tonight and both
 were wrong; the third attempt should measure.
 
-`device_issued_transfer` **defaults to False** because of this. The host path on the same
+`device_issued_transfer` defaulted to False because of this, and **defaults to True again
+since the cause was found**. The host path on the same
 commit still comes up healthy and serves, so nothing regressed — but no TTFT number tonight is
 a device-path number, and the +31.5% figure still stands as the only measured end-to-end cost.
 

@@ -66,6 +66,11 @@ else:
 
 logger = init_logger(__name__)
 
+# The data-parallel size every predictive expert replication figure was measured at.
+# Other sizes run, and are warned about, because none of those figures survives the
+# change: EP size sets the per-rank expert count, and that sets what imbalance exists.
+_MEASURED_DATA_PARALLEL_SIZE = 8
+
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "DeepseekV2ForCausalLM",
@@ -547,8 +552,10 @@ class VllmConfig:
             )
         if parallel_config.pipeline_parallel_size != 1:
             unsupported.append(f"PP={parallel_config.pipeline_parallel_size} (need 1)")
-        if parallel_config.data_parallel_size != 8:
-            unsupported.append(f"DP={parallel_config.data_parallel_size} (need 8)")
+        if parallel_config.data_parallel_size < 2:
+            unsupported.append(
+                f"DP={parallel_config.data_parallel_size} (need at least 2)"
+            )
         if not parallel_config.enable_expert_parallel:
             unsupported.append("expert parallelism disabled")
         if parallel_config.enable_dbo:
@@ -564,6 +571,24 @@ class VllmConfig:
             raise ValueError(
                 "Predictive expert replication does not support: "
                 f"{', '.join(unsupported)}."
+            )
+        if parallel_config.data_parallel_size != _MEASURED_DATA_PARALLEL_SIZE:
+            # The scope was pinned to exactly 8 and that blocked development on a
+            # smaller node, so it now only requires enough ranks for a replica to have
+            # somewhere to go. It stays a warning rather than becoming silent, because
+            # every measurement in this project was taken at DP=8 and none of them
+            # carries over: the per-rank expert count, the block-quantization bar and
+            # the per-layer imbalance all move with the EP size, so the ceiling does
+            # too. A TTFT number from another DP is a development signal, not a result.
+            logger.warning(
+                "Predictive expert replication is running at DP=%d. Every measured "
+                "figure for this feature - the %s%% ceiling, the recovered excess and "
+                "every TTFT comparison - was taken at DP=%d, and none of them applies "
+                "here, because EP size sets the per-rank expert count and with it the "
+                "imbalance there is to recover. Use this for functional runs only.",
+                parallel_config.data_parallel_size,
+                "5.05",
+                _MEASURED_DATA_PARALLEL_SIZE,
             )
 
     def _validate_predictive_model_scope(self, ep_size: int) -> int | None:

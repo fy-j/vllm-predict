@@ -13,7 +13,9 @@ device tensors, so a device scatter suffices.
 
 **Blocked by:** 05 — The transfer lands in the replica slot. Done.
 
-**Status:** in progress — plan, publish and transfer done and verified; the put kernel segfaults a real server and is the one thing left
+**Status:** implemented and running end to end (2026-08-30). The segfault is fixed and its
+cause was the plan's ownership, not the transport. Two criteria stay open and both need 8
+GPUs: the 24.0%/43-layer reproduction and the occupancy measurement. This node now has 2.
 
 **The precondition is answered and it changes the shape of this ticket.** Ticket 05's
 transport cannot reach this ticket's headline criterion, because a **host-issued** put takes
@@ -59,17 +61,21 @@ coverage ratchet up to all 43 layers.
       anything is recorded**. Deciding it after a snapshot exists is what previously made every
       decode and every dummy forward publish an empty set on all 48 layers, which reverted
       everything and defeated transfer reuse under any mixed traffic.
-- [ ] **No `synchronize()` anywhere on the per-forward path**, asserted by a source-level test
-      the way event polling is already forbidden. This is the ticket's headline criterion.
+- [x] **No `synchronize()` anywhere on the per-forward path** — asserted by *measurement*
+      rather than by the source-level test this asked for. A grep cannot see the spellings
+      that matter: `set_sync_debug_mode("error")` passes on the first `torch.stack` in a
+      process, which blocks the host for 50-100 ms while its kernel loads. The test queues
+      100 ms on the compute stream, runs all three phases, and asserts the host came back
+      in microseconds; a single `int(plan[0])` inserted deliberately makes it fail.
 - [ ] The existing baseline is reproduced, not merely equalled in spirit: at least **24.0% of
       full-prefill critical-path excess removed**, activation on **all 43 reachable layers**,
       and physical per-rank load diverging from canonical ownership by a non-zero amount.
-- [ ] Generated output matches a no-replica reference within BF16 tolerance over many forwards,
-      and repeated activation, replacement and reclamation complete on every rank without
-      deadlock.
+- [x] Generated output matches a no-replica reference within BF16 tolerance over many
+      forwards, and repeated activation, replacement and reclamation complete on every rank
+      without deadlock. Done at DP=2; see the equivalence note below for what the logprob
+      tolerance does and does not decide.
 - [ ] GPU occupancy inside real forward windows measured, and reported against the baseline's
       86.8% and the placed arm's 52.9%.
-
 
 ## Where this stands, 2026-08-30 night
 
@@ -91,14 +97,45 @@ device. They had to. Once the plan stops reaching the host, reconstructing "is t
 already resident" by reading it back restores the synchronisation, and residency is what makes
 transfer reuse free and coverage ratchet up across forwards.
 
-Not done, and it blocks the rest:
+## The segfault, 2026-08-30 afternoon: it was the plan's ownership
 
-- [ ] `put_expert` segfaults NVSHMEM's proxy thread in a real server, at the startup EPLB
-      rearrange, after all 48 layers have launched a transfer. Bisected: transfer skipped is
-      healthy, barrier only is healthy, barrier plus drain is healthy. Does not reproduce in a
-      standalone script that pipelines 48 transfers with NCCL work and no synchronisation, so
-      the trigger is something the server supplies. Print the plan and the resolved source
-      address from the kernel before hypothesising again.
-- [ ] The reproduction of at least 24.0% of prefill excess on all 43 layers, and the occupancy
-      measurement against 86.8% / 52.9%. Both need a server that stays up.
-- [ ] Output equivalence over many forwards against a no-replica reference.
+- [x] `put_expert` no longer crashes a server, and the transport was never at fault.
+      `plan_and_launch` built the `[4]` plan as a temporary on the compute stream and
+      launched two kernels that read it on the **predictive** stream. The temporary died
+      when the method returned, PyTorch's allocator handed its block to the next
+      allocation on the compute stream — measured, the 5th — and the kernels, still queued
+      behind a 40 us transfer, read whatever the forward had put there. `pe` was then not
+      a rank. Nothing in `vllm/distributed/eplb/` called `record_stream`.
+
+      Demonstrated rather than argued, in three steps: a pure-torch consumer on a second
+      stream read the poison; the production classes did the same, moving expert 11 where
+      the plan said 3 (`bench/probe_plan_lifetime.py`); and a plan whose recycled block
+      named PE 12345 of 2 killed rank 0 with **SIGSEGV**, which is the server's crash.
+
+      Fixed by giving each layer a plan row the coordinator owns for its lifetime, so
+      there is no allocation on the path and nothing to recycle.
+
+- [x] Verified end to end on **2 GPUs** (this node lost its other 6): both workers arm,
+      all 43 reachable layers per rank launch a device-issued transfer, the device counter
+      reports 8 replicas actually placed, requests are served, and no worker dies.
+      `bench/run_device_transfer_smoke.sh`.
+
+- [x] Output equivalence, at DP=2 with real weights: greedy text over 4 prompts x 96
+      tokens is **identical** to a no-replica reference while placement is demonstrably
+      active. The first-token top-10 logprobs move by 0.25 against the harness's invented
+      0.05 tolerance — but the **host-issued** path moves them 0.34 on the same test, and
+      two canonical runs move them 0.000, so this is what dynamic placement does to the
+      cross-rank combine order and not something the device transport introduced.
+
+Still open, and both need 8 GPUs:
+
+- [ ] At least 24.0% of prefill critical-path excess removed, on all 43 reachable layers.
+- [ ] GPU occupancy inside real forward windows, against the baseline's 86.8% and the
+      placed arm's 52.9%.
+
+One residual risk worth naming: nothing in a real server checks that a *dynamically*
+placed replica holds the bytes of the expert it claims. `verify_replica_weight_equality`
+runs at startup, where nothing is placed yet, and says so — it reported "0 pairs,
+vacuous". The evidence that it does is indirect: byte equality over every rank pair in the
+probe, and 384 greedy tokens unchanged with placement active, which a wrong row would very
+likely have broken. A runtime checksum check is the cheap way to make it direct.

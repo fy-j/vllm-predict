@@ -910,7 +910,6 @@ of MoE time, 5.1% of a prefill step here and 11.8% on an NVLink machine.** At bu
 The policy comparisons are unaffected: uniform against global, and hottest-first
 against largest-reduction, each ran both arms over the same layer set.
 
-
 ### Correction (2026-08-25, later the same day): the per-rank view was on the wrong scale
 
 Every prefill figure above is superseded. The dump field named `rank_load` was
@@ -964,7 +963,6 @@ reported: 13% relatively at one per layer, 9% at two,
 5% at three (critical path 1.245 against
 1.2258 at two). The earlier 15% to 19% came from the mis-scaled
 data.
-
 
 ## 2026-08-25 — borrowing from UltraEP: what transferred and what did not
 
@@ -1196,7 +1194,7 @@ what the payoff figure needs before it sizes anything.
 
 ---
 
-# 2026-08-29 — 8x H100 80GB SXM, NVSwitch. First measurements on the new node.
+# 2026-08-29 — 8x H100 80GB SXM, NVSwitch. First measurements on the new node
 
 Hardware, established rather than assumed (`HANDOFF-2026-08-29-H100.md` step 0):
 
@@ -1476,7 +1474,6 @@ collectives are inflated by arrival skew at concurrency 8), so an evenly loaded 
 point would raise the ceiling — but it would have to raise it about 1.6x just to reach
 prediction's own cost, and prediction's cost would rise with it, since more concurrency
 does not reduce the number of collectives.
-
 
 TPOT reads 0.00 in all arms because `OUT_LEN=1` produces no inter-token interval; this
 shape prices TTFT only.
@@ -2088,14 +2085,14 @@ collective waiting 322.4 -> 266.5 ms, a 17% reduction.
 Its method needs fixing before any TTFT verdict, and this is the ticket's own risk rather
 than a detail. Options, in increasing cost:
 
-* **Repeat each arm** several times within one run and report a distribution. Cheapest, and
+- **Repeat each arm** several times within one run and report a distribution. Cheapest, and
   it at least bounds the variance instead of ignoring it.
-* **Interleave the arms** rather than running them in sequence, so a drift in machine state
+- **Interleave the arms** rather than running them in sequence, so a drift in machine state
   cannot land entirely on one of them. Requires restarting servers per block.
-* **Make the profile-based attribution primary** and TTFT supporting. GPU time inside
+- **Make the profile-based attribution primary** and TTFT supporting. GPU time inside
   annotated windows is measured within a single run and has shown a 17% change cleanly,
   where mean TTFT could not see 40%.
-* **Report throughput as well as TTFT.** It is less tail-sensitive and moved coherently in
+- **Report throughput as well as TTFT.** It is less tail-sensitive and moved coherently in
   both runs (43.21/40.14/32.87 and 60.30/48.56/30.91).
 
 Recorded as a warning rather than a fix: no TTFT number from this harness should be quoted
@@ -2378,7 +2375,6 @@ evidence that a stream barrier completes a device-issued nbi put, this project h
 shipped one ordering claim resting on exactly that kind of observation, and the quiet costs
 about 1 us.
 
-
 ## Ticket 06's wiring, 2026-08-30: every piece works, and the put kernel crashes a server
 
 The three device-side pieces are built, tested and committed. Each is verified against the
@@ -2445,3 +2441,110 @@ the quiet was not load-bearing. Removing it did **not** fix the crash, and an ea
 in the probe claiming the quiet was needed because "7 of 8 ranks read a buffer the bytes had
 not reached" has been corrected: that observation was a bool `all_reduce` saturating, not a
 missing quiet.
+
+## Ticket 06, 2026-08-30 afternoon: the segfault was the plan's ownership, and the path now runs
+
+The put kernel that crashed three workers is fine. What was wrong is who owned the plan it
+read, and the whole chain is now measured rather than argued — the previous session
+reasoned through two hypotheses and both were wrong, so this one starts from an experiment.
+
+`DevicePlacementCoordinator.plan_and_launch` built the `[4]` int64 plan on the **compute**
+stream and launched two kernels that read it on the **predictive** stream, then returned,
+dropping the last reference. PyTorch's caching allocator returns a freed block to the pool
+of the stream it was allocated on and hands it to the next allocation there with no
+synchronisation, because cross-stream use is supposed to be declared with `record_stream`.
+Nothing in `vllm/distributed/eplb/` called it. So the compute stream overwrote the plan
+while the kernels were still queued behind a 40 us transfer.
+
+| step | what was measured |
+| --- | --- |
+| the mechanism, pure torch | a consumer on a second stream read `[1, 11, 1, 2]` — the poison, not the plan |
+| the allocator | the freed `[4]` int64 block came back on the **5th** allocation of that size |
+| the production classes | the transfer moved **expert 11** where the plan said expert 3 |
+| the link to the crash | a recycled block naming **PE 12345 of 2** killed rank 0 with **exitcode -11**, SIGSEGV |
+
+That last row is the server's crash reproduced on demand. In a real forward the overwrite
+is not another plan but whatever the engine allocated, so `pe` is an arbitrary int64 and
+NVSHMEM's proxy thread dereferences a peer address computed from it.
+
+**Fix:** each layer gets a plan row in a `[num_layers, 4]` buffer the coordinator owns for
+its lifetime. No allocation on the path, nothing to recycle, and no `record_stream`
+needed. The row is rewritten only by a later forward, by which point
+`activate_and_publish` has already made the compute stream wait on that layer's transfer
+event.
+
+`bench/probe_plan_lifetime.py` is the probe, and `tests/distributed/test_device_coordinator.py`
+the regression test — which fails on the pre-fix code with "the plan's memory was handed to
+another allocation while the transfer was still queued to read it".
+
+### Why every earlier check passed
+
+All of them held the plan in a local variable and synchronised immediately after launching.
+`probe_device_transfer.py` does exactly that, 112/112 times. A fake that reads the plan when
+the transfer is *issued* cannot catch this; the new probe's fake reads it late, behind a
+queued delay, which is what a kernel does.
+
+### End to end on 2 GPUs
+
+This node came back from a restart with **2 H100s instead of 8**, so the runtime scope check
+that pinned DP=8 was relaxed to "at least 2" with a startup warning that no measured figure
+for this feature survives the change — EP size sets the per-rank expert count and with it the
+imbalance there is to recover.
+
+`bench/run_device_transfer_smoke.sh`, DP=EP=2, dummy weights:
+
+    device path armed on 2 workers, 86 layer-launches (43 reachable x 2 ranks)
+    replicas actually placed, from the device counter: 8
+    host-path fallbacks: 0    crash signatures: 0
+
+The placement counter is the evidence that matters: "transfer launched for layer" is logged
+whether or not the plan found anything, so a run can log 86 launches and place nothing. It
+is now lowerable through `VLLM_PREDICTIVE_PLACEMENT_REPORT_EVERY`, because at 50 forwards a
+functional run never reaches its first report.
+
+### Output equivalence, real weights, DP=2
+
+`verify_source_rank_routing.sh` gained `MODE=device` and `MODE=host`, so the same test can
+attribute a difference to the transport:
+
+| arm | greedy text, 4 x 96 tokens | largest first-token logprob delta |
+| --- | --- | --- |
+| canonical vs canonical (CONTROL) | identical | **0.000000** |
+| canonical vs device-issued placement | identical | 0.253 (8 replicas placed) |
+| canonical vs host-issued placement | identical | 0.337 (1 replica placed) |
+
+So the device transport introduces nothing the host path does not: placement itself moves
+low-probability logprobs, because a replica changes which rank contributes a token's expert
+output and the combine sums them in another order. The harness's 0.05 tolerance was invented
+rather than calibrated — recorded here before, and now shown to fail on the path that was
+already measured working end to end. **Greedy text equality is the criterion this test can
+actually decide**, and it holds.
+
+Not decided: nothing in a real server checks that a *dynamically* placed replica holds the
+bytes of the expert it claims. The startup checksum check runs where nothing is placed and
+says so ("0 pairs, vacuous").
+
+### Two defects found on the way, both in things that were supposed to be checked
+
+**`BLOCK_SIZE_M` was never resolved from the kernel.** Every server logged "could not
+resolve ... falling back to 128" and nobody had read the traceback: `resolve_moe_block_size_m`
+passed `model.expert_weights[0]`, which EPLB registers as **flattened** `[rows, numel]`
+views — measured `(65, 3145728)` and `(65, 1572864)` — into a helper that unpacks
+`w2_shape` as `(E, K, N)`. The unit test passed because its fake model supplied
+three-dimensional tensors, which the real one does not have. Now read from the layer's
+`moe_config`, and the fake matches reality. It resolves to 128 at M=16384 on this node, so
+no behaviour changed — but it was a guess and is now a reading.
+
+**`torch.stack` blocks the host on its first call in a process**, 50-101 ms, while its
+kernel loads. Not a per-call synchronisation: calls 1-3 measure 0.01-0.04 ms and leave a
+side stream running. It is a trap for any measurement, and it silently drained the queued
+delay in the first version of the lifetime probe, turning a defect-reproducing arm into a
+vacuous pass. Warm the path, then measure — and assert the delay was still pending, which
+both the probe and the test now do.
+
+**And a correction of my own first reading:** I reported that `torch.stack` over 0-dim
+tensors was a per-layer device synchronisation on the production path. It is not; it is the
+one-time kernel load above. `set_sync_debug_mode("error")` does not catch it either, which
+is why the sync criterion is now tested by measurement: 100 ms queued on the compute stream,
+and the path must return in microseconds. A deliberately inserted `int(plan[0])` makes that
+test fail, so it is sensitive.

@@ -235,16 +235,21 @@ class PredictiveExpertReplicationConfig:
     traffic invalidates the resident set. The separate byte bound is
     `max_concurrent_transfer_bytes`, which is not yet implemented.
     """
-    device_issued_transfer: bool = False
+    device_issued_transfer: bool = True
     """Issue the transfer from a kernel, so the plan never reaches the host.
 
-    **Default False as of 2026-08-30, and not because the design is in doubt.** The path
-    is built and verified in isolation - 112/112 weight tensors byte-identical over all
-    56 ordered rank pairs, 36.7 us to 40.0 us per expert - but inside a real server the
-    put kernel segfaults NVSHMEM's proxy thread at the startup EPLB rearrange. Bisected
-    with three server runs: the barrier alone is fine, the drain alone is fine, and
-    `put_expert` is not. Enabling this today loses the worker, so it stays off until
-    that is understood. The host path still serves, and still measures what it costs.
+    **Default True as of 2026-08-30, when the crash that had it off was found and
+    fixed.** The path was built and verified in isolation - 112/112 weight tensors
+    byte-identical over all 56 ordered rank pairs, 36.7 us to 40.0 us per expert - and
+    then segfaulted NVSHMEM's proxy thread in a real server. The cause was not the
+    transport: `plan_and_launch` built the plan as a temporary on the compute stream and
+    the kernels read it on the predictive stream, so the allocator handed the block to
+    the next allocation and the put read a `pe` that was not a rank. The plan now lives
+    in a buffer the coordinator owns, and a regression test ages a plan across the
+    stream boundary the way a forward does. Verified end to end at DP=EP=2 on H100: both
+    workers arm, 43 reachable layers per rank launch a transfer, replicas are placed,
+    and greedy output matches a no-replica reference. **Not yet re-run at DP=8**, which
+    is where every measured figure for this feature comes from.
 
     This is the difference between the feature costing more than perfect expert
     balance could ever return and not. A **host-issued** put takes its peer, source

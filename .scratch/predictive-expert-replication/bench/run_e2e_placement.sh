@@ -99,12 +99,19 @@ for budget in $BUDGETS; do
   if [[ "$budget" == "off" ]]; then
     echo "[e2e] arm=off: stock server, feature fully disabled"
   else
+    # The transport is stated rather than defaulted, and printed, because it decides what
+    # the run measures: the host-issued path pays 5.28 ms of synchronisation per predicted
+    # layer and the device-issued one pays none. `DEVICE_TRANSFER=0` reproduces the
+    # +31.5% mean TTFT figure; 1 is what the config now defaults to.
+    echo "[e2e] budget=$budget: device_issued_transfer=${DEVICE_TRANSFER:-1}"
     ADDITIONAL=$(python3 -c "
 import json,sys
-cfg={'enabled': True, 'cost_profile_path': sys.argv[1]}
+cfg={'enabled': True, 'cost_profile_path': sys.argv[1],
+     'device_issued_transfer': sys.argv[3] == '1'}
 if int(sys.argv[2]) > 0:
     cfg['max_transfers_per_forward'] = int(sys.argv[2])
-print(json.dumps({'predictive_expert_replication': cfg}))" "$PROFILE" "$budget")
+print(json.dumps({'predictive_expert_replication': cfg}))" \
+      "$PROFILE" "$budget" "${DEVICE_TRANSFER:-1}")
     FEATURE_ARGS=(
       --additional-config "$ADDITIONAL"
       --eplb-config '{"log_balancedness":true,"log_balancedness_interval":1,"step_interval":1000000000,"window_size":1000,"use_async":false}'

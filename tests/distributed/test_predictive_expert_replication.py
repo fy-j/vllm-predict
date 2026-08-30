@@ -124,7 +124,11 @@ def test_predictive_replication_and_native_eplb_cannot_both_run(tmp_path):
     "overrides,expected",
     [
         ({"tensor_parallel_size": 2, "data_parallel_size": 4}, "TP=2"),
-        ({"data_parallel_size": 4}, "DP=4"),
+        # One rank has nowhere to put a replica. Sizes other than the measured 8 are
+        # allowed and warned about instead: pinning it to 8 blocked every functional run
+        # on a smaller node, and the reason for 8 was that the measurements were taken
+        # there, which a warning states better than a rejection.
+        ({"data_parallel_size": 1}, "DP=1"),
         ({"pipeline_parallel_size": 2}, "PP=2"),
         ({"enable_expert_parallel": False}, "expert parallelism disabled"),
         (
@@ -1271,7 +1275,7 @@ class TestStepDiagnosticsAreCollectiveSafe:
         monkeypatch.setattr(
             "vllm.envs.VLLM_PREDICTIVE_ACCURACY_DUMP_PATH", None, raising=False
         )
-        calls = []
+        calls: list[str] = []
         self._state(calls)._run_step_diagnostics()
         assert calls == ["verify"]
 
@@ -1283,7 +1287,7 @@ class TestStepDiagnosticsAreCollectiveSafe:
             "VLLM_PREDICTIVE_ACCURACY_DUMP_PATH",
         ):
             monkeypatch.setattr(f"vllm.envs.{name}", None, raising=False)
-        calls = []
+        calls: list[str] = []
         self._state(calls)._run_step_diagnostics()
         assert calls == []
 
@@ -1702,12 +1706,30 @@ class TestTheBlockSizeComesFromTheKernel:
     """
 
     def _model(self, num_rows=17, inter=768, hidden=2048, top_k=8):
-        w13 = torch.zeros(num_rows, 2 * inter, hidden)
-        w2 = torch.zeros(num_rows, hidden, inter)
+        """A model shaped like the real one, which is where this went wrong.
+
+        `expert_weights` are the **flattened** `[rows, numel]` views EPLB registers, not
+        the `[E, 2N, K]` and `[E, K, N]` tensors the kernel holds. The earlier fake here
+        supplied the three-dimensional ones, so the resolver passed them straight to
+        `try_get_optimal_moe_config` and this test agreed with it — while every real
+        server raised "not enough values to unpack" and took the fallback in silence.
+        """
         return SimpleNamespace(
-            expert_weights=[[w13, w2]],
+            expert_weights=[
+                [
+                    torch.zeros(num_rows, 2 * inter * hidden),
+                    torch.zeros(num_rows, hidden * inter),
+                ]
+            ],
             moe_layers=[
-                SimpleNamespace(moe_config=SimpleNamespace(experts_per_token=top_k))
+                SimpleNamespace(
+                    moe_config=SimpleNamespace(
+                        experts_per_token=top_k,
+                        num_local_experts=num_rows,
+                        intermediate_size_per_partition=inter,
+                        hidden_dim=hidden,
+                    )
+                )
             ],
         )
 
@@ -1720,8 +1742,8 @@ class TestTheBlockSizeComesFromTheKernel:
 
         model = self._model()
         expected = try_get_optimal_moe_config(
-            w1_shape=tuple(model.expert_weights[0][0].shape),
-            w2_shape=tuple(model.expert_weights[0][1].shape),
+            w1_shape=(17, 2 * 768, 2048),
+            w2_shape=(17, 2048, 768),
             top_k=8,
             dtype=None,
             M=m,

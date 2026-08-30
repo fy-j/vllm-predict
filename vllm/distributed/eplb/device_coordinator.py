@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
 # the vLLM project
 """In-forward placement with the plan never leaving the device.
@@ -43,8 +46,10 @@ logger = init_logger(__name__)
 
 # Forwards between reports of the device-side placement counter. Large enough that the
 # one synchronisation it costs is noise, small enough that a short benchmark still
-# produces the line the runners look for.
-_REPORT_EVERY = 50
+# produces the line the runners look for. Lowerable, because it is the only evidence
+# that a replica was placed at all and a functional run is a few forwards long — at 50
+# a smoke test cannot tell a working path from an inert one.
+_REPORT_EVERY = int(os.environ.get("VLLM_PREDICTIVE_PLACEMENT_REPORT_EVERY", "50"))
 
 # Debug only: tells a crash inside the transfer apart from one in everything
 # around it. Left in because that distinction took three server runs to make.
@@ -127,6 +132,23 @@ class DevicePlacementCoordinator:
         self._budget = torch.tensor(budget, dtype=torch.int64, device=device)
         self._spent = torch.zeros((), dtype=torch.int64, device=device)
         self._zero = torch.zeros((), dtype=torch.int64, device=device)
+
+        # One row per layer, owned for this coordinator's lifetime, because the transfer
+        # kernels read the plan on the **predictive** stream tens of microseconds after
+        # the host enqueued them. A per-layer temporary would be freed the moment
+        # `plan_and_launch` returns, and PyTorch's allocator hands a freed block to the
+        # next allocation on the stream that allocated it without waiting for another
+        # stream to be done with it — that is what `record_stream` exists to declare,
+        # and this path never called it. Measured with the production classes
+        # (`bench/probe_plan_lifetime.py`): the freed block came back on the 5th
+        # allocation and the put moved the expert that had overwritten the plan instead
+        # of the one the plan named. In a server the overwrite is not another plan but
+        # whatever the forward allocated there, so `pe` is not a rank, and the put lands
+        # NVSHMEM's proxy thread in a segfault — which is exactly the crash that kept
+        # `device_issued_transfer` switched off.
+        self._transfer_plans = torch.zeros(
+            (max(num_layers, 1), 4), dtype=torch.int64, device=device
+        )
 
         # Evidence that the path did something, counted on the device and read rarely.
         # `analyse_e2e.py` and the bench runners treat an activation log line as the
@@ -225,8 +247,15 @@ class DevicePlacementCoordinator:
         publish_plan = torch.stack(
             [(keep | affordable).to(torch.int64), raw[1], raw[2], raw[3]]
         )
-        transfer_plan = torch.stack(
-            [affordable.to(torch.int64), raw[1], raw[2], raw[3]]
+        # Publishing runs on the compute stream and the plan stays referenced in
+        # `_pending` until it does, so a temporary is safe there. The transfer's is not:
+        # it goes into this layer's own row, which nothing frees. The row is rewritten
+        # only by a later forward, and `activate_and_publish` has made the compute
+        # stream wait on the transfer event by then, so a rewrite cannot overtake a
+        # kernel still reading it.
+        transfer_plan = self._transfer_plans[target]
+        transfer_plan.copy_(
+            torch.stack([affordable.to(torch.int64), raw[1], raw[2], raw[3]])
         )
 
         with self._transfer_stream():
