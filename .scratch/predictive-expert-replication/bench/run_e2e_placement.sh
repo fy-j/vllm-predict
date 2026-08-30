@@ -16,13 +16,18 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-loaded=$(python3 -c "import vllm; print(vllm.__file__)" 2>/dev/null || true)
+# The venv, not system python3: `nvshmem.core` is installed only there, and without it a
+# device-transport arm falls back to the host path with a warning — measuring the very
+# synchronisation it was meant to remove, under the label that says it removed it.
+PY_BIN="${PY_BIN:-$REPO_ROOT/.venv/bin/python}"
+[[ -x "$PY_BIN" ]] || PY_BIN=python3
+loaded=$("$PY_BIN" -c "import vllm; print(vllm.__file__)" 2>/dev/null || true)
 case "$loaded" in
   "$REPO_ROOT"/*) : ;;
   *) echo "[FATAL] vLLM resolves to '$loaded', not $REPO_ROOT." >&2; exit 4 ;;
 esac
 echo "[env] vLLM from $loaded"
-python3 -c "
+"$PY_BIN" -c "
 import sys, vllm.envs as e
 need = {'VLLM_PREDICTIVE_PLACE_PER_FORWARD', 'VLLM_EPLB_DUMP_LOAD_PATH'}
 sys.exit(0 if need <= set(e.environment_variables) else 1)
@@ -35,7 +40,14 @@ PORT="${PORT:-8180}"
 # Three arms by default: `off` is the stock server (ticket 14's missing denominator),
 # `0` enables prediction but withholds placement, `43` places. Any two of these answer
 # a different question, so quote which pair a number came from.
+# An arm is `<budget>` or `<budget>:<transport>`, transport being `device` or `host`.
+# `43:host` pays the 5.28 ms per-layer host synchronisation and `43:device` does not, which
+# is the whole claim of ticket 06 and the one thing measurable at any rank count.
 BUDGETS="${BUDGETS:-off 0 43}"
+# Data-parallel size. 8 is where every recorded figure for this feature comes from; a
+# smaller value runs and is warned about at startup, because EP size sets the per-rank
+# expert count and with it how much imbalance there is to recover at all.
+DP="${DP:-8}"
 # How many times to measure each arm. One pass cannot see a 5% effect: between two runs of
 # this script the stock arm alone moved 28% on mean TTFT and 40% on throughput, on identical
 # workloads, because the machine was in a better state. Arms are measured in blocks —
@@ -55,12 +67,16 @@ exec 9>"$LOCK"
 flock -w 10800 9 || { echo "[e2e] lock not acquired" >&2; exit 3; }
 
 PROFILE="$OUT_DIR/cost-profile-local.json"
-python3 - "$HERE/results/cost-profile.json" "$PROFILE" "$MODEL" <<'PY'
-import json, sys
-src, dst, model = sys.argv[1:4]
-p = json.load(open(src)); p["fingerprint"]["model"] = model
+"$PY_BIN" - "$HERE/results/cost-profile.json" "$PROFILE" "$MODEL" "$DP" <<'PYEOF'
+import json, subprocess, sys
+src, dst, model, ep = sys.argv[1:5]
+p = json.load(open(src))
+device = subprocess.check_output(
+    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True
+).splitlines()[0].strip()
+p["fingerprint"].update(model=model, ep_size=int(ep), device_name=device)
 json.dump(p, open(dst, "w"), indent=2)
-PY
+PYEOF
 
 # Which domain's prompts. Routing is content dependent and the domains differ widely
 # in how much a placement can recover, measured per layer over 12 prefill forwards
@@ -75,11 +91,15 @@ PROMPTS="$HERE/results/prompts-$DOMAIN-p1024.jsonl"
 echo "[e2e] domain=$DOMAIN"
 
 for repeat in $(seq 1 "$REPEATS"); do
-for budget in $BUDGETS; do
+for arm in $BUDGETS; do
+  budget="${arm%%:*}"
+  if [[ "$arm" == *:* ]]; then transport="${arm#*:}"; else transport="${DEFAULT_TRANSPORT:-device}"; fi
+  label="$budget"
+  [[ "$arm" == *:* ]] && label="${budget}-${transport}"
   # The tag carries the repeat only when there is more than one, so a single-pass run keeps
   # the filenames every existing reader and every recorded result already expects.
-  if [[ "$REPEATS" -gt 1 ]]; then tag="b${budget}-r${repeat}"; else tag="b$budget"; fi
-  echo "[e2e] budget=$budget: starting server"
+  if [[ "$REPEATS" -gt 1 ]]; then tag="b${label}-r${repeat}"; else tag="b$label"; fi
+  echo "[e2e] arm=$arm: starting server (budget=$budget, transport=$transport)"
   LOG="$OUT_DIR/server-$tag.log"
   DUMP="$OUT_DIR/dump-$tag.jsonl"
   rm -f "$DUMP"
@@ -99,19 +119,17 @@ for budget in $BUDGETS; do
   if [[ "$budget" == "off" ]]; then
     echo "[e2e] arm=off: stock server, feature fully disabled"
   else
-    # The transport is stated rather than defaulted, and printed, because it decides what
-    # the run measures: the host-issued path pays 5.28 ms of synchronisation per predicted
-    # layer and the device-issued one pays none. `DEVICE_TRANSFER=0` reproduces the
-    # +31.5% mean TTFT figure; 1 is what the config now defaults to.
-    echo "[e2e] budget=$budget: device_issued_transfer=${DEVICE_TRANSFER:-1}"
-    ADDITIONAL=$(python3 -c "
+    # The transport decides what the arm measures: the host-issued path pays 5.28 ms of
+    # synchronisation per predicted layer and the device-issued one pays none, so the
+    # +31.5% mean TTFT figure belongs to `43:host`.
+    ADDITIONAL=$("$PY_BIN" -c "
 import json,sys
 cfg={'enabled': True, 'cost_profile_path': sys.argv[1],
-     'device_issued_transfer': sys.argv[3] == '1'}
+     'device_issued_transfer': sys.argv[3] == 'device'}
 if int(sys.argv[2]) > 0:
     cfg['max_transfers_per_forward'] = int(sys.argv[2])
 print(json.dumps({'predictive_expert_replication': cfg}))" \
-      "$PROFILE" "$budget" "${DEVICE_TRANSFER:-1}")
+      "$PROFILE" "$budget" "$transport")
     FEATURE_ARGS=(
       --additional-config "$ADDITIONAL"
       --eplb-config '{"log_balancedness":true,"log_balancedness_interval":1,"step_interval":1000000000,"window_size":1000,"use_async":false}'
@@ -120,13 +138,19 @@ print(json.dumps({'predictive_expert_replication': cfg}))" \
       "VLLM_PREDICTIVE_PLACE_PER_FORWARD=$budget"
       "VLLM_EPLB_DUMP_LOAD_PATH=$DUMP"
       "VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS=0"
+      # The device path cannot log per activation - the host no longer knows what was
+      # placed - so it counts on the device and reports every N forwards. At the default
+      # 50 a short run finishes before its first report, and the guard then calls a
+      # working arm inert. 10 keeps the one synchronisation it costs out of the way while
+      # still producing the line every reader here looks for.
+      "VLLM_PREDICTIVE_PLACEMENT_REPORT_EVERY=10"
     )
   fi
 
   env "${FEATURE_ENV[@]}" \
-  python3 -m vllm.entrypoints.openai.api_server \
+  "$PY_BIN" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" --port "$PORT" \
-    --data-parallel-size 8 --enable-expert-parallel \
+    --data-parallel-size "$DP" --enable-expert-parallel \
     --all2all-backend allgather_reducescatter --enforce-eager \
     --max-model-len 3072 --gpu-memory-utilization 0.88 \
     --max-num-seqs 64 --seed 0 --uvicorn-log-level warning \
@@ -141,14 +165,18 @@ print(json.dumps({'predictive_expert_replication': cfg}))" \
     sleep 5
   done
   if [[ "$ready" -ne 1 ]]; then
-    echo "[e2e] budget=$budget: never ready" >&2; tail -40 "$LOG" >&2
+    echo "[e2e] arm=$arm: never ready" >&2; tail -40 "$LOG" >&2
     kill -9 "$PID" 2>/dev/null || true; sleep 5
     for p in $(ps -eo pid,cmd --no-headers | grep "VLLM::" | grep -v grep | awk '{print $1}'); do kill -9 "$p" 2>/dev/null; done
     sleep 8; continue
   fi
-  echo "[e2e] budget=$budget: ready"
+  echo "[e2e] arm=$arm: ready"
 
-  timeout 1800 vllm bench serve \
+  # `$PY_BIN -m`, not the `vllm` console script: the script runs under system python,
+  # where the bench extra's pandas is not installed - and on a pod restart it disappears
+  # again. It also leaves the working tree off sys.path, which has silently measured stock
+  # vLLM before.
+  timeout 1800 "$PY_BIN" -m vllm.entrypoints.cli.main bench serve \
     --backend openai-chat --endpoint /v1/chat/completions \
     --model "$MODEL" --port "$PORT" \
     --dataset-name custom --dataset-path "$PROMPTS" \
@@ -215,11 +243,13 @@ done
 # them printed a warning to stderr and carried on.
 guard_arms=""
 for repeat in $(seq 1 "$REPEATS"); do
-  for budget in $BUDGETS; do
-    if [[ "$REPEATS" -gt 1 ]]; then guard_arms="$guard_arms ${budget}-r${repeat}"; else guard_arms="$guard_arms $budget"; fi
+  for arm in $BUDGETS; do
+    label="${arm%%:*}"
+    [[ "$arm" == *:* ]] && label="${label}-${arm#*:}"
+    if [[ "$REPEATS" -gt 1 ]]; then guard_arms="$guard_arms ${label}-r${repeat}"; else guard_arms="$guard_arms $label"; fi
   done
 done
-if ! python3 "$HERE/check_run_measured.py" --results-dir "$OUT_DIR" --arms $guard_arms; then
+if ! "$PY_BIN" "$HERE/check_run_measured.py" --results-dir "$OUT_DIR" --arms $guard_arms; then
   echo "[e2e] MEASURED NOTHING - do not read $OUT_DIR" >&2
   exit 5
 fi

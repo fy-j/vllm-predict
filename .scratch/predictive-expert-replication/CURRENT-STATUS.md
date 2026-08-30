@@ -58,6 +58,22 @@ introduces nothing placement does not.
 layers, and the occupancy measurement against 86.8% / 52.9%. No TTFT number here is
 comparable to the DP=8 ones; the config validator now says so at startup.
 
+**First TTFT numbers for the device transport, four arms at DP=2** (Korean prompts, 120
+requests at concurrency 16, prefill-weighted, each arm twice). The device path's p99 is
+**42% and 27% below the host path's** with no overlap between the arms' ranges — which is
+what removing a per-layer host synchronisation should look like, since an 11.02 ms
+`cudaEventSynchronize` lands in the tail rather than the mean. The mean difference is 2.4%
+and sits inside the host arm's own 9.6% repeat spread, so **there is no mean claim in this
+run**. Both transports recover the same share of full-prefill excess, 34.8-36.6% against
+36.1-36.2%, which is the check that the device path places what the planner chose.
+
+**The stock arm moved 56% between two identical repeats** (406.36 against 260.31 ms mean
+TTFT), so nothing in that run can be compared against stock. Previously recorded at 28%.
+And placement still costs +38% mean TTFT against prediction alone here — expected, because
+two ranks give a critical-path imbalance of 1.17 against eight ranks' 1.885, so there is
+much less to win for the same 43 transfers. It says nothing new about the verdict, which is
+a DP=8 question.
+
 Also fixed on the way: `BLOCK_SIZE_M` was never actually resolved from the kernel — every
 server logged the fallback because EPLB's `expert_weights` are flattened `[rows, numel]` views
 and the unit test's fake supplied three-dimensional ones. And `torch.stack` blocks the host

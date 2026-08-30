@@ -2548,3 +2548,55 @@ one-time kernel load above. `set_sync_debug_mode("error")` does not catch it eit
 is why the sync criterion is now tested by measurement: 100 ms queued on the compute stream,
 and the path must return in microseconds. A deliberately inserted `int(plan[0])` makes that
 test fail, so it is sensitive.
+
+### Four arms at DP=2, the first TTFT numbers for the device transport
+
+Korean prompts, 120 requests at concurrency 16, `OUT_LEN=1` so the run is prefill-weighted,
+every arm measured twice in interleaved blocks. **DP=2, so none of these compares to the
+DP=8 figures** — with two ranks the per-layer critical-path imbalance is 1.17 where eight
+ranks give 1.885, so there is far less to win and the same 43 transfers to pay for.
+
+| arm | mean TTFT, r1 / r2 | p99 TTFT, r1 / r2 |
+| --- | --- | --- |
+| `off`, stock server | 406.36 / 260.31 ms | 997.32 / 436.86 ms |
+| `0`, prediction only | 259.30 / 263.50 ms | 384.82 / 388.95 ms |
+| `43:host`, host-issued transfer | 387.66 / 353.57 ms | 863.80 / 659.33 ms |
+| `43:device`, device-issued transfer | 363.20 / 360.34 ms | 503.96 / 483.50 ms |
+
+**The stock arm moved 56% between two repeats of an identical configuration** (406 against
+260), so nothing here can be compared against stock. That is the same drift recorded before
+at 28%, worse this time, and it is why the arms are measured in interleaved blocks.
+
+**What the device transport buys is the tail.** Against the host-issued path its p99 is 42%
+and 27% lower in the two repeats, with no overlap between the arms' ranges, which is what
+removing a per-layer host synchronisation should look like: an 11.02 ms `cudaEventSynchronize`
+per predicted layer stalls the engine and lands in the tail, not in the mean. The mean
+difference is 2.4% and sits inside the host arm's own repeat spread of 9.6%, so **no mean
+claim is available from this run** — only the p99 one.
+
+**The mechanism is unchanged by the transport, which is the check that matters.** Both place
+from the same planner, and both recover the same share of the full-prefill critical-path
+excess:
+
+| arm | full prefill, critical path | excess removed | partial prefill |
+| --- | --- | --- | --- |
+| `43:device` r1 / r2 | 1.172 -> 1.109 / 1.174 -> 1.113 | **36.6% / 34.8%** | 12.9% / 13.3% |
+| `43:host` r1 / r2 | 1.172 -> 1.110 / 1.174 -> 1.111 | 36.1% / 36.2% | 13.4% / 13.0% |
+
+`connected: true` on all four, 120 of 120 requests completed, 0 failed. The device arm
+reports **217 replicas placed over 30 forwards** from its own device counter, with no
+host-path fallback and no crash signature in either repeat.
+
+So at two ranks the feature recovers a *larger* share of a *much smaller* imbalance — 35% of
+an excess of 0.17 rather than 24% of 0.885 — while paying the same transfer count, and
+placement costs **+38% mean TTFT against prediction alone**. That is the expected direction
+and it says nothing new about the verdict, which is a DP=8 question. What is new is that the
+device transport's cost is now measured rather than projected, and it is lower than the host
+path's on the tail.
+
+Two harness notes for whoever runs this next. `run_e2e_placement.sh` takes `DP` and arms of
+the form `43:device` / `43:host`, so both transports interleave inside one pass instead of
+being compared across invocations — which, given the 56% drift above, would have compared
+machine states. And it now runs both the server and the bench client from `.venv/bin/python`:
+the `vllm` console script runs under system python, where the bench extra's pandas vanished
+with the pod restart, and where the working tree is off `sys.path` anyway.
