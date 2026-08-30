@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Land a predicted expert in its target's replica row, without the host reading it.
 
 Ticket 05. The pynccl path this replaces is not slow because of the wire: transfers

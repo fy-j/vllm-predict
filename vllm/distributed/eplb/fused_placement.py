@@ -273,6 +273,22 @@ def plan_and_charge_fused(
         raise ValueError(
             f"{num_logical} logical experts do not divide across {ep_size} EP ranks."
         )
+    if num_logical == 0:
+        # `plan_replicas` returns no placement for this and names the all-zero dummy
+        # forward as the reason, so it must not become a crash: `per_rank` would be 0
+        # and the kernel would fail to compile on `tl.arange(0, 0)`.
+        transfer_plan.zero_()
+        publish_plan.zero_()
+        return
+    # Unit innermost stride, because the kernel indexes `load_ptr + rank * per_rank +
+    # off`. The tensor versions this replaces handle arbitrary strides, and every
+    # equality test builds contiguous tensors, so a strided view would read the wrong
+    # elements in silence.
+    if predicted.stride(-1) != 1:
+        raise ValueError(
+            "the predicted load must have unit innermost stride; the fused planner "
+            "indexes it directly. Pass a contiguous tensor."
+        )
     per_rank = num_logical // ep_size
     _plan_and_charge_kernel[(1,)](
         predicted,
@@ -320,6 +336,19 @@ def publish_plan_fused(
             f"copy cannot be recorded and the replica would never be routed to. "
             f"Widen it to at least 2."
         )
+    for name, tensor in (
+        ("logical_to_physical", logical_to_physical),
+        ("logical_replica_count", logical_replica_count),
+        ("source_local", source_local),
+        ("layout", layout),
+    ):
+        # Same reason as the planner's: the kernel adds a column offset to a row
+        # pointer, so only `stride(0)` is passed and the innermost stride must be 1.
+        if tensor.stride(-1) != 1:
+            raise ValueError(
+                f"{name} must have unit innermost stride; the fused publish writes "
+                f"columns by offset. Pass a contiguous tensor."
+            )
     _publish_kernel[(1,)](
         plan,
         residency,

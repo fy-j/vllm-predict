@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Publish a placement into the routing maps without reading the plan on the host.
 
 Ticket 06. The plan is a device tensor and the transfer is issued from a kernel, so

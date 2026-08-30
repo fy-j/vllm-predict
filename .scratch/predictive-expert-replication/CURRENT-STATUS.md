@@ -71,6 +71,73 @@ Pairwise arrival is worth 0.23 ms and belongs well down the list. A collective's
 mostly a measurement of what the other rank was doing — the same lesson as the 5090's
 2000x-spread AllGather.
 
+## Code review, 2026-08-30 night: six more fixed, five open
+
+A second review of the branch found 14 issues. Six are fixed with tests; five are recorded
+below because they are real and not yet done, and three of the six are worth naming because
+of *how* they hid.
+
+**Fixed, and it would have failed CI.** Twelve files carried a merged SPDX header
+(`# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: ... to` / `# the vLLM
+project`), which `check-spdx-header` rejects. It came from a reflow in `d760c2d33`, and the
+`pre-commit` hook's own auto-fix then *prepended* the canonical two lines rather than
+repairing them, so six files ended up with both. Restored everywhere and verified against
+the hook.
+
+**Fixed, my own new bug.** `lookahead_pair` keyed its comparison by lookahead alone, so with
+the accuracy runner's two domains per lookahead the last report silently won — the reviewer
+reproduced code at 0.9 and text at 0.1 reporting 0.1 for both arms and "not better at 1",
+printed as the answer to ticket 07. It is per domain now, compares the two shortest
+lookaheads and names any it ignored, and never raises: with the runner's own default
+`LOOKAHEADS="1 2 3"` it used to raise into two callers' `except` and the deliverable table
+vanished without a word. Three new tests.
+
+**Fixed, and unreachable today, which is how it would have survived.** The device path's
+publish did not pass `slot`, so it always wrote row `per_rank_experts + 0` while
+`drain_expert` wrote `replica_row_of(canonical_per_rank, slot)`. At any slot but 0 routing
+would point at an unwritten row with the weights one row over, silently.
+`replica_slots_per_rank` is validated to 1, so nothing could reach it — yet.
+
+Also fixed: the host coordinator never ordered the predictive stream behind the compute
+stream, so its drain could overwrite a replica row the previous forward's MoE was still
+reading — the same hazard the device path had, and worse since `activate` became a stream
+wait and the CPU runs further ahead. `VLLM_PREDICTIVE_PLACEMENT_REPORT_EVERY=0` raised
+`ZeroDivisionError` on the first forward, where 0 is the natural spelling for "never". An
+empty snapshot crashed the fused planner on `tl.arange(0, 0)` where the tensor version
+places nothing. And both fused kernels now reject a non-unit innermost stride rather than
+reading the wrong elements, since they index directly and every equality test builds
+contiguous tensors.
+
+**Open, most serious first.**
+
+*The device-path setup wraps collectives in a per-rank `try/except`.* `_symmetric_staging`
+does `broadcast_object_list` and `nvshmem.init`; a rank that raises earlier — in
+`WeightPointers.build`, say — falls back to the host path while every other rank blocks in
+that broadcast forever. A failure *after* the broadcast is worse: the others keep putting
+into a peer with no symmetric heap. The availability decision has to be all-reduced before
+any rank commits. Nothing has hit this because the setup succeeds or fails identically on
+every rank so far.
+
+*Neither NVSHMEM object is ever closed*, unchanged from the previous review: `close()` and
+`library_finalize` have no caller outside probes, and both docstrings say the symmetric heap
+surviving into interpreter exit segfaults every rank after the results have printed.
+
+*`resolve_moe_block_size_m` passes no `dtype` or `block_shape`*, so on a quantised MoE the
+resolved `BLOCK_SIZE_M` can be one the kernel never uses — and it logs "resolved" either
+way, which is the guess this function exists to remove. Harmless on BF16 Qwen, which is the
+approved scope, and a trap for DSV4's FP8 in ticket 10.
+
+*A forward with no DP metadata never opens the coordinator.* `note_forward_token_load` is
+called only when `_forward_tokens_per_expert()` returns a value, while
+`_prediction_is_worth_it()` returns True in exactly that case — so such a forward predicts
+and records but leaves `_suppressed` at the previous forward's value and does not advance
+`_forward_id`, disabling both invariants ticket 07 added.
+
+*`replica_transfer.py`'s single staging buffer has the ordering hazard the device path fixed*
+with parity-alternated buffers, and `WeightPointers.build` does not bound-check
+`replica_row` against the row count. Both are reachable only from probes and tests today,
+since `ReplicaTransferEngine` has no production caller.
+
 ## Code review, 2026-08-30 evening: three fixed, four open
 
 A review of the branch's unpushed work found seven issues. Three were fixed on the spot and

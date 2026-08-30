@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
 """Move an expert's weights from a kernel, so the plan never reaches the host.
 
 Ticket 06. Ticket 05's transport works and is fast — 53.7 us for a 9.00 MiB expert — but

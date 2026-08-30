@@ -2862,3 +2862,51 @@ cost figures are now stale and have to be re-run: placement's +22.1% was measure
 kernels per placed layer and a host synchronisation, and prediction's own +7.6% predates
 nothing but is a rank-count effect — the same prediction arm measures **-0.2%** at DP=2,
 because the arrival skew that amplifies launches barely exists between two ranks.
+
+
+## Ticket 07's last criterion, 2026-08-30: lookahead 1 predicts better, on every metric
+
+The one measurement ticket 07 was still missing. Two servers, one per lookahead, Korean
+prompts at 1024 tokens, 32 requests each, DP=2, `prediction_skip_first_layers=3` and no
+placement — the accuracy dump pairs each source layer's predicted logical counts with the
+target layer's actual recorded load, so this is prediction against truth and nothing else.
+
+| metric | L=1 | L=2 | change |
+| --- | --- | --- | --- |
+| samples (forward x target layer) | 1584 | 1548 | 44 vs 43 layers |
+| **`peak_hit_rate` = recall@1** | **0.7702** | 0.7132 | **+8.0% relative** |
+| recall@2 | 0.8166 | 0.7629 | +7.0% |
+| recall@4 | 0.8551 | 0.8133 | +5.1% |
+| recall@8 | 0.8817 | 0.8409 | +4.9% |
+| **`count_error`** (TV distance, lower better) | **0.0925** | 0.1269 | **-27%** |
+
+**Recall@1 is the figure that matters**, because `max_replicas_per_layer` defaults to 1 —
+the planner picks one expert, so what it needs is that the single expert it would choose is
+the one that actually ran hottest. That is 0.770 at lookahead 1 against 0.713 at 2.
+
+`accuracy_report.py`'s `PLANNER_K` said 2 and has been corrected to 1 with the reason,
+because it was the report's headline number and the cap changed under it. Reporting the
+figure the planner does not depend on is the class of mistake this project keeps making.
+
+**The comparison is restricted to the layers both arms cover**, because at a lookahead of
+`n` the reachable targets start at `skip_first + n`: lookahead 1 reaches target layer 4 and
+lookahead 2 does not, and early layers are exactly the ones a skip decision is about, so
+pooling would charge lookahead 1 for a layer its opponent never had to predict. It makes
+almost no difference here — recall@1 0.767 on the 43 common layers against 0.770 pooled —
+which is itself the useful finding: the improvement is not an artifact of layer coverage.
+
+`lookahead_pair()` in `accuracy_report.py` does that restriction, with five unit tests
+including the two cases worth pinning: no common layer at all is reported rather than
+averaged into a number, and a set that is not a pair of lookaheads raises.
+
+**So ticket 07's expectation is confirmed on measurement.** Lookahead 2 existed only to buy
+the host planner a layer of compute for its snapshot copy to land in; it cost 8% of the
+planner's operative accuracy to do it, and the device path does not need it.
+
+**One thing worth following up and not concluded here.** The per-layer curve puts no leading
+layer below tolerance at either lookahead — stable medians 0.861 at L=1 and 0.799 at L=2,
+with no early layer materially worse. The layers before `prediction_skip_first_layers=3`
+never predict at all, so this says nothing about *them*; what it does say is that among the
+layers that do predict, the earliest are not the weak ones on this domain. Whether the skip
+can be reduced from 3, and buy coverage, is a separate measurement that would have to let
+those layers predict.

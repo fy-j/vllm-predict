@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Can a CUDA kernel issue the put, reading the plan from device memory?
 
 Ticket 06's precondition, and the one that decides whether its headline criterion is

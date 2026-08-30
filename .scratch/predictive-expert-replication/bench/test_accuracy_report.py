@@ -14,15 +14,26 @@ from accuracy_report import (  # noqa: E402
     by_layer_curve,
     degradation,
     domain_of,
+    lookahead_pair,
     skip_recommendation,
 )
 
 
-def _report(label, lookahead, recall_at_2, count_error=0.1, by_layer=None):
+def _report(label, lookahead, recall, count_error=0.1, by_layer=None):
+    """A scored run, with `recall` written at both k.
+
+    So a test reads the same number whichever `PLANNER_K` is current: the default moved
+    from 2 to 1 when the planner's per-layer cap did, and fixtures pinned to one k would
+    have quietly stopped matching.
+    """
     return {
         "label": label,
         "lookahead": lookahead,
-        "overall": {"recall_at_2": recall_at_2, "count_error": count_error},
+        "overall": {
+            "recall_at_1": recall,
+            "recall_at_2": recall,
+            "count_error": count_error,
+        },
         "by_layer": by_layer or {},
     }
 
@@ -81,16 +92,36 @@ class TestByLayerCurve:
         and `skip_recommendation` then finds nothing to skip.
         """
         reports = [
-            _report("L1-code", 1, 0.8, by_layer={"4": {"recall_at_2": 0.76}}),
-            _report("L3-code", 3, 0.7, by_layer={"6": {"recall_at_2": 0.68}}),
+            _report(
+                "L1-code",
+                1,
+                0.8,
+                by_layer={"4": {"recall_at_1": 0.76, "recall_at_2": 0.76}},
+            ),
+            _report(
+                "L3-code",
+                3,
+                0.7,
+                by_layer={"6": {"recall_at_1": 0.68, "recall_at_2": 0.68}},
+            ),
         ]
         with pytest.raises(ValueError, match="cannot pool a per-layer curve"):
             by_layer_curve(reports)
 
     def test_pools_the_same_layer_across_runs(self):
         reports = [
-            _report("L1-code", 1, 0.8, by_layer={"10": {"recall_at_2": 0.6}}),
-            _report("L1-text", 1, 0.8, by_layer={"10": {"recall_at_2": 0.8}}),
+            _report(
+                "L1-code",
+                1,
+                0.8,
+                by_layer={"10": {"recall_at_1": 0.6, "recall_at_2": 0.6}},
+            ),
+            _report(
+                "L1-text",
+                1,
+                0.8,
+                by_layer={"10": {"recall_at_1": 0.8, "recall_at_2": 0.8}},
+            ),
         ]
         assert by_layer_curve(reports) == {10: 0.7}
 
@@ -101,9 +132,9 @@ class TestByLayerCurve:
                 1,
                 0.8,
                 by_layer={
-                    "9": {"recall_at_2": 0.5},
-                    "10": {"recall_at_2": 0.6},
-                    "100": {"recall_at_2": 0.7},
+                    "9": {"recall_at_1": 0.5, "recall_at_2": 0.5},
+                    "10": {"recall_at_1": 0.6, "recall_at_2": 0.6},
+                    "100": {"recall_at_1": 0.7, "recall_at_2": 0.7},
                 },
             )
         ]
@@ -134,3 +165,146 @@ class TestSkipRecommendation:
         got = skip_recommendation({})
         assert got["stable_median"] is None
         assert got["implied_skip_target_layers"] is None
+
+
+class TestLookaheadPair:
+    """Ticket 07 asks whether shortening the lookahead to 1 predicts better.
+
+    The two arms do not cover the same target layers: at a lookahead of `n` the reachable
+    targets start at `skip_first + n`, so lookahead 1 covers one extra early layer — and
+    early layers predict worst, which is the whole reason
+    `prediction_skip_first_layers` exists. Comparing pooled overalls therefore charges
+    lookahead 1 for a layer lookahead 2 never had to predict.
+    """
+
+    def _pair(self, l1_layers, l2_layers, l1_overall=0.9, l2_overall=0.8):
+        return [
+            _report("L1-ko-p1024", 1, l1_overall, by_layer=l1_layers),
+            _report("L2-ko-p1024", 2, l2_overall, by_layer=l2_layers),
+        ]
+
+    def test_compares_on_the_layers_both_arms_cover(self):
+        got = lookahead_pair(
+            self._pair(
+                {
+                    "4": {"recall_at_1": 0.30, "recall_at_2": 0.30, "count_error": 0.5},
+                    "5": {"recall_at_1": 0.90, "recall_at_2": 0.90, "count_error": 0.1},
+                    "6": {"recall_at_1": 0.90, "recall_at_2": 0.90, "count_error": 0.1},
+                },
+                {
+                    "5": {"recall_at_1": 0.80, "recall_at_2": 0.80, "count_error": 0.2},
+                    "6": {"recall_at_1": 0.80, "recall_at_2": 0.80, "count_error": 0.2},
+                },
+            ),
+            k=2,
+        )["ko-p1024"]
+        assert got["common_layers"] == [5, 6]
+        assert got["common"]["recall_at_2"] == {1: 0.9, 2: 0.8}
+        assert got["common"]["count_error"] == {1: 0.1, 2: 0.2}
+        assert got["better_at_1"] is True
+
+    def test_reports_the_pooled_overall_too(self):
+        """Both are useful; the point is not to quote only the flattering one."""
+        got = lookahead_pair(
+            self._pair(
+                {
+                    "4": {"recall_at_1": 0.30, "recall_at_2": 0.30, "count_error": 0.5},
+                    "5": {"recall_at_1": 0.90, "recall_at_2": 0.90, "count_error": 0.1},
+                },
+                {
+                    "5": {"recall_at_1": 0.80, "recall_at_2": 0.80, "count_error": 0.2},
+                },
+                l1_overall=0.60,
+                l2_overall=0.80,
+            ),
+            k=2,
+        )["ko-p1024"]
+        assert got["overall"]["recall_at_2"] == {1: 0.6, 2: 0.8}
+        assert got["common"]["recall_at_2"] == {1: 0.9, 2: 0.8}
+        assert got["layers_only_at_1"] == [4]
+
+    def test_no_common_layer_is_stated_rather_than_averaged_to_nothing(self):
+        got = lookahead_pair(
+            self._pair(
+                {"4": {"recall_at_1": 0.9, "recall_at_2": 0.9, "count_error": 0.1}},
+                {"9": {"recall_at_1": 0.8, "recall_at_2": 0.8, "count_error": 0.2}},
+            ),
+            k=2,
+        )["ko-p1024"]
+        assert got["common_layers"] == []
+        assert got["common"] is None
+        assert got["better_at_1"] is None
+        assert got["reason"] == "the two arms share no target layer"
+
+    def test_a_mixed_distance_report_is_left_off_the_axis(self):
+        """A dump spanning several distances has no single lookahead to compare at."""
+        got = lookahead_pair(
+            [
+                _report("L1-ko-p1024", 1, 0.9, by_layer={"5": {"recall_at_2": 0.9}}),
+                _report("Lx-ko-p1024", [1, 2], 0.5, by_layer={"5": {"recall_at_2": 0.5}}),
+            ],
+            k=2,
+        )["ko-p1024"]
+        assert got["lookaheads"] == [1]
+        assert got["reason"] == "only one lookahead measured"
+
+
+class TestLookaheadPairAcrossDomains:
+    """Two domains per lookahead is the runner's default, and it must not silently pool.
+
+    Keying by lookahead alone made the last report win: with code at 0.9 and text at 0.1
+    the comparison reported 0.1 for both arms and "not better at 1", presented in the
+    report as the answer to ticket 07. Accuracy is a property of the content's routing, so
+    the domains are separate results and the comparison is per domain.
+    """
+
+    def _layers(self, recall):
+        return {
+            "5": {"recall_at_1": recall, "recall_at_2": recall, "count_error": 0.1},
+            "6": {"recall_at_1": recall, "recall_at_2": recall, "count_error": 0.1},
+        }
+
+    def test_each_domain_is_compared_against_its_own_other_arm(self):
+        got = lookahead_pair(
+            [
+                _report("L1-code-p1024", 1, 0.90, by_layer=self._layers(0.90)),
+                _report("L2-code-p1024", 2, 0.80, by_layer=self._layers(0.80)),
+                _report("L1-text-p2048", 1, 0.10, by_layer=self._layers(0.10)),
+                _report("L2-text-p2048", 2, 0.05, by_layer=self._layers(0.05)),
+            ],
+            k=1,
+        )
+        assert set(got) == {"code-p1024", "text-p2048"}
+        assert got["code-p1024"]["common"]["recall_at_1"] == {1: 0.9, 2: 0.8}
+        assert got["text-p2048"]["common"]["recall_at_1"] == {1: 0.1, 2: 0.05}
+        assert got["code-p1024"]["better_at_1"] is True
+        assert got["text-p2048"]["better_at_1"] is True
+
+    def test_a_domain_with_only_one_arm_is_reported_as_such_not_dropped(self):
+        """Silence would read as "the comparison says nothing", which is not the same."""
+        got = lookahead_pair(
+            [
+                _report("L1-code-p1024", 1, 0.9, by_layer=self._layers(0.9)),
+                _report("L2-code-p1024", 2, 0.8, by_layer=self._layers(0.8)),
+                _report("L1-text-p2048", 1, 0.5, by_layer=self._layers(0.5)),
+            ],
+            k=1,
+        )
+        assert got["text-p2048"]["lookaheads"] == [1]
+        assert got["text-p2048"]["common"] is None
+        assert got["text-p2048"]["reason"] == "only one lookahead measured"
+
+    def test_three_lookaheads_compare_the_two_shortest_and_say_so(self):
+        """The runner's own default is `LOOKAHEADS="1 2 3"`, which used to raise and be
+        swallowed by both callers, so the deliverable table vanished without a word."""
+        got = lookahead_pair(
+            [
+                _report("L1-ko-p1024", 1, 0.9, by_layer=self._layers(0.9)),
+                _report("L2-ko-p1024", 2, 0.8, by_layer=self._layers(0.8)),
+                _report("L3-ko-p1024", 3, 0.7, by_layer=self._layers(0.7)),
+            ],
+            k=1,
+        )
+        assert got["ko-p1024"]["lookaheads"] == [1, 2]
+        assert got["ko-p1024"]["ignored_lookaheads"] == [3]
+        assert got["ko-p1024"]["common"]["recall_at_1"] == {1: 0.9, 2: 0.8}

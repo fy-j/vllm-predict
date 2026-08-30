@@ -23,7 +23,12 @@ set -euo pipefail
 # with nothing but an "Unknown vLLM environment variable" warning to show for it.
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-loaded=$(python3 -c "import vllm; print(vllm.__file__)" 2>/dev/null || true)
+# The venv, not system python3: the bench client needs the bench extra's pandas, which
+# lives only there and disappeared with a pod restart, and `vllm serve` would leave the
+# working tree off sys.path entirely.
+PY_BIN="${PY_BIN:-$REPO_ROOT/.venv/bin/python}"
+[[ -x "$PY_BIN" ]] || PY_BIN=python3
+loaded=$("$PY_BIN" -c "import vllm; print(vllm.__file__)" 2>/dev/null || true)
 case "$loaded" in
   "$REPO_ROOT"/*) : ;;
   *) echo "[FATAL] vLLM resolves to '$loaded', not $REPO_ROOT." >&2
@@ -34,7 +39,7 @@ echo "[env] vLLM from $loaded"
 
 # The dump is driven by an environment variable the running build must know
 # about; an unrecognised one is a warning, not an error, so check it here.
-python3 -c "
+"$PY_BIN" -c "
 import sys, vllm.envs as e
 sys.exit(0 if 'VLLM_PREDICTIVE_ACCURACY_DUMP_PATH' in e.environment_variables else 1)
 " || { echo "[FATAL] this build does not register the accuracy dump variable." >&2; exit 4; }
@@ -44,6 +49,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 MODEL="${MODEL:-/models/preset/Qwen/Qwen3-30B-A3B/v1.0}"
 PORT="${PORT:-8140}"
 LOOKAHEADS="${LOOKAHEADS:-1 2 3}"
+# Data-parallel size. 8 is where the recorded accuracy figures come from; a smaller value
+# runs and is warned about at startup, and for a *lookahead comparison* what matters is
+# that both arms see the same prompts on the same node rather than the absolute number.
+DP="${DP:-8}"
+# Which prompt shapes. Accuracy is a property of the content's routing, so the domain is
+# part of the result; `ko` is the highest-imbalance domain measured and needs no rebuild.
+DOMAINS="${DOMAINS:-code text}"
 SKIP_FIRST="${SKIP_FIRST:-3}"
 OUTPUT_LEN="${OUTPUT_LEN:-128}"
 NUM_PROMPTS="${NUM_PROMPTS:-32}"
@@ -63,25 +75,28 @@ echo "[accuracy] lock acquired"
 # identity, which here is a local path rather than the HuggingFace id the
 # canonical profile records.
 PROFILE="$OUT_DIR/cost-profile-local.json"
-python3 - "$HERE/results/cost-profile.json" "$PROFILE" "$MODEL" <<'PY'
-import json, sys
-src, dst, model = sys.argv[1], sys.argv[2], sys.argv[3]
+"$PY_BIN" - "$HERE/results/cost-profile.json" "$PROFILE" "$MODEL" "$DP" <<'PYEOF'
+import json, subprocess, sys
+src, dst, model, ep = sys.argv[1:5]
 profile = json.load(open(src))
-profile["fingerprint"]["model"] = model
+device = subprocess.check_output(
+    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True
+).splitlines()[0].strip()
+profile["fingerprint"].update(model=model, ep_size=int(ep), device_name=device)
 json.dump(profile, open(dst, "w"), indent=2)
-print(f"[accuracy] cost profile for {model} -> {dst}")
-PY
+print(f"[accuracy] cost profile for {model} at EP={ep} on {device} -> {dst}")
+PYEOF
 
 # Prompts at the two agreed shapes, paired with the domain whose natural length
 # already fits: code near 1k, conversational text near 2k.
-declare -A DATASET=( [code]="likaixin/InstructCoder" [text]="Aeala/ShareGPT_Vicuna_unfiltered" )
-declare -A PROMPT_LEN=( [code]=1024 [text]=2048 )
-for domain in code text; do
+declare -A DATASET=( [code]="likaixin/InstructCoder" [text]="Aeala/ShareGPT_Vicuna_unfiltered" [ko]="beomi/KoAlpaca-v1.1a" )
+declare -A PROMPT_LEN=( [code]=1024 [text]=2048 [ko]=1024 )
+for domain in $DOMAINS; do
   # Shared across runs rather than copied per out_dir: 2 MB each, identical.
   prompts="$HERE/results/prompts-$domain-p${PROMPT_LEN[$domain]}.jsonl"
   if [[ ! -s "$prompts" ]]; then
     echo "[accuracy] building ${PROMPT_LEN[$domain]}-token $domain prompts"
-    python3 "$HERE/make_prompts.py" \
+    "$PY_BIN" "$HERE/make_prompts.py" \
       --dataset "${DATASET[$domain]}" --tokenizer "$MODEL" \
       --target-prompt-len "${PROMPT_LEN[$domain]}" --tolerance 0.10 \
       --num-prompts 64 --out "$prompts" \
@@ -98,7 +113,7 @@ for lookahead in $LOOKAHEADS; do
 
   # The predictive controller is configured through additional_config, not a
   # dedicated flag.
-  ADDITIONAL_CFG=$(python3 -c "
+  ADDITIONAL_CFG=$("$PY_BIN" -c "
 import json,sys
 print(json.dumps({'predictive_expert_replication': {
   'enabled': True,
@@ -114,10 +129,10 @@ print(json.dumps({'predictive_expert_replication': {
   # "num_redundant_experts is set to 8 but EPLB is not enabled". A single API
   # server has no such round trip, and this is the form ticket 03 validated with.
   VLLM_PREDICTIVE_ACCURACY_DUMP_PATH="$DUMP" \
-  python3 -m vllm.entrypoints.openai.api_server \
+  "$PY_BIN" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --port "$PORT" \
-    --data-parallel-size 8 \
+    --data-parallel-size "$DP" \
     --enable-expert-parallel \
     --all2all-backend allgather_reducescatter \
     --enforce-eager \
@@ -145,15 +160,12 @@ print(json.dumps({'predictive_expert_replication': {
   fi
   echo "[accuracy] lookahead=$lookahead: ready"
 
-  for domain in code text; do
-    case "$domain" in
-      code) prompt_len=1024 ;;
-      text) prompt_len=2048 ;;
-    esac
+  for domain in $DOMAINS; do
+    prompt_len="${PROMPT_LEN[$domain]}"
     prompts="$HERE/results/prompts-$domain-p$prompt_len.jsonl"
     tag="L$lookahead-$domain-p$prompt_len"
     echo "[accuracy] $tag: $NUM_PROMPTS requests"
-    vllm bench serve \
+    "$PY_BIN" -m vllm.entrypoints.cli.main bench serve \
       --backend openai-chat --endpoint /v1/chat/completions \
       --model "$MODEL" --port "$PORT" \
       --dataset-name custom --dataset-path "$prompts" \
@@ -188,7 +200,7 @@ echo "[accuracy] scoring"
 for dump in "$OUT_DIR"/dump-L*.jsonl; do
   [[ -s "$dump" ]] || continue
   label="$(basename "$dump" .jsonl | sed 's/^dump-//')"
-  python3 "$HERE/prediction_accuracy.py" --dump "$dump" --ks 1 2 4 8 \
+  "$PY_BIN" "$HERE/prediction_accuracy.py" --dump "$dump" --ks 1 2 4 8 \
     --label "$label" --out "$OUT_DIR/accuracy-$label.json" >/dev/null 2>&1 \
     && echo "[accuracy] $label scored" \
     || echo "[accuracy] $label SCORING FAILED" >&2

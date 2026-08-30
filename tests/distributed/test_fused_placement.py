@@ -343,3 +343,50 @@ def test_the_fused_plan_agrees_at_the_real_expert_geometries(ep_size, per_rank):
         )
         assert publish.tolist() == want_publish.tolist()
         assert int(spent) == int(want_spent) and int(placed) == int(want_placed)
+
+
+def test_an_empty_snapshot_places_nothing_rather_than_failing_to_compile():
+    """`plan_replicas` returns no placement for this, so the fused path must not crash.
+
+    A dummy or padding-only forward is the case, and it is the one the retained planner
+    names in its own docstring. With no experts `per_rank` is 0 and the kernel would fail
+    to compile on `tl.arange(0, 0)` — a crash where the tensor version places nothing.
+    """
+    device = torch.device("cuda")
+    transfer = torch.full((4,), 7, dtype=torch.int64, device=device)
+    publish = torch.full((4,), 7, dtype=torch.int64, device=device)
+    plan_and_charge_fused(
+        torch.zeros(0, dtype=torch.int32, device=device),
+        torch.tensor([-1, -1], dtype=torch.int64, device=device),
+        torch.tensor(43, dtype=torch.int64, device=device),
+        torch.zeros((), dtype=torch.int64, device=device),
+        torch.zeros((), dtype=torch.int64, device=device),
+        transfer,
+        publish,
+        EP_SIZE,
+        MIN_TOKENS,
+    )
+    assert transfer.tolist() == [0, 0, 0, 0]
+    assert publish.tolist() == [0, 0, 0, 0]
+
+
+def test_a_strided_snapshot_is_refused_rather_than_read_wrong():
+    """The kernel indexes the load directly, so a non-contiguous view would read garbage.
+
+    The tensor planner it replaces handles any stride, and every equality test above
+    builds contiguous tensors — so this is exactly the difference a test would not catch.
+    """
+    device = torch.device("cuda")
+    strided = torch.zeros((NUM_LOGICAL, 2), dtype=torch.int32, device=device)[:, 0]
+    with pytest.raises(ValueError, match="unit innermost stride"):
+        plan_and_charge_fused(
+            strided,
+            torch.tensor([-1, -1], dtype=torch.int64, device=device),
+            torch.tensor(43, dtype=torch.int64, device=device),
+            torch.zeros((), dtype=torch.int64, device=device),
+            torch.zeros((), dtype=torch.int64, device=device),
+            torch.zeros(4, dtype=torch.int64, device=device),
+            torch.zeros(4, dtype=torch.int64, device=device),
+            EP_SIZE,
+            MIN_TOKENS,
+        )

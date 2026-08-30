@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
 """Move one expert's weights with a one-sided put, so the host never learns the plan.
 
 Ticket 05. The host currently stalls once per predicted layer, and it is structural

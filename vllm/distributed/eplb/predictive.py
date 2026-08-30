@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Cross-layer predicted-load estimation for Predictive expert replication.
 
 The current sparse MoE evaluates the *next* sparse MoE's gate and router on its own

@@ -17,8 +17,10 @@ is why ticket 02 rejects `lookahead = 1` until now.
 
 **Blocked by:** 06 — No host synchronisation on the per-forward path.
 
-**Status:** implemented 2026-08-30, measured at DP=2. Two criteria need a profile and an
-accuracy run and are listed at the bottom with what they need.
+**Status:** DONE 2026-08-30, all criteria measured at DP=2. The launch moved, `lookahead=1`
+is the default and predicts 8% better on the planner's own metric, and the profile found the
+cost centre the ticket did not expect — 132 kernels per placed layer, since fused to 2. What
+remains for the *feature* is a DP=8 re-measurement, which is ticket 08's, not this one's.
 
 - [x] The launch is issued at the predicting layer's MoE tail and the wait at the target
       layer's MoE head, with at least one Attention block of compute between them.
@@ -63,8 +65,24 @@ accuracy run and are listed at the bottom with what they need.
       excess it removes unchanged at 34.5-36.5%. The barrier then measured 0.23 ms rather
       than 4.40 — it had been exposing the launch storm's arrival skew rather than costing
       anything itself. Details and the per-kernel tables in `bench/RESULTS.md`.
-- [ ] Prediction accuracy at lookahead 1 is reported against lookahead 2. **Needs an
-      accuracy run** (`run_prediction_accuracy.sh`), which wants the GPUs to itself.
+- [x] Prediction accuracy at lookahead 1 is reported against lookahead 2, and it is better
+      on every metric. Korean prompts at 1024 tokens, DP=2, 1584 and 1548 samples:
+      **`peak_hit_rate` (= recall@1) 0.7702 against 0.7132**, recall@2 0.8166 against
+      0.7629, and `count_error` **0.0925 against 0.1269** — 8% better on the figure the
+      planner depends on and 27% less total-variation error. Recall@1 is that figure
+      because `max_replicas_per_layer` defaults to 1: the planner picks one expert, so what
+      it needs is that the one it would choose is the one that actually ran hottest.
+      `accuracy_report.py`'s `PLANNER_K` said 2 and is corrected, since it was the report's
+      headline and the cap changed under it.
+
+      Compared on the 43 target layers both arms cover, because lookahead 1 reaches target
+      layer 4 and lookahead 2 does not, and early layers are what a skip decision is about.
+      It barely matters here — 0.767 common against 0.770 pooled — which is itself worth
+      knowing: the improvement is not an artifact of layer coverage. `lookahead_pair()`
+      does the restriction, with tests for the two cases worth pinning.
+
+      So lookahead 2 cost 8% of the planner's operative accuracy to buy the host planner a
+      layer of latency, and the device path does not need it.
 - [x] The baseline from ticket 06 is held or improved. At DP=2 — this node's 8 GPUs became 2
       on 2026-08-30 — the reachable layer count went from 43 to **44**, since a lookahead of
       1 leaves one fewer trailing layer unbound, and all of them launch a transfer. The

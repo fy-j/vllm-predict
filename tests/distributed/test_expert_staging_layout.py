@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """How one expert's weight tensors pack into the shared staging workspace.
 
 Ticket 05. A one-sided put moves bytes into a peer's staging buffer, and the peer then

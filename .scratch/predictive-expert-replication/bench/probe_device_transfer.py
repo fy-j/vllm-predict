@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Does the kernel-issued transfer land the right bytes, from a plan never read on host?
 
 Ticket 06's transfer half, verified the way ticket 05's was: the production classes over

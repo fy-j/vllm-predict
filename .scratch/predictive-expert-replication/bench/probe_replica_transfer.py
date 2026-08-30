@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Does the production transfer path land the right bytes on 8 real ranks?
 
 Ticket 05's distributed acceptance. `tests/distributed/test_replica_transfer.py` drives

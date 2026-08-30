@@ -326,7 +326,22 @@ class PlacementCoordinator:
         # layers between here and the target rather than serializing into the forward.
         if self.stream is not None:
             self.communicator.set_stream(self.stream)
+        # And it has to be ordered *behind* what the compute stream has already
+        # enqueued. `transfer_replicas` drains into a replica row, and the previous
+        # forward's MoE kernel may still be reading that row: nothing in stream ordering
+        # connects the two otherwise, and since `activate` became a stream wait rather
+        # than a host block the CPU runs further ahead, widening the window rather than
+        # closing it. Recorded on the compute stream explicitly and before entering the
+        # other one, because `record()` takes the *current* stream — inside
+        # `torch.cuda.stream(self.stream)` that is the predictive stream and the wait
+        # would be on its own work. The device path had exactly that bug.
+        compute = torch.cuda.current_stream() if self.stream is not None else None
+        if compute is not None:
+            barrier = self._event_factory()
+            barrier.record(compute)
         with self._transfer_stream():
+            if compute is not None:
+                self.stream.wait_event(barrier)
             transfer_replicas(
                 to_transfer,
                 expert_weights=self.expert_weights,

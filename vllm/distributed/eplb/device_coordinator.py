@@ -47,7 +47,11 @@ logger = init_logger(__name__)
 # produces the line the runners look for. Lowerable, because it is the only evidence
 # that a replica was placed at all and a functional run is a few forwards long — at 50
 # a smoke test cannot tell a working path from an inert one.
-_REPORT_EVERY = int(os.environ.get("VLLM_PREDICTIVE_PLACEMENT_REPORT_EVERY", "50"))
+# 0 means never, which is the natural spelling for it and used to raise
+# `ZeroDivisionError` on the first MoE layer of the first forward.
+_REPORT_EVERY = max(
+    int(os.environ.get("VLLM_PREDICTIVE_PLACEMENT_REPORT_EVERY", "50")), 0
+)
 
 # Debug only: tells a crash inside the transfer apart from one in everything
 # around it. Left in because that distinction took three server runs to make.
@@ -231,7 +235,7 @@ class DevicePlacementCoordinator:
         self._forward_id += 1
         self._suppressed = tokens_per_expert <= self.min_tokens_per_expert
         self._forwards += 1
-        if self._forwards % _REPORT_EVERY == 0:
+        if _REPORT_EVERY and self._forwards % _REPORT_EVERY == 0:
             logger.info(
                 "Predictive expert replication: activated %d device-issued replica(s) "
                 "over %d forwards.",
@@ -393,6 +397,13 @@ class DevicePlacementCoordinator:
             per_rank_experts=self.canonical_per_rank,
             replica_slots_per_rank=self.replica_slots_per_rank,
             source_rank=self.ep_rank,
+            # The same slot the transfer wrote into. Omitting it published row
+            # `per_rank_experts + 0` while `drain_expert` wrote
+            # `replica_row_of(canonical_per_rank, slot)`, so at any slot but 0 routing
+            # would point at an unwritten row with the weights one row over, and nothing
+            # would raise. Unreachable while `replica_slots_per_rank` is validated to 1,
+            # which is exactly how a trap like this survives.
+            slot=self.slot,
         )
         # The source-local count is all-ones invariantly — that *is* source-rank
         # routing: one copy on offer, so a rank's chunk cannot be split — so it is set

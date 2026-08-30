@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0 SPDX-FileCopyrightText: Copyright contributors to
-# the vLLM project
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The one-sided transfer lands the expert, in the right order, within its byte budget.
 
 Ticket 05. The engine under test moves one expert into a peer's replica row without the
