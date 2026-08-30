@@ -2910,3 +2910,236 @@ never predict at all, so this says nothing about *them*; what it does say is tha
 layers that do predict, the earliest are not the weak ones on this domain. Whether the skip
 can be reduced from 3, and buy coverage, is a separate measurement that would have to let
 those layers predict.
+
+---
+
+# 2026-08-30 (night) — ticket 06's 8-GPU close-out, and prediction turns out to be the cost
+
+## Environment
+
+| Item | Value |
+| --- | --- |
+| Node | **8x NVIDIA H100 80GB HBM3**, NV18 between all pairs (full NVSwitch) |
+| Note | the node had 2 GPUs earlier the same day; it has 8 again. Check `nvidia-smi`, not a document |
+| Build | this tree, editable, torch 2.13.0+cu130, CUDA 13.0; `vllm` resolves inside the repo |
+| Model | `/models/preset/Qwen/Qwen3-30B-A3B/v1.0`, BF16, 48 MoE layers, 128 experts, top_k 8 |
+| Config | DP=EP=8, TP=1, eager, `allgather_reducescatter`, `max-model-len` 3072, `gpu-memory-utilization` 0.88 |
+| Feature | `device_issued_transfer=True`, `prediction_lookahead_layers=1`, `max_replicas_per_layer=1`, fused placement kernels |
+| Driver | `run_t06_close_out.sh`, three stages in one process so the tree is identical across them |
+
+## Stage 1 — correctness of a *dynamically* placed replica, which nothing had checked
+
+`REAL=1 VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS=1 run_device_transfer_smoke.sh`.
+
+    device path armed on 8 worker(s), launched on 352 layer(s)   = 44 layers x 8 ranks
+    replicas actually placed (device counter): 32
+    host-path fallbacks: 0    crash signatures: 0
+
+Two log lines, and the pair is the point:
+
+    compared 0 replicated (layer, expert) pairs; ... No replicas are placed, so this
+      check is vacuous.                                            <- startup, as before
+    verified 4 dynamically placed replica (layer, expert) pairs hold their canonical
+      weights.                                                     <- new, per forward
+
+**Real weights are required for this to mean anything.** Under `--load-format dummy` every
+expert row holds the same values, so a replica pointing at the wrong row passes. The new check
+is off by default because it all-gathers and reads the result on the host.
+
+## Stage 2 — the criterion: 26.2% of full-prefill excess, on every reachable layer
+
+`ko`, 400 requests, CONC=8, OUT_LEN=1, arms `off 0 43` — the operating point the 24.0% was
+recorded at, because that is what reproducing it means.
+
+| band | forwards | critical path | excess removed |
+| --- | --- | --- | --- |
+| full prefill | 50 / 50 | 1.8901 -> 1.6571 | **26.2%** |
+| partial prefill | 50 / 50 | 1.8927 -> 1.7239 | 18.9% |
+
+`connected: true`, 400/400 requests on each arm, 0 failed. Coverage **44 of 44** reachable
+layers — targets 4 to 47, no gap, 352 launch lines = 44 x 8. 50 full-prefill forwards per arm
+against the 15/13 the original 24.0% rested on.
+
+Three arms from the same run. **CONC=8 is recorded as unable to resolve a 5% effect, so read
+direction only:**
+
+| arm | mean TTFT | median | p99 | req/s | vs stock |
+| --- | --- | --- | --- | --- | --- |
+| stock | 141.41 ms | 135.49 | 356.22 | 56.37 | — |
+| prediction only | 168.44 ms | 164.73 | 247.92 | 47.35 | **+19.1%** |
+| placing | 176.02 ms | 170.11 | **245.08** | 45.30 | +24.5% |
+
+**Placing costs +4.5% over prediction only**, where the host path cost +22.1% over it on
+2026-08-29 (242.79 against 198.81). That is ticket 06's claim, measured. The placing arm's p99
+is 245 ms against stock's 356.
+
+## Stage 3 — occupancy, and why the metric is the wrong instrument at DP=8
+
+Knee operating point (CONC=16, NUM_PROMPTS=128, OUT_LEN=4), the same shape as the
+2026-08-29 `knee16-profile` it is compared against, so one tool reads both. Medians across 8
+ranks, `bench/window_occupancy.py`:
+
+| arm | wall | occupancy | occupancy ex-nccl | gaps >0.5 ms | expert GEMM per 1k ctx |
+| --- | --- | --- | --- | --- | --- |
+| host path, stock | 91.8 ms | 84.4% | 23.4% | 4.74 ms | 7347 us |
+| host path, prediction | 110.3 ms | 87.7% | 21.9% | 4.08 ms | 8420 us |
+| host path, placing | 126.9 ms | 69.7% | 13.7% | 5.70 ms | 3764 us |
+| device path, stock | 88.9 ms | **86.7%** | 30.2% | 3.86 ms | 7044 us |
+| device path, prediction | 106.9 ms | 89.9% | 22.0% | 4.32 ms | 8506 us |
+| device path, placing | 109.1 ms | **41.8%** | 16.7% | **3.52 ms** | 4278 us |
+
+**Stock reproduces the 86.8% reference at 86.7%**, which is what makes the row below readable.
+**Placing measures 41.8% against the reference's 52.9%** — worse, on a ticket whose whole
+purpose was to raise it.
+
+It is the metric. Per rank, occupancy tracks time spent inside `ncclDevKernel` almost exactly:
+
+    dp3  occ 20.9%   nccl 12.46 ms        dp2  occ 87.9%   nccl 58.45 ms
+    dp6  occ 27.5%   nccl 10.95 ms        dp0  occ 70.8%   nccl 50.57 ms
+
+A rank blocked in a collective waiting for a peer is *busy* by kernel-time accounting and idle
+in fact, so raw occupancy rewards arriving early. This is the same lesson as "a collective's
+duration is mostly a measurement of what the other rank was doing", applied to occupancy rather
+than to a barrier — the third time this shape has appeared on this branch.
+
+What host starvation actually looks like is long holes, and there the placing arm **wins**:
+gaps over 0.5 ms are **3.52 ms**, below stock's own 3.86 ms on the same node and the same day,
+and below the host path's 5.70 ms. The largest single gap is ~3.3 ms on every rank of every arm;
+the 11.02 ms `cudaEventSynchronize` of the host-sync era is gone.
+
+**The 86.8% / 52.9% / 30.2 ms reference is a 5090 measurement**, taken 2026-08-26, three days
+before this node existed. The criterion names those numbers so they are reported against, but
+the only sound comparison is host path against device path on *this* node with *this* tool:
+placing occupancy **69.7% -> 41.8%** while its gaps over 0.5 ms go **5.70 ms -> 3.52 ms**.
+Occupancy fell and idleness fell with it. Both stock arms differ across the two days too
+(84.4% against 86.7% raw, 23.4% against 30.2% ex-nccl), which is the run-to-run floor on any
+cross-run profile comparison here.
+
+### The direct measurement, which is what the ticket should have asked for
+
+Host-side synchronisation per profile, summed over 8 ranks:
+
+| | `cudaEventSynchronize` | `cudaStreamSynchronize` |
+| --- | --- | --- |
+| host path, placing | **7293** calls, 8417.18 ms, p50 73.2 us, max 425.9 ms | **38672** calls, 285.05 ms |
+| device path, placing | **1081** calls, 1642.55 ms, p50 5.7 us, max 59.4 ms | **8** calls, 0.07 ms |
+| device path, stock | 1072 calls, 1819.81 ms, p50 5.6 us, max 30.7 ms | 8 calls, 0.07 ms |
+
+**Placement performs the same number of host event synchronisations as a stock server**, 1081
+against 1072. `cudaStreamSynchronize` falls from 38672 to 8 — the per-layer stream syncs are
+gone entirely, not reduced. This is "no host synchronisation on the per-forward path" measured
+against an external reference instead of against itself.
+
+## The live surprise: prediction is not free at 8 ranks, and DP=2 could not have shown it
+
+`CLAUDE.md` recorded prediction at **-0.2%** after the fused kernels. That was DP=2. At DP=8,
+same code, same lookahead, same kernels, it is **+19.1%**. The profile says why — per prefill
+window, medians across ranks:
+
+| arm | window wall | token collectives | expert GEMM |
+| --- | --- | --- | --- |
+| stock | 88.9 ms | **47.3 ms** | 9.79 ms |
+| prediction only | 106.9 ms | **82.4 ms** | 8.32 ms |
+
+Prediction adds ~2 ms of GPU work and **+35.1 ms of collective residency**, with the same byte
+volume and the same number of collectives. That is the desynchronisation signature recorded at
++39.9 ms before: the extra launches push 8 ranks' arrival at the next collective apart and the
+collective absorbs the skew. **Two ranks have almost no arrival skew to amplify**, so DP=2
+measures prediction as free and DP=8 measures it as the dominant cost. `CLAUDE.md`'s warning
+that no measured figure survives a change of EP size held — for the most optimistic figure on
+the branch.
+
+The cost centre has now moved three times: host synchronisation (`06`) -> launch dispatch
+(`07`'s fused kernels) -> **prediction's own per-layer collectives and launches**, which is the
+one thing none of `03`, `06` or `07` touches, because it is what predicting *means*.
+
+## A recorded claim that does not survive the per-rank view
+
+"Balancing shortens the expert GEMM from 10.01 ms to 6.88 ms, a 3.13 ms saving against a
+4.70 ms ceiling, so the placement recovers 67% of the ceiling — the first direct sight of this
+feature doing the thing it was built to do."
+
+Within a **single** arm, expert GEMM per 1000 prefill tokens spans **4696 to 10134 us** across
+the 8 ranks — a 2.2x spread, wider than the ~2x difference between arms. By
+`report_arm_spread.py`'s own rule — if an arm's own spread exceeds the difference between arms,
+the run says nothing — this profile does not resolve the expert-GEMM benefit. Median across
+ranks hides it, which is how the figure was produced. The 26.2% excess figure is measured on
+token counts from the load dump and is unaffected.
+
+Also visible and unexplained: the prediction-only arm's expert GEMM per 1k ctx is *higher* than
+stock's (8506 against 7044 us) on work that should be identical. Prediction does not change
+routing. The 17-row layout is the obvious suspect and it is not established here.
+
+## Two pieces of tooling, and one process failure
+
+`bench/window_occupancy.py` (22 unit tests). The 86.8% / 52.9% figures came from ad-hoc
+analysis that was never saved, so ticket 06's criterion had no instrument. Busy time is the
+**union** of kernel intervals, never the sum — summing overlapping streams is what once
+reported the expert GEMM at 10.76% of a step where wall-clock puts it at 14.29%. Windows come
+from the runner's `execute_context` annotation. `occupancy_ex_nccl` is the work-versus-waiting
+split, and `expert_gemm_us_per_1k_ctx` normalises across arms whose window shapes differ, which
+the placed arm's do: 18-25 windows per rank against 11-13.
+
+`VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS`, above.
+
+**The process failure: the first excess run was invalidated by editing the tree while it was in
+flight.** `vllm/envs.py` gained a variable and `eplb_state.py` gained a read of it; the placing
+arm's server started between the two edits, every worker raised `AttributeError`, and 392 of
+400 requests failed. The guard reported `NO PLACEMENT LOG LINE ... arm was inert`, which is
+exactly its job. The successful run used one driver for all three stages. **A server starts per
+arm, so a tree edit mid-run changes the code under later arms and not earlier ones** — the
+worst possible shape for a measurement.
+
+## The knee, DP=8, with a 0.3% ruler: placement pays and prediction does not
+
+The measurement above at CONC=8 cannot resolve a 5% effect, so the three arms were re-run at
+the knee — `ko`, 512 requests, CONC=16, OUT_LEN=1, three passes, arms interleaved within each
+pass — which is the method `report_arm_spread.py` exists for.
+
+| arm | n | mean TTFT | median | p99 | req/s | own spread | vs stock |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| stock | 3 | 167.53 ms | 160.58 | 307.47 | 94.07 | **0.3%** | — |
+| prediction only | 3 | 190.19 ms | 183.90 | 303.92 | 83.14 | 4.1% | **+13.5%** |
+| placing | 3 | **183.24 ms** | 172.21 | 307.98 | 86.08 | 3.1% | **+9.4%** |
+
+**The baseline's own spread is 0.3%**, the tightest this project has had — against 4.9% at the
+same point in August and 28-56% at the points used before that. So both effects are far above
+the drift and the verdict line reads "readable".
+
+**Placing is faster than prediction only, by 6.95 ms.** The two arms differ in nothing but the
+transfer budget, so that difference is placement's own contribution and its sign is **negative
+cost**: placement gives back 4.1 points of the 13.5 that prediction spends. p99 is flat across
+all three arms (304-308 ms), so this is not a tail trade, and throughput moves with it
+(83.14 -> 86.08 req/s).
+
+Excess removed in the same run, per repeat, full-prefill band:
+
+| repeat | forwards | critical path | excess removed |
+| --- | --- | --- | --- |
+| 1 | 33 / 32 | 1.8909 -> 1.6508 | **27.0%** |
+| 2 | 33 / 33 | 1.8908 -> 1.6544 | **26.5%** |
+| 3 | 33 / 33 | 1.8895 -> 1.6522 | **26.7%** |
+
+A 0.5-point spread across three passes, `connected: true` and 0 failed requests on every one.
+
+### The arithmetic, at last on one ruler
+
+    expert GEMM share of a stock prefill window       11.16%   (wall-clock, measured today)
+    recoverable share of MoE time at cp 1.8901        47.09%
+    -> perfect balance is worth                        5.26%  of a prefill window = 4.68 ms
+    placement returned                                 6.95 ms of mean TTFT
+    -> TTFT spans roughly two prefill windows here, so about 3.5 ms per window,
+       which is about 70-80% of the ceiling
+
+    prediction alone costs                           +13.5%  = 2.6x the entire ceiling
+    prediction + placement                            +9.4%
+
+**So the two halves of this feature have opposite verdicts, and that is new.** Placement works
+and captures most of the headroom that exists. Prediction — 44 gate GEMMs, 44 AllGathers and
+their launches per forward — costs 2.6x everything perfect balance could ever return, and it is
+the mechanism that creates the window placement needs. The feature is net negative because of
+its enabling half, not its acting half.
+
+The step from "roughly two prefill windows per TTFT" is an inference from the 88.9 ms window
+against the 167.53 ms mean TTFT, not a measurement, and it is the one soft link in the chain
+above. The excess figures and the TTFT figures either side of it are direct.

@@ -300,6 +300,7 @@ if TYPE_CHECKING:
     VLLM_EPLB_DUMP_LOAD_PATH: str | None = None
     VLLM_PREDICTIVE_ACCURACY_DUMP_PATH: str | None = None
     VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS: bool = False
+    VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS: bool = False
     VLLM_PREDICTIVE_PLACE_PER_FORWARD: int = 0
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -2061,6 +2062,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # logical expert. Off by default because it synchronizes with the host.
     "VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS": lambda: bool(
         int(os.getenv("VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS", "0"))
+    ),
+    # Verification: every forward, compare position-weighted checksums of each
+    # logical expert's physical copies, so a *placed* replica is proven to hold the
+    # bytes it claims. The startup check runs before anything is placed and reports
+    # zero pairs. Off by default, and **never enable it during a measurement run**:
+    # it all-gathers, reads the result on the host, and walks every expert row of
+    # every layer, so it costs far more than the effects this feature is measured by.
+    # It is deliberately unconditional rather than sampled every N forwards, because
+    # the all_gather is collective and a per-rank interval counter near a collective
+    # is this branch's most expensive class of bug.
+    "VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS": lambda: bool(
+        int(os.getenv("VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS", "0"))
     ),
     # Bring-up arm for in-forward placement; 0 is off. The transfer budget itself
     # comes from `max_transfers_per_forward`, per the spec — this only decides whether

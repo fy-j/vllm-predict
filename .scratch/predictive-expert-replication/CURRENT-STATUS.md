@@ -20,9 +20,12 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 
 - Branch: `feature/predictive-expert-replication`
 - Original vLLM base: `10704541aaf72567fe9d6229b3e3d84d37f2ddba`
-- Tickets `01` `02` `03` `04` `05` `10` implemented and closed, and `06` is implemented and
-  running end to end with two measurements outstanding that need 8 GPUs. `00` answered for
-  both regimes. `11` `12` open. `07` `08` `09` unstarted.
+- Tickets `01` `03` `04` `05` `06` `07` are **done**; `02` is 3 of 5, with the byte bound
+  (`max_concurrent_transfer_bytes`) still declared and never read. `08` is
+  ready-for-agent and is the ticket that decides the project; `09` is ready-for-agent,
+  terminal and off the mainline; `10` waits on `08`. `00` answered for both regimes.
+  (This line previously mixed the superseded `00`-`14` numbering into the current
+  `01`-`10` set, and said `07` was unstarted while it was done.)
 - The feature runs end to end and is **correct**: replicas are transferred, published
   where routing reads, routed to, and reverted. It removes about **15% of prefill
   critical-path excess** against an oracle of 35%.
@@ -30,6 +33,204 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
   configurations, TPOT +7%.
 - **The cost is host synchronisation, not the transfers.** See the section below
   before touching anything.
+
+## Ticket 06 closed on 8 GPUs, 2026-08-30 night: placement is no longer the cost
+
+**This node has 8 H100s again** — 8x H100 80GB HBM3, NV18 between all pairs — after a spell
+with 2. Every claim below is DP=EP=8. Ticket `06`'s two outstanding criteria are measured and
+it is **17 of 17**.
+
+**Criterion: at least 24.0% of full-prefill critical-path excess removed, on every reachable
+layer.** Measured **26.2%**, at the operating point the 24.0% was recorded at (`ko`, 400
+requests, CONC=8, OUT_LEN=1):
+
+| band | forwards | critical path | excess removed |
+| --- | --- | --- | --- |
+| full prefill | 50 / 50 | 1.8901 -> 1.6571 | **26.2%** |
+| partial prefill | 50 / 50 | 1.8927 -> 1.7239 | 18.9% |
+
+Coverage is **44 of 44** reachable layers, targets 4 to 47 with no gap, 352 launches = 44 x 8
+ranks. `connected: true`, 400/400 requests on both arms, 0 failed. 50 full-prefill forwards per
+arm against the 15/13 the original figure rested on.
+
+**Criterion: GPU occupancy inside real forward windows.** Stock **86.7%**, which reproduces the
+86.8% reference almost exactly; prediction only 89.9%; placing **41.8%**, which is *below* the
+52.9% reference rather than above it. **That number does not mean what it looks like.** Per
+rank, occupancy tracks time spent inside `ncclDevKernel`: the ranks at 21-29% are the ones with
+11-12 ms of collective time and the ones at 88% have 58 ms. A rank blocked in a collective
+waiting for a peer is busy by kernel-time accounting and idle in fact, so raw occupancy rewards
+arriving early. The same lesson as "a collective's duration is mostly a measurement of what the
+other rank was doing", now applied to occupancy.
+
+What host starvation actually looks like is long gaps, and those say the opposite: **gaps over
+0.5 ms are 3.52 ms in the placing arm** against stock's own 3.86 ms on the same node and the
+same day. So the placing arm leaves *fewer* long holes than a stock server.
+
+**Read the 86.8% / 52.9% / 30.2 ms reference as cross-hardware, because it is.** Those figures
+were measured on the **5090** node on 2026-08-26; the H100 arrived on 08-29. The criterion names
+them, so they are reported, but the sound comparison is host path against device path on *this*
+node with *this* tool, and that one is: placing occupancy 69.7% -> 41.8% while its gaps over
+0.5 ms go 5.70 ms -> 3.52 ms. Occupancy fell and idleness fell with it, which is only
+contradictory if occupancy measures what its name suggests.
+
+**The ticket's headline, measured directly instead of through occupancy.** Per profile, 8 ranks:
+
+| | `cudaEventSynchronize` | `cudaStreamSynchronize` |
+| --- | --- | --- |
+| host path, placing | **7293** calls, 8417 ms, p50 73.2 us | **38672** calls, 285 ms |
+| device path, placing | **1081** calls, 1643 ms, p50 5.7 us | **8** calls, 0.07 ms |
+| device path, stock | 1072 calls, 1820 ms, p50 5.6 us | 8 calls |
+
+**Placement performs the same number of host event synchronisations as a stock server.** That
+is "no host synchronisation on the per-forward path" as a measurement against an external
+reference rather than against itself.
+
+**And the marginal cost matches.** Placing costs **+4.5%** mean TTFT over prediction only
+(176.02 against 168.44 ms), where the host path cost +22.1% over it on 2026-08-29 (242.79
+against 198.81). The placing arm's p99 is **245 ms against stock's 356**.
+
+**But prediction is not free at 8 ranks, and that is the live surprise.** Against a stock
+server at the same operating point, prediction only measured **+19.1%** (168.44 against
+141.41 ms) where DP=2 had recorded **-0.2%**. The mechanism is in the same profile — token
+collectives per prefill window grow **47.3 ms -> 82.4 ms** while the expert GEMM does not move
+(9.79 -> 8.32 ms). That is the recorded desynchronisation signature, +39.9 ms before, at 8
+ranks; 2 ranks have almost no arrival skew for extra launches to amplify. `CLAUDE.md`'s warning
+that **no measured figure for this feature survives a change of EP size** held, and it held for
+the most optimistic figure on the branch.
+
+So the cost centre has moved for the third time: host synchronisation -> launch dispatch ->
+**prediction's own per-layer collectives and launches**, which is the one thing neither `03`
+nor `06` nor `07` touches. Ticket `08` owns the verdict.
+
+### Re-measured at the knee with a 0.3% ruler: the two halves have opposite verdicts
+
+CONC=8 cannot resolve a 5% effect, so the three arms were re-run at the knee (`ko`, 512
+requests, CONC=16, OUT_LEN=1, three interleaved passes). **The stock arm's own spread across
+passes is 0.3%** — the tightest ruler this project has had, against 4.9% earlier in August:
+
+| arm | n | mean TTFT | p99 | req/s | own spread | vs stock |
+| --- | --- | --- | --- | --- | --- | --- |
+| stock | 3 | 167.53 ms | 307.47 | 94.07 | **0.3%** | — |
+| prediction only | 3 | 190.19 ms | 303.92 | 83.14 | 4.1% | **+13.5%** |
+| placing | 3 | **183.24 ms** | 307.98 | 86.08 | 3.1% | **+9.4%** |
+
+**Placing is 6.95 ms *faster* than prediction only.** The arms differ in nothing but the
+transfer budget, so that is placement's own contribution and its sign is negative cost:
+placement gives back 4.1 of the 13.5 points prediction spends. p99 is flat across all three
+arms and throughput moves with it. Excess removed in the same run: **27.0%, 26.5%, 26.7%**
+across the three repeats, a 0.5-point spread, `connected: true` and 0 failed everywhere.
+
+    expert GEMM share of a stock prefill window     11.16%   wall-clock, measured today
+    recoverable share of MoE time at cp 1.8901      47.09%
+    -> perfect balance is worth                      5.26%   of a prefill window = 4.68 ms
+    placement returned                               6.95 ms of mean TTFT, so roughly
+                                                             3.5 ms per window: 70-80%
+                                                             of the ceiling
+    prediction alone                               +13.5%    = 2.6x the whole ceiling
+    prediction + placement                          +9.4%
+
+**Placement works and captures most of the headroom that exists. Prediction costs 2.6x
+everything perfect balance could ever return.** The feature is net negative because of its
+enabling half, not its acting half — which is a different conclusion from the recorded verdict,
+and a more actionable one. The soft link in that chain is "roughly two prefill windows per
+TTFT", inferred from 88.9 ms against 167.53 ms rather than measured; the excess and TTFT
+figures either side of it are direct.
+
+**Two new pieces of tooling, both of which the tree lacked.**
+
+`bench/window_occupancy.py` is the occupancy measurement `06` asked for. The recorded 86.8% /
+52.9% figures came from ad-hoc analysis that was never saved, so there was nothing to re-run.
+It restricts to the runner's own `execute_context` prefill windows, takes busy time as the
+**union** of kernel intervals rather than their sum — summing overlapping streams is what once
+reported the expert GEMM at 10.76% of a step where wall-clock puts it at 14.29% — and carries
+`occupancy_ex_nccl` for the work-versus-waiting split above. 22 unit tests, each pinning a
+mistake this project has already made.
+
+`VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS` closes `06`'s own named residual risk: nothing in a
+real server checked that a *dynamically* placed replica holds the bytes of the expert it
+claims, because `verify_replica_weight_equality` runs at startup and reported "0 pairs,
+vacuous". It now runs every forward when armed, and on 8 GPUs with **real weights** — required,
+since dummy weights make every expert row identical and a wrong row would pass — it verified
+**4 placed pairs** with no mismatch.
+
+**A process failure worth recording, because it invalidated a whole run.** The first attempt
+at the excess measurement was ruined by **editing the tree while the run was in flight**: the
+placing arm's server started between two edits and died on an environment variable that did not
+exist yet, failing 392 of 400 requests. The guard caught it and called the arm inert, which is
+what the guard is for. Every stage of the successful run went through one driver
+(`bench/run_t06_close_out.sh`) so the tree is provably identical across all three.
+
+**One recorded claim is now doubtful.** "Balancing shortens the expert GEMM from 10.01 ms to
+6.88 ms, 67% of the ceiling — the first direct sight of this feature working" does not survive
+the per-rank view. Within a single arm the expert GEMM per 1000 prefill tokens spans 4696 to
+10134 us across 8 ranks, a 2.2x spread, which is **wider than the difference between arms**. By
+`report_arm_spread.py`'s own rule — if an arm's own spread exceeds the difference between arms,
+the run says nothing — that comparison is not resolved by this profile. The 26.2% figure above
+is measured on token counts and is unaffected.
+
+## Code review, 2026-08-30 night: one fixed, six recorded
+
+A `high`-effort review of the whole branch against upstream (23 commits plus the working tree)
+found seven issues; all 363 of the branch's own tests pass, so every one of them is in a path
+those tests do not cover. **One was introduced this session and is fixed. Six are pre-existing
+and are recorded here rather than fixed, because they are outside ticket `06`'s scope and the
+first of them deserves its own change with its own test.**
+
+**Fixed: the new per-forward replica-weight check allocated a float64 copy of every expert
+tensor.** `weight.reshape(local_rows, -1).to(torch.float64)` plus `flat * position` is two
+transients of 8 bytes per element — 428 MiB each for a measured `[17, 3145728]` expert — and
+splitting the check out of startup put it on every forward, on a device whose free memory the KV
+cache has taken. It accumulates a row at a time now, so the peak is one row, and the arithmetic
+is unchanged, which the equality tests pin. The environment variable also now says in as many
+words that it must not be enabled during a measurement run, and why it is unconditional rather
+than sampled every N forwards: the check contains an all_gather, and a per-rank interval counter
+next to a collective is this branch's most expensive class of bug.
+
+**Open, and the one that would bite an operator on the default configuration: an exhausted
+transfer budget reverts still-valid resident replicas instead of keeping them.**
+`fused_placement.py`'s `publish_ptr[0] = max(keep, affordable)`. When a layer holds resident
+`A@T`, this forward's plan names a different `B@T'`, and the budget is already spent, then
+`keep=0`, `needs=1`, `affordable=0`, so the publish takes the **revert** branch and clears the
+layer — even though `A@T`'s weights are still in its row and cost nothing to keep. At the default
+`max_transfers_per_forward=4` over 44 reachable layers, a traffic shift re-places 4 layers and
+**reverts the other 40**, collapsing coverage and needing ~10 forwards to ratchet back. That
+contradicts the "coverage is free once resident, and the budget bounds churn" property the same
+kernel's docstring claims. The host `PlacementCoordinator` has the same shape at
+`remaining <= 0`. **It did not affect this session's numbers**, which ran at budget 43 with 44
+reachable layers, where the budget is not exhausted in steady state and the excess figure was
+stable to 0.5 points across three repeats. Fixing it needs the publish row to be able to carry
+the *resident* placement rather than only the new one, so it is a real change and not a flag.
+
+**Open, five more.**
+
+*`resolve_moe_block_size_m` is never told the quant dtype or block shape*, so on a block-quantised
+MoE it resolves 128 where `get_default_config` would return 64, and the tuned-file lookup is
+keyed on dtype too. That constant is both the suppression bar and the planner's minimum move, so
+every prefill forward between 64 and 128 tokens per expert is suppressed and every placement
+shedding 64-127 tokens is refused — the exact failure the function's docstring says it exists to
+prevent. `moe_config.quant_dtype` and `.block_shape` are available on the layer. This was already
+recorded as open; the review adds the mechanism and the size.
+
+*`max_replicas_per_layer`'s bound is hardcoded to 8 ranks* (`> 7` rejected, "with 8 EP ranks the
+maximum is 7") while DP is now accepted from 2 up. At EP=2 a cap of 2 to 7 passes validation and
+is silently reduced to 1 by `best_move`'s own constraints, with no diagnostic — on the knob the
+branch's thesis says sets coverage. The bound should come from the EP size.
+
+*The NVSHMEM fallback can hang on the cleanup side.* `self._one_sided` is assigned only once
+`OneSidedExpertTransfer.__init__` returns, so a rank whose `nvshmem.init` succeeded but whose
+symmetric staging allocation then failed skips `close()`, while every other rank blocks forever
+in the collective `nvshmem.finalize()`. `agree_across_ranks` was added to turn exactly this
+asymmetry into a clean fallback, and this reintroduces it after teardown.
+
+*`static_replica_placement` is invisible to the device residency table*, so the first device
+placement on that layer writes the replica row without reverting the static expert's maps, and
+half the ranks then route that logical expert to a row holding another expert's weights with
+nothing raising. Debug knobs only, but independently settable and documented as validation aids
+meant to be used together. (This was already recorded; the review adds the routing consequence.)
+
+*`device_transfer.py` builds a fresh `cuda.core` stream wrapper on every `transfer()`*, ~44 per
+forward, around the same underlying handle — per-layer host work and object churn on the one path
+this ticket exists to make host-free. Cache it for the coordinator's single predictive stream.
 
 ## The fused placement kernels, 2026-08-30 night: placement now costs about 3%
 
@@ -289,7 +490,10 @@ placement is active — and the host-issued path moves the first-token logprobs 
 device one (0.34 versus 0.25, against 0.000 for two canonical runs), so the transport
 introduces nothing placement does not.
 
-**Two criteria stay open and both need 8 GPUs:** the 24.0%-of-excess reproduction on 43
+**Both of these criteria are now measured on 8 GPUs — see the close-out section at the top of
+this document.** What follows was written when the node had 2.
+
+~~**Two criteria stay open and both need 8 GPUs:**~~ the 24.0%-of-excess reproduction on 43
 layers, and the occupancy measurement against 86.8% / 52.9%. No TTFT number here is
 comparable to the DP=8 ones; the config validator now says so at startup.
 

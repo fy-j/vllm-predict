@@ -13,9 +13,15 @@ device tensors, so a device scatter suffices.
 
 **Blocked by:** 05 — The transfer lands in the replica slot. Done.
 
-**Status:** implemented and running end to end (2026-08-30). The segfault is fixed and its
-cause was the plan's ownership, not the transport. Two criteria stay open and both need 8
-GPUs: the 24.0%/43-layer reproduction and the occupancy measurement. This node now has 2.
+**Status:** DONE 2026-08-30 night. The node came back with its 8 GPUs, and both remaining
+criteria are measured there: **26.2% of full-prefill critical-path excess removed on all 44
+reachable layers**, against the 24.0% the ticket asked for, and occupancy measured with the
+`window_occupancy.py` this ticket needed and the tree did not have. The occupancy comparison
+came out interesting rather than clean — raw occupancy counts a rank parked inside
+`ncclDevKernel` as busy — so the ticket's headline is carried by the direct evidence instead:
+**placement now performs the same number of host event synchronisations as a stock server**,
+1081 against 1072, where the host path performed 7293. Its own named residual risk is closed
+too. See "The 8-GPU close-out" below.
 
 **The precondition is answered and it changes the shape of this ticket.** Ticket 05's
 transport cannot reach this ticket's headline criterion, because a **host-issued** put takes
@@ -48,36 +54,110 @@ counter for the budget, and a scatter for the layout. The residency table is the
 matters for benefit, not just for cost, because transfer reuse across forwards is what lets
 coverage ratchet up to all 43 layers.
 
-- [ ] A device scatter publishes the **source-local** map pair. Writing the global pair
+- [x] A device scatter publishes the **source-local** map pair. Writing the global pair
       instead transfers the replica, describes it correctly, and publishes it where nothing
       reads: a measured run then activated 131 replicas per forward and removed 0.6% of
       prefill excess against an oracle's 35.1%. The routing path prefers the source-local pair
       whenever it is set, and under this feature it always is.
-- [ ] The published set is a layer's **complete** desired set, so an empty set reverts what the
+- [x] The published set is a layer's **complete** desired set, so an empty set reverts what the
       previous forward left. Reversion is a map edit with no transfer, and carrying an unwanted
       replica is not neutral: it goes on shedding half of an expert that may no longer be hot
       onto a rank that may now be the peak.
-- [ ] Placement suppression is decided per forward from a value every rank agrees on **before
+- [x] Placement suppression is decided per forward from a value every rank agrees on **before
       anything is recorded**. Deciding it after a snapshot exists is what previously made every
       decode and every dummy forward publish an empty set on all 48 layers, which reverted
       everything and defeated transfer reuse under any mixed traffic.
+
+      These three were implemented and verified on 2026-08-30 night and were ticked only in
+      the section below, which read as though the ticket had three open criteria it did not.
+      Each one's evidence is there.
 - [x] **No `synchronize()` anywhere on the per-forward path** — asserted by *measurement*
       rather than by the source-level test this asked for. A grep cannot see the spellings
       that matter: `set_sync_debug_mode("error")` passes on the first `torch.stack` in a
       process, which blocks the host for 50-100 ms while its kernel loads. The test queues
       100 ms on the compute stream, runs all three phases, and asserts the host came back
       in microseconds; a single `int(plan[0])` inserted deliberately makes it fail.
-- [ ] The existing baseline is reproduced, not merely equalled in spirit: at least **24.0% of
+- [x] The existing baseline is reproduced, not merely equalled in spirit: at least **24.0% of
       full-prefill critical-path excess removed**, activation on **all 43 reachable layers**,
       and physical per-rank load diverging from canonical ownership by a non-zero amount.
+      **26.2%** on 50 full-prefill forwards per arm, critical path 1.8901 -> 1.6571, at the
+      operating point the 24.0% was recorded at (`ko`, 400 requests, CONC=8, OUT_LEN=1, DP=8).
+      Coverage is **44 of 44** reachable layers, target layers 4 to 47 with no gap — 44 rather
+      than 43 because ticket 07's lookahead of 1 leaves one fewer trailing layer unbound — and
+      352 launches is exactly 44 x 8 ranks. `connected: true`, 400/400 requests on both arms,
+      0 failed. The load divergence is what the critical path is computed from: the dump
+      records physical-slot load after the router applied the map, so a changed critical path
+      is a changed per-rank distribution.
 - [x] Generated output matches a no-replica reference within BF16 tolerance over many
       forwards, and repeated activation, replacement and reclamation complete on every rank
       without deadlock. Done at DP=2; see the equivalence note below for what the logprob
       tolerance does and does not decide.
-- [ ] GPU occupancy inside real forward windows measured, and reported against the baseline's
-      86.8% and the placed arm's 52.9%.
+- [x] GPU occupancy inside real forward windows measured, and reported against the baseline's
+      86.8% and the placed arm's 52.9%. At the knee, DP=8, medians across 8 ranks: **stock
+      86.7%** — which reproduces the 86.8% reference almost exactly and is what makes the rest
+      comparable — prediction only 89.9%, **placing 41.8%**, so placing is *below* the 52.9%
+      reference rather than above it.
 
-## Where this stands, 2026-08-30 night
+      **That number does not mean what it appears to, and the decomposition is the finding.**
+      Gaps over 0.5 ms, which is what host starvation actually looks like, are **3.52 ms in
+      the placing arm** against stock's own 3.86 ms on the same node and day, and the host
+      path's 5.70 ms — so the placing arm now leaves *fewer* long holes than a stock server.
+      Note that the 86.8% / 52.9% / 30.2 ms figures this criterion names were measured on the
+      **5090**, three days before this node existed, so they are a cross-hardware reference;
+      the sound comparison is host path against device path here, and that is occupancy
+      69.7% -> 41.8% with gaps 5.70 ms -> 3.52 ms. Per rank, occupancy
+      tracks time spent inside `ncclDevKernel`: the ranks scoring 21-29% are the ones with
+      11-12 ms of collective time and the ones at 88% have 58 ms. A rank blocked in a
+      collective waiting for a peer is busy by kernel-time accounting and idle in fact, so
+      raw occupancy rewards arriving early. `occupancy_ex_nccl` is the honest version and puts
+      every arm at 17-30%: the DP=8 prefill window is collective-dominated, which is this
+      spec's own out-of-scope item and not something placement can move.
+
+      The ticket's headline is therefore carried directly rather than through occupancy.
+      `cudaEventSynchronize` per profile, 8 ranks: host path **7293 calls, 8417 ms, p50
+      73.2 us**; device path **1081 calls, 1643 ms, p50 5.7 us**; a stock server **1072
+      calls**. `cudaStreamSynchronize` goes **38672 calls to 8**. Placement adds no host
+      synchronisation, measured against a stock server rather than against itself.
+
+- [x] **The residual risk this ticket named is closed.** "Nothing in a real server checks that
+      a *dynamically* placed replica holds the bytes of the expert it claims" — now
+      `VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS` compares position-weighted checksums of every
+      physical copy on every forward, so the check runs where replicas exist rather than only
+      at startup where it reported "0 pairs, vacuous". On 8 GPUs with **real weights**, which
+      this needs — under `--load-format dummy` every expert row holds the same values, so a
+      replica pointing at the wrong row would pass — it logs `verified 4 dynamically placed
+      replica (layer, expert) pairs hold their canonical weights` beside the startup check's
+      vacuous line, with no mismatch. Off by default: it all-gathers and reads the result on
+      the host. Position weighting is what catches a permuted copy, and there is a test for
+      exactly that.
+
+## The 8-GPU close-out, 2026-08-30 night
+
+Three stages in one driver (`run_t06_close_out.sh`), so the tree is provably identical across
+all of them. That matters here: the first attempt at this was invalidated because the tree was
+edited **while the run was in flight**, and the placing arm's server started between two edits
+and died on an environment variable that did not exist yet — 392 of 400 requests failed and
+the guard correctly called the arm inert. Never edit the tree during a measurement.
+
+Correctness first, because measuring an incorrect placement is worth nothing: 8 workers armed,
+352 device-issued launches, 32 replicas placed by the device counter, 0 host-path fallbacks,
+0 crash signatures, and the replica-weight check above.
+
+**What the close-out does not settle.** Re-measured at the knee with three interleaved passes,
+where the stock arm's own spread is **0.3%**: stock 167.53 ms, prediction only 190.19 ms
+(**+13.5%**), placing 183.24 ms (**+9.4%**). **Placing is 6.95 ms faster than prediction only**,
+and the arms differ in nothing but the transfer budget — so placement's own contribution is
+negative cost, and against a ceiling of 5.26% of a prefill window it captures roughly 70-80%.
+Excess removed in the same run: 27.0% / 26.5% / 26.7%.
+
+Prediction alone, however, costs **2.6x the whole ceiling**, where DP=2 had recorded it at
+-0.2%. The mechanism is in the same profile: token collectives grow **47.3 ms -> 82.4 ms** per
+prefill window while the expert GEMM does not move. That is the recorded desynchronisation
+signature at 8 ranks, which 2 ranks have too little arrival skew to show. Ticket 08 owns the
+verdict; what this ticket establishes is that **placement is no longer where the cost is, and
+that placement itself pays.**
+
+## Where this stood, 2026-08-30 night, before the 8-GPU close-out
 
 Done, each verified against the host path it replaces:
 
@@ -127,15 +207,20 @@ transfer reuse free and coverage ratchet up across forwards.
       two canonical runs move them 0.000, so this is what dynamic placement does to the
       cross-rank combine order and not something the device transport introduced.
 
-Still open, and both need 8 GPUs:
+~~Still open, and both need 8 GPUs~~ — **both measured 2026-08-30 night; see the close-out
+section above.**
 
-- [ ] At least 24.0% of prefill critical-path excess removed, on all 43 reachable layers.
-- [ ] GPU occupancy inside real forward windows, against the baseline's 86.8% and the
-      placed arm's 52.9%.
+- [x] At least 24.0% of prefill critical-path excess removed, on all reachable layers. 26.2%
+      on 44 of 44.
+- [x] GPU occupancy inside real forward windows, against the baseline's 86.8% and the
+      placed arm's 52.9%. Stock 86.7%, placing 41.8%, and the reason the second one is not
+      the improvement it should be is that the metric counts collective residency as busy.
 
-One residual risk worth naming: nothing in a real server checks that a *dynamically*
-placed replica holds the bytes of the expert it claims. `verify_replica_weight_equality`
-runs at startup, where nothing is placed yet, and says so — it reported "0 pairs,
-vacuous". The evidence that it does is indirect: byte equality over every rank pair in the
-probe, and 384 greedy tokens unchanged with placement active, which a wrong row would very
-likely have broken. A runtime checksum check is the cheap way to make it direct.
+~~One residual risk worth naming~~ — **closed.** Nothing in a real server checked that a
+*dynamically* placed replica holds the bytes of the expert it claims.
+`verify_replica_weight_equality` runs at startup, where nothing is placed yet, and said so —
+it reported "0 pairs, vacuous". The evidence was indirect: byte equality over every rank pair
+in the probe, and 384 greedy tokens unchanged with placement active, which a wrong row would
+very likely have broken. It is direct now, through
+`VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS`, and 4 placed pairs were verified on real weights at
+DP=8.

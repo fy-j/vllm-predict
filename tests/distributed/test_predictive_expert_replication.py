@@ -1256,7 +1256,21 @@ class TestStepDiagnosticsAreCollectiveSafe:
         )
         state._dump_logical_expert_load = lambda path: calls.append("load")
         state._dump_prediction_accuracy = lambda path: calls.append("accuracy")
+        state.model_states = {}
+        state._verify_model_replica_weights = lambda state_: (
+            calls.append("weights") or 43
+        )
         return state
+
+    def _disarm(self, monkeypatch, *, keep=()):
+        for name in (
+            "VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS",
+            "VLLM_EPLB_DUMP_LOAD_PATH",
+            "VLLM_PREDICTIVE_ACCURACY_DUMP_PATH",
+            "VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS",
+        ):
+            if name not in keep:
+                monkeypatch.setattr(f"vllm.envs.{name}", None, raising=False)
 
     def test_the_dispatch_takes_no_per_rank_argument(self):
         """A parameterless signature is what makes divergence impossible."""
@@ -1281,15 +1295,55 @@ class TestStepDiagnosticsAreCollectiveSafe:
 
     def test_nothing_runs_when_no_diagnostic_is_armed(self, monkeypatch):
         """The serving path must pay nothing: these all synchronize with the host."""
-        for name in (
-            "VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS",
-            "VLLM_EPLB_DUMP_LOAD_PATH",
-            "VLLM_PREDICTIVE_ACCURACY_DUMP_PATH",
-        ):
-            monkeypatch.setattr(f"vllm.envs.{name}", None, raising=False)
+        self._disarm(monkeypatch)
         calls: list[str] = []
         self._state(calls)._run_step_diagnostics()
         assert calls == []
+
+    def test_the_replica_weight_check_runs_when_armed(self, monkeypatch):
+        """Ticket 06's named residual risk: nothing checked a *placed* replica.
+
+        `verify_replica_weight_equality` runs at startup, where no replica is placed
+        yet, and it reported "0 pairs, vacuous". The evidence that a dynamically placed
+        replica holds the bytes of the expert it claims was indirect — byte equality in
+        a probe, and greedy output unchanged. This makes it direct.
+        """
+        self._disarm(monkeypatch, keep=("VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS",))
+        monkeypatch.setattr(
+            "vllm.envs.VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS", True, raising=False
+        )
+        calls: list[str] = []
+        state = self._state(calls)
+        state.model_states = {"m": object()}
+        state._run_step_diagnostics()
+        assert calls == ["weights"]
+
+    def test_a_vacuous_replica_weight_pass_is_not_logged_as_evidence(self, monkeypatch):
+        """Zero compared pairs means no replica was placed, so it proves nothing.
+
+        The same rule the inactive-slot check follows, and for the same reason: a
+        vacuous pass reads exactly like a real one in a log.
+        """
+        self._disarm(monkeypatch, keep=("VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS",))
+        monkeypatch.setattr(
+            "vllm.envs.VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS", True, raising=False
+        )
+        state = self._state([])
+        state.model_states = {"m": object()}
+        state._verify_model_replica_weights = lambda state_: 0
+        state._run_step_diagnostics()
+        assert state._logged_replica_weight_check is False
+
+    def test_the_replica_weight_pair_count_is_logged_once(self, monkeypatch):
+        self._disarm(monkeypatch, keep=("VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS",))
+        monkeypatch.setattr(
+            "vllm.envs.VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS", True, raising=False
+        )
+        state = self._state([])
+        state.model_states = {"m": object()}
+        assert state._logged_replica_weight_check is False
+        state._run_step_diagnostics()
+        assert state._logged_replica_weight_check is True
 
     def test_nothing_is_logged_when_the_check_verified_nothing(self, monkeypatch):
         """A zero count means no traffic was observed; claiming a pass would lie."""
@@ -1317,6 +1371,71 @@ class TestStepDiagnosticsAreCollectiveSafe:
         assert state._logged_inactive_slot_check is False
         state._run_step_diagnostics()
         assert state._logged_inactive_slot_check is True
+
+
+class TestReplicaWeightsAreCheckedAgainstTheirCanonicalRow:
+    """A placed replica must hold the bytes of the expert it claims to hold.
+
+    Nothing in a real server checked this. The startup check runs before anything is
+    placed and reported "0 pairs, vacuous", so the evidence was indirect: byte equality
+    in a standalone probe, and 384 greedy tokens unchanged. A replica row holding the
+    wrong expert produces plausible logits and raises nothing, which is the failure mode
+    that survives an output comparison.
+    """
+
+    def _state(self, monkeypatch, rows):
+        """One layer, EP=1, two canonical rows plus a replica row holding logical 0."""
+        from vllm.distributed.eplb.eplb_state import EplbState
+
+        group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+        monkeypatch.setattr(
+            "vllm.distributed.eplb.eplb_state.get_eplb_group",
+            lambda: SimpleNamespace(device_group=group),
+        )
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_into_tensor",
+            lambda out, local, group=None: out[0].copy_(local),
+        )
+        state = EplbState.__new__(EplbState)
+        state.device = torch.device("cpu")
+        model = SimpleNamespace(
+            expert_weights=[(rows,)],
+            num_local_physical_experts=3,
+        )
+        return state, SimpleNamespace(
+            model=model,
+            # Row 2 is the replica slot and holds logical expert 0, whose canonical
+            # copy is row 0. That pairing is what the check exists to verify.
+            physical_to_logical_map=torch.tensor([[0, 1, 0]]),
+        )
+
+    def test_matching_copies_report_the_pair_they_compared(self, monkeypatch):
+        rows = torch.tensor([[1.0, 2.0], [9.0, 9.0], [1.0, 2.0]])
+        state, model_state = self._state(monkeypatch, rows)
+        assert state._verify_model_replica_weights(model_state) == 1
+
+    def test_a_replica_holding_another_experts_weights_raises(self, monkeypatch):
+        # Row 2 claims logical 0 but carries row 1's weights, which is exactly what a
+        # transfer aimed at the wrong row, or a publish naming the wrong slot, produces.
+        rows = torch.tensor([[1.0, 2.0], [9.0, 9.0], [9.0, 9.0]])
+        state, model_state = self._state(monkeypatch, rows)
+        with pytest.raises(RuntimeError, match="not identical"):
+            state._verify_model_replica_weights(model_state)
+
+    def test_a_permuted_copy_is_caught_not_just_a_different_sum(self, monkeypatch):
+        # Position weighting is the reason: a plain sum passes this.
+        rows = torch.tensor([[1.0, 2.0], [9.0, 9.0], [2.0, 1.0]])
+        state, model_state = self._state(monkeypatch, rows)
+        with pytest.raises(RuntimeError, match="not identical"):
+            state._verify_model_replica_weights(model_state)
+
+    def test_no_replica_placed_compares_nothing(self, monkeypatch):
+        """The startup case, which must report zero rather than claim a pass."""
+        rows = torch.tensor([[1.0, 2.0], [9.0, 9.0], [0.0, 0.0]])
+        state, model_state = self._state(monkeypatch, rows)
+        model_state.physical_to_logical_map = torch.tensor([[0, 1, -1]])
+        assert state._verify_model_replica_weights(model_state) == 0
 
 
 class TestAccuracyDumpDoesNotMixModels:

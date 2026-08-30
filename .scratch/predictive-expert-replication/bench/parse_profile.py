@@ -27,11 +27,12 @@ import bisect
 import glob
 import gzip
 import json
-import re
 import statistics
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import regex as re
 
 KERNEL_CLASSES = ("nccl", "moe_expert", "attention", "other")
 
@@ -91,12 +92,20 @@ def classify_kernel(name: str) -> str:
 
 @dataclass(frozen=True)
 class DecodeWindow:
-    """One pure-decode step, as a GPU-side time span."""
+    """One step of a single phase, as a GPU-side time span.
+
+    The context counts default to zero so a decode window can be built without them,
+    which is what every existing caller does. On a *prefill* window they are the batch
+    size that matters: two arms can split the same requests into different numbers of
+    prefill steps, and then per-window figures compare different amounts of work.
+    """
 
     start: float
     end: float
     gen_requests: int
     gen_tokens: int
+    ctx_requests: int = 0
+    ctx_tokens: int = 0
 
 
 @dataclass
@@ -155,6 +164,8 @@ def decode_windows(events: list[dict], phase: str = "decode") -> list[DecodeWind
                 end=start + float(event.get("dur") or 0.0),
                 gen_requests=gen_requests,
                 gen_tokens=gen_tokens,
+                ctx_requests=ctx_requests,
+                ctx_tokens=ctx_tokens,
             )
         )
     if not windows and detailed:

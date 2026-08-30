@@ -23,7 +23,7 @@ Ticket order is set by each ticket's `Blocked by` field, not by its filename num
 03 fused Triton counting kernel  blocks 08         (needs 01)  DONE 2026-08-29
 04 device-side plan              blocks 05         (needs 01)  DONE 2026-08-29
 05 transfer lands in the slot    blocks 06         (needs 04)  DONE 2026-08-30
-06 no host sync on the path      blocks 07         (needs 05)  DONE 2026-08-30, 2 items need 8 GPUs
+06 no host sync on the path      blocks 07         (needs 05)  DONE 2026-08-30, 17/17 at DP=8
 07 window = target's Attention   blocks 08         (needs 06)  DONE 2026-08-30
 08 three-arm verdict + stop gate blocks 10         (needs 03, 07)  ← unblocked, and it decides
 09 CUDA graph feasibility        terminal          no blockers; exploratory, off the mainline
@@ -51,12 +51,47 @@ coordinator's choice, not the runner's — the host planner synchronises inside
 `plan_and_launch` and so keeps the old site, where a lookahead of 1 has no window at all and
 configuration validation still rejects it. Reachable layers went 43 -> 44.
 
-**This node has 2 H100s, not 8** (since the 2026-08-30 pod restart). `06` is implemented and
-runs end to end there — the segfault that had `device_issued_transfer` off was the plan tensor
-being freed while the transfer kernels still had it queued, and it is fixed with a regression
-test. The runtime scope check no longer pins DP=8; it warns instead, because **no measured
-figure for this feature survives a change of EP size**. `06`'s two remaining criteria — 24.0%
-of prefill excess on 43 layers, and occupancy against 86.8%/52.9% — need the 8-GPU node back.
+**This node has 8 H100s again** (NV18 all-pairs), after a spell with 2 following the
+2026-08-30 pod restart. Check `nvidia-smi` rather than trusting a document: the count has
+changed twice. The runtime scope check no longer pins DP=8; it warns instead, because **no
+measured figure for this feature survives a change of EP size** — and that warning was
+vindicated on 2026-08-30 night by the most optimistic figure on the branch.
+
+**`06` is DONE, 17 of 17, measured at DP=EP=8** (2026-08-30 night). Its two outstanding
+criteria: **26.2%** of full-prefill critical-path excess removed on **44 of 44** reachable
+layers, against the 24.0% asked for; and occupancy measured with `bench/window_occupancy.py`,
+which the tree lacked. The headline is carried directly rather than through occupancy, because
+raw occupancy counts a rank parked inside `ncclDevKernel` as busy: **placement performs the
+same number of host event synchronisations as a stock server**, 1081 against 1072, where the
+host path performed 7293, and `cudaStreamSynchronize` went 38672 -> 8. Gaps over 0.5 ms in the
+placing arm are 3.52 ms against stock's own 3.86 ms and the host path's 5.70 ms — the
+86.8%/52.9% reference is a **5090** measurement and cross-hardware, so the same-node comparison
+is the one to quote. `06`'s own named residual risk is
+closed too: `VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS` verifies on real weights that a
+*dynamically* placed replica holds the bytes it claims.
+
+**The two halves of this feature now have opposite verdicts, measured at DP=8 on a 0.3% ruler**
+(the knee: `ko`, 512 requests, CONC=16, three interleaved passes — the tightest baseline this
+project has had):
+
+```
+stock            167.53 ms  —          excess removed, full prefill: 27.0% / 26.5% / 26.7%
+prediction only  190.19 ms  +13.5%     across three repeats, 0.5-point spread
+placing          183.24 ms   +9.4%     p99 flat across all three arms
+```
+
+**Placing is 6.95 ms faster than prediction only** — the arms differ in nothing but the
+transfer budget, so placement's own contribution is *negative cost*. Against a ceiling of
+5.26% of a prefill window (11.16% expert-GEMM share x 47.09% recoverable, both measured
+today) placement captures roughly 70-80% of it. **Prediction alone costs 2.6x that entire
+ceiling.** So the feature is net negative because of its *enabling* half, not its acting half.
+
+**And "prediction is nearly free" is a DP=2 statement only.** DP=2 recorded -0.2%; at DP=8 the
+same code costs +13.5%. The mechanism is in the profile: token collectives per prefill window
+grow **47.3 -> 82.4 ms** while the expert GEMM does not move. That is the recorded
+desynchronisation signature at 8 ranks, which 2 ranks have too little arrival skew to show.
+`08` owns the verdict and it is now unambiguously about prediction's 44 gate GEMMs and 44
+AllGathers per forward, not about placement.
 
 **`06` is the ticket the arithmetic turns on, not `03`.** Measured on 2026-08-29: of the
 per-source-layer cost, 2.21 ms scales with launch count and 5.28 ms does not, and the

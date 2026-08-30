@@ -812,6 +812,40 @@ class EplbState:
                 means a transfer or the layout is wrong.
         """
         model_state = self.model_states[compute_hash_cached(model_config)]
+        compared = self._verify_model_replica_weights(model_state)
+        if get_eplb_group().device_group.rank() == 0:
+            # Report how much was actually compared. With no replica placed there
+            # is nothing to compare and this check passes without checking
+            # anything, which would be worse than not having it: a vacuous pass
+            # reads exactly like a real one.
+            logger.info(
+                "Predictive expert replication compared %d replicated "
+                "(layer, expert) pairs; all copies identical. %s",
+                compared,
+                "No replicas are placed, so this check is vacuous."
+                if compared == 0
+                else "",
+            )
+
+    def _verify_model_replica_weights(self, model_state: EplbModelState) -> int:
+        """Compare every physical copy of each logical expert, for one model.
+
+        Split out of :meth:`verify_replica_weight_equality` so it can also run
+        *during* serving, where the replicas the feature places actually exist. At
+        startup nothing is placed yet, so that call site compares zero pairs and says
+        so — which left "a dynamically placed replica holds the bytes of the expert it
+        claims" resting on indirect evidence.
+
+        Args:
+            model_state: The model whose physical layout and expert weights to check.
+
+        Returns:
+            The number of replicated `(layer, logical expert)` pairs compared. Zero
+            means no logical expert had a second copy, so the check proved nothing.
+
+        Raises:
+            RuntimeError: If two copies of one logical expert disagree.
+        """
         model = model_state.model
         ep_group = get_eplb_group().device_group
         ep_size = ep_group.size()
@@ -823,11 +857,21 @@ class EplbState:
         )
         for layer_index, layer_weights in enumerate(model.expert_weights):
             for weight in layer_weights:
-                flat = weight.reshape(local_rows, -1).to(torch.float64)
+                flat = weight.reshape(local_rows, -1)
                 position = torch.arange(
                     1, flat.shape[1] + 1, dtype=torch.float64, device=flat.device
                 )
-                local[layer_index] += (flat * position).sum(dim=1)
+                # A row at a time. Promoting the whole tensor to float64 first
+                # materialises two transients of 8 bytes per element — for a measured
+                # `[17, 3145728]` expert that is 428 MiB each — and this now runs on
+                # every forward rather than once at startup, on a device whose free
+                # memory the KV cache has deliberately taken. Per row the peak is
+                # `row_numel * 8` and the arithmetic is unchanged, which the equality
+                # tests pin.
+                for row in range(local_rows):
+                    local[layer_index, row] += (
+                        flat[row].to(torch.float64) * position
+                    ).sum()
 
         gathered = torch.zeros(
             (ep_size, num_layers, local_rows), dtype=torch.float64, device=self.device
@@ -862,21 +906,7 @@ class EplbState:
                 "output comparison could not distinguish reduction-order noise "
                 f"from a real defect: {mismatches[:5]}"
             )
-        if ep_group.rank() == 0:
-            # Report how much was actually compared. With no replica placed there
-            # is nothing to compare and this check passes without checking
-            # anything, which would be worse than not having it: a vacuous pass
-            # reads exactly like a real one.
-            logger.info(
-                "Predictive expert replication compared %d replicated "
-                "(layer, expert) pairs across %d layers; all copies identical. "
-                "%s",
-                compared,
-                num_layers,
-                "No replicas are placed, so this check is vacuous."
-                if compared == 0
-                else "",
-            )
+        return compared
 
     _predictive_stream: torch.cuda.Stream | None = None
     """Ordered predictive communication stream, spec section 9."""
@@ -900,6 +930,13 @@ class EplbState:
 
     _logged_inactive_slot_check: bool = False
     """Set once the inactive-slot check has reported, so it logs a single line."""
+
+    _logged_replica_weight_check: bool = False
+    """Set once the replica-weight check has compared something and reported it.
+
+    Only a non-zero comparison sets it: before the first placement the check is vacuous,
+    and a log line claiming a pass then reads exactly like one that verified 43 pairs.
+    """
 
     def verify_inactive_slots_unused(
         self,
@@ -1712,6 +1749,21 @@ class EplbState:
             self._dump_logical_expert_load(envs.VLLM_EPLB_DUMP_LOAD_PATH)
         if envs.VLLM_PREDICTIVE_ACCURACY_DUMP_PATH:
             self._dump_prediction_accuracy(envs.VLLM_PREDICTIVE_ACCURACY_DUMP_PATH)
+        if envs.VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS:
+            # Runs over every model state rather than one, and unconditionally, because
+            # the all_gather inside it is collective: choosing which models to check
+            # from anything that can differ by rank is the deadlock this dispatcher's
+            # docstring is about.
+            compared = 0
+            for model_state in self.model_states.values():
+                compared += self._verify_model_replica_weights(model_state)
+            if compared and not self._logged_replica_weight_check:
+                self._logged_replica_weight_check = True
+                logger.info(
+                    "Predictive expert replication: verified %d dynamically placed "
+                    "replica (layer, expert) pairs hold their canonical weights.",
+                    compared,
+                )
         if envs.VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS:
             # Raise on the forward that did it, so the log points at the step
             # rather than at whatever fails downstream of invalid output.
