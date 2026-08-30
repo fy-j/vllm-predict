@@ -2835,3 +2835,30 @@ duration is mostly a measurement of what the other rank was doing**, so attribut
 before the ranks are otherwise balanced attributes cost to the wrong place. It happened with
 the prediction AllGather on the 5090 (2000x spread on a 4 KiB payload) and it happened again
 here.
+
+### Does prefill pay now? Not at DP=2, and this is the arithmetic
+
+From the fused profile's prediction-only arm, rank0, 9 prefill windows of 103.9 ms:
+
+    expert GEMM's share of a prefill window        15.0%   (nccl 31.6, other 12.7, attn 2.3)
+    per-layer critical-path imbalance              1.173
+    perfect balance recovers of the expert GEMM    14.7%
+    -> the ceiling here                            2.21% of a prefill step
+    35% of the excess actually removed             0.77% of a step
+    measured cost                                  about +3% mean TTFT
+
+**So the cost is still about 4x the benefit** and prefill remains net negative on this node.
+The ratio was roughly 42x before the fusion, so it improved by an order of magnitude, but it
+is on the wrong side of 1.
+
+**DP=2 is a poor place to look for the benefit**, and that is the point worth carrying to the
+8-GPU node. The ceiling here is 2.21% because two ranks give an imbalance of 1.173; eight give
+**1.885**, which measured a **5.05%** ceiling, and eight ranks also give a placement more
+places to shed to — 24-36% of that excess is 1.2-1.8% of a step.
+
+So for the first time in this project the cost and the ceiling are the same order of
+magnitude, and which side wins is a DP=8 measurement, not an extrapolation. Both of the DP=8
+cost figures are now stale and have to be re-run: placement's +22.1% was measured with 132
+kernels per placed layer and a host synchronisation, and prediction's own +7.6% predates
+nothing but is a rank-count effect — the same prediction arm measures **-0.2%** at DP=2,
+because the arrival skew that amplifies launches barely exists between two ranks.
