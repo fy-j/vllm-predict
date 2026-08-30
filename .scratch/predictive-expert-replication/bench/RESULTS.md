@@ -2749,3 +2749,89 @@ One thing the fix caught immediately, which is the invariant from ticket 07 doin
 `probe_plan_lifetime.py` launches without ever publishing, so the second forward it opened
 raised "ended with a pending plan for layer(s) [2]". The probe checks the transport and has no
 routing maps, so it now drops the entry explicitly rather than leaving a real check disarmed.
+
+
+## The fused placement kernels, 2026-08-30: +32.0% becomes about +3%
+
+Two Triton kernels replace the 132 launches a placed layer used to cost — 46 to plan, 19 to
+charge the budget, 67 to publish. Two rather than one because the halves run at different
+points in the forward: the plan at the predicting layer's MoE tail, the publish at the target
+layer's MoE head, one Attention block later. Measured through the real coordinator,
+**132 kernels per placed layer became 2**, plus one `zero_` per forward.
+
+A third kernel turned out to be writing a constant: `source_local_replica_count.fill_(1)` ran
+per layer per forward, and the source-local count is all-ones invariantly — that *is*
+source-rank routing, one copy on offer so a rank's chunk cannot be split. Set once at startup
+now.
+
+### What it bought, four repeats each, DP=2, Korean prompts, concurrency 16
+
+| arm | before, median mean TTFT | after | before p99 | after p99 |
+| --- | --- | --- | --- | --- |
+| stock | 257.8 ms | 260.0 ms | 435.2 ms | 442.5 ms |
+| prediction only | 264.6 ms (+2.6%) | 259.6 ms (**-0.2%**) | 395.1 ms | 383.4 ms |
+| placing | 340.3 ms (**+32.0%**) | 266.6 ms (**+2.6%**) | 432.4 ms | **375.7 ms** |
+
+Read the stock arm with care in the second run: its repeat 1 is 317.8 ms against 261.1, 258.2
+and 258.8 for the rest, so the median understates it. Against the three settled repeats the
+paired deltas for placing are **+2.1%, +2.1% and +6.4%**, so **about +3%** is the honest
+figure. The placing arm's own spread fell from 11.8% to 4.4%, and its p99 is now the tightest
+of the three at 374.8-378.1 ms — *below* stock, which is what a path that no longer starves
+the GPU looks like.
+
+### And the placement itself is unchanged, which is the point
+
+| repeat | full prefill critical path | excess removed | connected |
+| --- | --- | --- | --- |
+| 1 | 1.1735 -> 1.1102 | 36.5% | true |
+| 2 | 1.1724 -> 1.1129 | 34.5% | true |
+| 3 | 1.1734 -> 1.1131 | 34.8% | true |
+| 4 | 1.1731 -> 1.1099 | 36.5% | true |
+
+34.5-36.5% against 34.8-36.6% before the fusion. A cost reduction with identical behaviour is
+exactly what the differential tests promise: both kernels are asserted bit-identical to the
+tensor implementations they replace, over 200 randomised snapshots at three `min_tokens`
+values, a 200-plan publish sequence at both source-rank parities, and the real expert
+geometries — EP=8 with 128 experts, EP=2 with 128, and a per-rank count that is not a power of
+two.
+
+### The bug the differential test caught, which no reading would have
+
+The kernels work in **doubled integer units** so that shedding half an expert is exact and no
+rank can round differently from another. The trap is what doubling does to the shed amount:
+`moved` is half an expert, so `2 * moved` is the expert's own count — the *undoubled* load.
+Using the doubled load sheds twice what a replica can, overshoots the target, and refused
+**40 of 200 placements** the tensor planner accepts. Every one of those cases still produced a
+valid-looking plan of all zeros.
+
+### The profile says why, and corrects the barrier recommendation
+
+Two profiles at DP=2, prediction-only against placing, before and after the fusion. The
+per-layer host figure is the one to read across arms, because window counts differ:
+
+| placing arm, rank0 | before | after |
+| --- | --- | --- |
+| `vllm::moe_forward` host time per layer | 2.20 ms | **1.32 ms** |
+| the same, prediction-only arm | 1.25 ms | 1.33 ms |
+| kernel launches per prefill window | 2365 | 538 |
+| GPU idle inside the window | 77.9% | **48.4%** |
+| `barrier_on_stream` per window | 4.40 ms | **0.23 ms** |
+
+**Placement's host overhead per layer is now zero** — 1.32 ms against the prediction-only
+arm's 1.33 ms, where it was 0.95 ms more. That is the +29% of mean TTFT, gone, and it is why
+the placing arm's p99 is now the lowest of the three arms rather than its spread being the
+widest.
+
+**And it corrects the recommendation this session made two hours earlier.** The arrival
+barrier was measured at 4.40 ms per forward with a p90 of 1151 us, and I proposed replacing it
+with pairwise put-with-signal on that basis. The same barrier now costs **0.23 ms per
+forward**, 19x less, with nothing about it changed: it was never intrinsically expensive. It
+was *exposing arrival skew*, and the skew was the launch storm — 2365 host dispatches per
+window against 538. Fixing the launches fixed the barrier.
+
+So pairwise arrival is now worth 0.23 ms per forward and belongs well down the list. The
+general lesson is the one this project keeps relearning in new clothes: **a collective's
+duration is mostly a measurement of what the other rank was doing**, so attributing cost to it
+before the ranks are otherwise balanced attributes cost to the wrong place. It happened with
+the prediction AllGather on the 5090 (2000x spread on a 4 KiB payload) and it happened again
+here.

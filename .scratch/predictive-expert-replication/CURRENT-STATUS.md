@@ -31,6 +31,46 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 - **The cost is host synchronisation, not the transfers.** See the section below
   before touching anything.
 
+## The fused placement kernels, 2026-08-30 night: placement now costs about 3%
+
+Two Triton kernels replace the **132 launches** a placed layer cost — 46 to plan, 19 to charge
+the budget, 67 to publish — and the profile's per-layer host figure went with them:
+
+| placing arm, per MoE layer | before | after |
+| --- | --- | --- |
+| `moe_forward` host time | 2.20 ms | **1.32 ms** |
+| the same, prediction-only arm | 1.25 ms | 1.33 ms |
+| kernels per placed layer | 132 | **2** |
+| GPU idle in a prefill window | 77.9% | 48.4% |
+
+**Placement's host overhead per layer is now zero.** End to end at DP=2, four repeats each:
+
+| arm | before | after |
+| --- | --- | --- |
+| stock | 257.8 ms | 260.0 ms |
+| prediction only | 264.6 ms (+2.6%) | 259.6 ms (**-0.2%**) |
+| placing | 340.3 ms (**+32.0%**) | 266.6 ms (**about +3%**) |
+
+The placing arm's p99 is now the lowest of the three, 374.8-378.1 ms against stock's
+379-712 ms, and its repeat spread fell from 11.8% to 4.4%. Read the second run's stock median
+with care: its first repeat is 317.8 ms against 258-261 for the rest, so the paired per-repeat
+deltas — +2.1%, +2.1%, +6.4% — are the honest read.
+
+**The placement itself is unchanged**, 34.5-36.5% of full-prefill excess removed against
+34.8-36.6% before, `connected: true` on all four repeats. Both kernels are asserted
+bit-identical to the tensor implementations they replace, over randomised snapshots, a 200-plan
+publish sequence and the real expert geometries. That test caught the one bug that mattered:
+the kernels work in doubled integer units so half an expert is exact, and the shed amount is
+the *undoubled* load — using the doubled one refused 40 of 200 placements the tensor planner
+accepts, each time producing a plausible all-zero plan.
+
+**A correction to this session's own advice.** The arrival barrier measured 4.40 ms per forward
+and I proposed replacing it with pairwise put-with-signal. It now measures **0.23 ms** with
+nothing about it changed: it was exposing arrival skew, and the skew was the launch storm.
+Pairwise arrival is worth 0.23 ms and belongs well down the list. A collective's duration is
+mostly a measurement of what the other rank was doing — the same lesson as the 5090's
+2000x-spread AllGather.
+
 ## Code review, 2026-08-30 evening: three fixed, four open
 
 A review of the branch's unpushed work found seven issues. Three were fixed on the spot and

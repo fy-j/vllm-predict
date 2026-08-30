@@ -31,12 +31,13 @@ from collections.abc import Callable, Sequence
 
 import torch
 
-from vllm.distributed.eplb.device_publish import LayerResidency, publish_plan_on_device
+from vllm.distributed.eplb.device_publish import LayerResidency
 from vllm.distributed.eplb.device_transfer import DeviceExpertTransfer, WeightPointers
-from vllm.distributed.eplb.predictive_planner import (
-    plan_one_layer_on_device,
-    replica_row_of,
+from vllm.distributed.eplb.fused_placement import (
+    plan_and_charge_fused,
+    publish_plan_fused,
 )
+from vllm.distributed.eplb.predictive_planner import replica_row_of
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -170,6 +171,9 @@ class DevicePlacementCoordinator:
         self._transfer_plans = torch.zeros(
             (max(num_layers, 1), 4), dtype=torch.int64, device=device
         )
+        self._publish_plans = torch.zeros(
+            (max(num_layers, 1), 4), dtype=torch.int64, device=device
+        )
 
         # Evidence that the path did something, counted on the device and read rarely.
         # `analyse_e2e.py` and the bench runners treat an activation log line as the
@@ -272,36 +276,29 @@ class DevicePlacementCoordinator:
             self._spent.zero_()
         self._last_target = target
 
-        raw = plan_one_layer_on_device(predicted, self.ep_size, self.min_tokens)
-        residency = self._residency[target]
-        found = raw[0] > 0
-        keep = (
-            found
-            & (residency.expert >= 0)
-            & (residency.expert == raw[1])
-            & (residency.target == raw[2])
-        )
-        # Charged for what moves, not for what is planned. A replica already resident
-        # needs no transfer, so in a steady state the honest charge is zero and the
-        # budget bounds churn rather than coverage.
-        needs = found & ~keep
-        affordable = needs & (self._spent < self._budget)
-        charged = affordable.to(torch.int64)
-        self._spent += charged
-        self._placed_total += charged
-
-        publish_plan = torch.stack(
-            [(keep | affordable).to(torch.int64), raw[1], raw[2], raw[3]]
-        )
-        # Publishing runs on the compute stream and the plan stays referenced in
-        # `_pending` until it does, so a temporary is safe there. The transfer's is not:
-        # it goes into this layer's own row, which nothing frees. The row is rewritten
-        # only by a later forward, and `activate_and_publish` has made the compute
-        # stream wait on the transfer event by then, so a rewrite cannot overtake a
-        # kernel still reading it.
+        # One kernel for the plan, the residency check and the budget charge together.
+        # The tensor spelling of the same arithmetic measured **65 launches** — 46 to
+        # plan and 19 to charge — and in an eager engine each is a host dispatch:
+        # placement added 0.95 ms of host time per layer, about 42 ms per forward, and
+        # left the GPU idle for 78% of a prefill window. `plan_one_layer_on_device` is
+        # retained as the oracle this is tested against, not as the path.
+        #
+        # Both rows live in buffers this coordinator owns. Nothing frees them, so the
+        # kernels can read them on the predictive stream long after this returns; a
+        # temporary was freed the moment this method returned and the put then read
+        # whatever the forward allocated in its place.
         transfer_plan = self._transfer_plans[target]
-        transfer_plan.copy_(
-            torch.stack([affordable.to(torch.int64), raw[1], raw[2], raw[3]])
+        publish_plan = self._publish_plans[target]
+        plan_and_charge_fused(
+            predicted,
+            self._residency[target].state,
+            self._budget,
+            self._spent,
+            self._placed_total,
+            transfer_plan,
+            publish_plan,
+            self.ep_size,
+            self.min_tokens,
         )
 
         # Recorded on the compute stream **before** entering the predictive one, and
@@ -383,9 +380,12 @@ class DevicePlacementCoordinator:
         # requirement.
         event.wait()
         maps = self.maps[layer]
-        publish_plan_on_device(
+        # One kernel, where the tensor version measured 67 — the largest single piece of
+        # the 132 launches a placed layer used to cost. `publish_plan_on_device` is
+        # retained as the oracle it is tested against.
+        publish_plan_fused(
             plan=plan,
-            residency=self._residency[layer],
+            residency=self._residency[layer].state,
             logical_to_physical=maps.logical_to_physical,
             logical_replica_count=maps.logical_replica_count,
             source_local=maps.source_local,
@@ -394,10 +394,11 @@ class DevicePlacementCoordinator:
             replica_slots_per_rank=self.replica_slots_per_rank,
             source_rank=self.ep_rank,
         )
-        # All-ones, so the shared routing path's per-token replica choice stays a
-        # lookup:
-        # with one copy on offer a rank's chunk cannot be split.
-        maps.source_local_replica_count.fill_(1)
+        # The source-local count is all-ones invariantly — that *is* source-rank
+        # routing: one copy on offer, so a rank's chunk cannot be split — so it is set
+        # once when the coordinator is built rather than refilled per layer per forward.
+        # That refill was a placed layer's third kernel, behind the plan and the
+        # publish.
         return []
 
     def _transfer_stream(self):

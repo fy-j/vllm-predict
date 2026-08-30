@@ -34,6 +34,13 @@ Edges are listed rather than drawn: an ASCII diagram of this silently misaligned
 edges into neighbouring labels once, and each ticket's `Blocked by` field is
 authoritative anyway.
 
+**Placement costs about 3% of mean TTFT at DP=2, down from +32%** (2026-08-30). Two Triton
+kernels in `distributed/eplb/fused_placement.py` take a placed layer from **132 kernel
+launches to 2** — the device-side plan, publish and bookkeeping were tiny elementwise ops, and
+in an eager engine each was a host dispatch. Placement's host overhead per layer is now zero
+and the excess it removes is unchanged. Both kernels are asserted bit-identical to the tensor
+versions they replace, which are retained as the oracles.
+
 **`prediction_lookahead_layers` now defaults to 1, and the launch moved** (ticket 07,
 2026-08-30): the transfer is issued at the predicting layer's MoE **tail**, so the overlap
 window is the target layer's Attention and nothing more. Which site launches is the

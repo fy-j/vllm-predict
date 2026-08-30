@@ -1037,6 +1037,14 @@ class EplbState:
         # rather than rebuilding. They are allocated here so a layer cannot be reached
         # with them unset.
         self.publish_source_local_maps(model_config)
+        # And their replica counts are all-ones for the process's lifetime, which is
+        # what source-rank routing means: the map offers one copy, so a rank's chunk
+        # cannot be split across copies. Set here, once, because the device path used to
+        # refill it per layer per forward — 48 launches a forward to write a constant.
+        for layer_module in model.moe_layers:
+            count = layer_module.eplb_state.source_local_replica_count
+            if count is not None:
+                count.fill_(1)
 
         canonical_per_rank = model.num_logical_experts // ep_group.size()
         per_local = canonical_per_rank + predictive.replica_slots_per_rank

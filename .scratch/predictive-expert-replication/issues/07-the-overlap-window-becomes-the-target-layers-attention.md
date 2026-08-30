@@ -54,12 +54,15 @@ accuracy run and are listed at the bottom with what they need.
       the transfer is hidden. Two costs sit next to it, and the CPU side of the same traces
       ranks them. The barrier is worth **4.40 ms per forward** and pairwise arrival would
       remove it — NVSHMEM put-with-signal, with only the target rank waiting, which it can
-      decide on the device because the plan is rank-identical. The larger one is **53 extra
+      decide on the device because the plan is rank-identical. The larger one was **53 extra
       kernel launches and 0.95 ms of host time per layer**, about 42 ms per forward, from the
-      tiny elementwise and reduce kernels of `plan_one_layer_on_device`,
-      `publish_plan_on_device` and the device-side bookkeeping. That is ticket 03's defect in
-      a new place and takes the same fix. Details and the per-kernel table in
-      `bench/RESULTS.md`.
+      tiny elementwise and reduce kernels of the plan, the publish and the device-side
+      bookkeeping — ticket 03's defect in a new place. **Fixed the same way**: two Triton
+      kernels in `fused_placement.py` take a placed layer from 132 launches to 2, placement's
+      host overhead per layer to zero, and its mean TTFT from +32.0% to about +3%, with the
+      excess it removes unchanged at 34.5-36.5%. The barrier then measured 0.23 ms rather
+      than 4.40 — it had been exposing the launch storm's arrival skew rather than costing
+      anything itself. Details and the per-kernel tables in `bench/RESULTS.md`.
 - [ ] Prediction accuracy at lookahead 1 is reported against lookahead 2. **Needs an
       accuracy run** (`run_prediction_accuracy.sh`), which wants the GPUs to itself.
 - [x] The baseline from ticket 06 is held or improved. At DP=2 — this node's 8 GPUs became 2
