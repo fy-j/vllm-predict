@@ -40,9 +40,13 @@ PORT="${PORT:-8180}"
 # Three arms by default: `off` is the stock server (ticket 14's missing denominator),
 # `0` enables prediction but withholds placement, `43` places. Any two of these answer
 # a different question, so quote which pair a number came from.
-# An arm is `<budget>` or `<budget>:<transport>`, transport being `device` or `host`.
-# `43:host` pays the 5.28 ms per-layer host synchronisation and `43:device` does not, which
-# is the whole claim of ticket 06 and the one thing measurable at any rank count.
+# An arm is `<budget>[:<transport>[:<group>]]`, transport being `device` or `host` and
+# `group` the target group of ticket 12. `43:host` pays the 5.28 ms per-layer host
+# synchronisation and `43:device` does not, which is the whole claim of ticket 06.
+# Carrying the group **per arm** matters for the same reason arms are interleaved at all:
+# comparing a group of 4 against a group of 1 across two driver invocations charges the
+# difference with whatever the machine did in between, and that drift has measured 6.1%
+# on this baseline where the effect is a few points.
 BUDGETS="${BUDGETS:-off 0 43}"
 # Data-parallel size. 8 is where every recorded figure for this feature comes from; a
 # smaller value runs and is warned about at startup, because EP size sets the per-rank
@@ -93,9 +97,15 @@ echo "[e2e] domain=$DOMAIN"
 for repeat in $(seq 1 "$REPEATS"); do
 for arm in $BUDGETS; do
   budget="${arm%%:*}"
-  if [[ "$arm" == *:* ]]; then transport="${arm#*:}"; else transport="${DEFAULT_TRANSPORT:-device}"; fi
+  rest="${arm#*:}"
+  if [[ "$arm" == *:* ]]; then transport="${rest%%:*}"; else transport="${DEFAULT_TRANSPORT:-device}"; fi
+  # The third field is optional; absent means "whatever PRED_GROUP says", which is how
+  # every existing recorded run was labelled.
+  arm_group="${PRED_GROUP:-0}"
+  [[ "$rest" == *:* ]] && arm_group="${rest#*:}"
   label="$budget"
   [[ "$arm" == *:* ]] && label="${budget}-${transport}"
+  [[ "$rest" == *:* ]] && label="${label}-g${arm_group}"
   # The tag carries the repeat only when there is more than one, so a single-pass run keeps
   # the filenames every existing reader and every recorded result already expects.
   if [[ "$REPEATS" -gt 1 ]]; then tag="b${label}-r${repeat}"; else tag="b$label"; fi
@@ -128,8 +138,14 @@ cfg={'enabled': True, 'cost_profile_path': sys.argv[1],
      'device_issued_transfer': sys.argv[3] == 'device'}
 if int(sys.argv[2]) > 0:
     cfg['max_transfers_per_forward'] = int(sys.argv[2])
+if int(sys.argv[4]) > 0:
+    group = int(sys.argv[4])
+    cfg['prediction_target_group'] = group
+    # The window's collective is issued at its last source, so the distance must cover
+    # the window. Equality is the cheapest choice: a longer distance only costs accuracy.
+    cfg['prediction_lookahead_layers'] = group
 print(json.dumps({'predictive_expert_replication': cfg}))" \
-      "$PROFILE" "$budget" "$transport")
+      "$PROFILE" "$budget" "$transport" "$arm_group")
     FEATURE_ARGS=(
       --additional-config "$ADDITIONAL"
       --eplb-config '{"log_balancedness":true,"log_balancedness_interval":1,"step_interval":1000000000,"window_size":1000,"use_async":false}'
@@ -167,7 +183,9 @@ print(json.dumps({'predictive_expert_replication': cfg}))" \
   if [[ "$ready" -ne 1 ]]; then
     echo "[e2e] arm=$arm: never ready" >&2; tail -40 "$LOG" >&2
     kill -9 "$PID" 2>/dev/null || true; sleep 5
-    for p in $(ps -eo pid,cmd --no-headers | grep "VLLM::" | grep -v grep | awk '{print $1}'); do kill -9 "$p" 2>/dev/null; done
+    # `pgrep -f` matches the same worker processes the `ps | grep` pipeline did, without
+    # the grep-matches-itself hazard the `grep -v grep` was there to dodge.
+    for p in $(pgrep -f "VLLM::" || true); do kill -9 "$p" 2>/dev/null; done
     sleep 8; continue
   fi
   echo "[e2e] arm=$arm: ready"
@@ -234,22 +252,27 @@ print(json.dumps({'predictive_expert_replication': cfg}))" \
   kill -9 "$PID" 2>/dev/null || true
   wait "$PID" 2>/dev/null || true
   sleep 5
-  for p in $(ps -eo pid,cmd --no-headers | grep "VLLM::" | grep -v grep | awk '{print $1}'); do kill -9 "$p" 2>/dev/null; done
+  for p in $(pgrep -f "VLLM::" || true); do kill -9 "$p" 2>/dev/null; done
   sleep 10
 done
 done
 # One guard over every arm of every repeat, because the per-arm messages above only ever
 # printed. Three runs in this project reported success having measured nothing, and each of
 # them printed a warning to stderr and carried on.
-guard_arms=""
+guard_arms=()
 for repeat in $(seq 1 "$REPEATS"); do
   for arm in $BUDGETS; do
+    # The same construction the run loop uses. It was `${label}-${arm#*:}`, which turns
+    # `43:device:4` into `43-device:4` and sends the guard looking for files that do not
+    # exist — a guard that cries wolf on a healthy run is a guard that gets deleted.
     label="${arm%%:*}"
-    [[ "$arm" == *:* ]] && label="${label}-${arm#*:}"
-    if [[ "$REPEATS" -gt 1 ]]; then guard_arms="$guard_arms ${label}-r${repeat}"; else guard_arms="$guard_arms $label"; fi
+    rest="${arm#*:}"
+    if [[ "$arm" == *:* ]]; then label="${label}-${rest%%:*}"; fi
+    if [[ "$rest" == *:* ]]; then label="${label}-g${rest#*:}"; fi
+    if [[ "$REPEATS" -gt 1 ]]; then guard_arms+=("${label}-r${repeat}"); else guard_arms+=("$label"); fi
   done
 done
-if ! "$PY_BIN" "$HERE/check_run_measured.py" --results-dir "$OUT_DIR" --arms $guard_arms; then
+if ! "$PY_BIN" "$HERE/check_run_measured.py" --results-dir "$OUT_DIR" --arms "${guard_arms[@]}"; then
   echo "[e2e] MEASURED NOTHING - do not read $OUT_DIR" >&2
   exit 5
 fi

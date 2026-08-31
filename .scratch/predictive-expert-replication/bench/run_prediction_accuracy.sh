@@ -115,12 +115,14 @@ for lookahead in $LOOKAHEADS; do
   # dedicated flag.
   ADDITIONAL_CFG=$("$PY_BIN" -c "
 import json,sys
-print(json.dumps({'predictive_expert_replication': {
-  'enabled': True,
-  'cost_profile_path': sys.argv[1],
-  'prediction_lookahead_layers': int(sys.argv[2]),
-  'prediction_skip_first_layers': int(sys.argv[3]),
-}}))" "$PROFILE" "$lookahead" "$SKIP_FIRST")
+cfg={'enabled': True,
+     'cost_profile_path': sys.argv[1],
+     'prediction_lookahead_layers': int(sys.argv[2]),
+     'prediction_skip_first_layers': int(sys.argv[3])}
+if int(sys.argv[4]) > 0:
+    cfg['prediction_target_group'] = int(sys.argv[4])
+print(json.dumps({'predictive_expert_replication': cfg}))" \
+    "$PROFILE" "$lookahead" "$SKIP_FIRST" "${PRED_GROUP:-0}")
 
   # Deliberately the module form, not `vllm serve`. `vllm serve` starts one API
   # server per DP rank, and each rebuilds the config from serialized engine args;

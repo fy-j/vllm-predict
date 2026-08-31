@@ -34,6 +34,81 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 - **The cost is host synchronisation, not the transfers.** See the section below
   before touching anything.
 
+## Ticket 13, 2026-08-31: batching the snapshot works, but only from different sources
+
+Two designs were built for one collective per `K` layers. **The first was refuted on hardware
+and the second holds**, and the difference is the transferable part.
+
+**First design: one source predicts `K` targets.** It evaluated `K` target gates on one layer's
+hidden states — one concatenated GEMM, one counting kernel, one collective, and only every
+`K`-th layer predicting, so it attacked both halves of prediction's cost. 566 unit tests passed.
+On 8 GPUs it collapsed:
+
+| | full prefill excess removed |
+| --- | --- |
+| window 1, before the refactor | 26.5 / 26.7 / 27.0% |
+| window 1, after the refactor | **26.9 / 26.8%** |
+| first design at 4 | **3.7 / 4.6%** |
+
+Everything looked healthy: `connected: true`, 0 failed, 352 launches, coverage intact at 44 of
+44 layers. Only the benefit was gone. Ruled out in order: the refactor (window 1 after it
+reproduces window 1 before it to 0.1 points, so ticket 12's inertness holds on *benefit*, not
+only on launch counts), the row-to-target mapping (a differential test through the real runner
+loop), the collective's layout (a 4-rank gloo test: rank-major, target-minor, byte-identical),
+the binder, the fused gate projection (`block_norms` match the per-gate logits element for
+element), and instantaneous accuracy (distance 4 delivers 32.1% offline).
+
+**The cause is a property of the model, not a defect.** Four different logit vectors whose
+top-k selections are nearly the same:
+
+    within a group, the four predicted distributions differ by an L1 of 16, 24, 36
+    across groups, two sources' predictions differ by an L1 of 5412 to 7660
+    (of 7896 assignments)
+
+while the four target layers' *actual* loads are completely different. Applying four layers'
+gates to one layer's hidden states ranks experts almost identically — magnitudes differ by 20%
+but top-k only uses the ranking. So one target per group was planned from its own distribution
+and three were not: 13 of 44 layers improved, 4 got worse, the aggregated imbalance moved
+*more* than at window 1 (-0.0155 against -0.0134) while the critical path moved a seventh as
+much. Load was being shed, just not off each layer's own peak.
+
+**The methodological finding.** Ticket 11's accuracy curve measures *distance* with one source
+per target. The first design depended on "the same source distinguishes different targets", and
+that quantity is **0.2%**. It was never measured because nothing had asked for it. An offline
+accuracy curve is not a substitute for the quantity a design actually rests on.
+
+**Second design: a window of `K` consecutive sources, each predicting its own target.** Each
+writes one row of a shared buffer and the window's last source issues the single AllGather.
+Measured in the same interleaved passes:
+
+| arm | full prefill excess | mean TTFT | vs stock |
+| --- | --- | --- | --- |
+| stock | — | 180.30 ms | — |
+| prediction only, window 1 | — | 203.03 ms | +12.6% |
+| placing, window 1 | 26.8 / 26.7 / 26.8% | 187.25 ms | +3.9% |
+| **placing, window 4** | **20.8 / 20.7 / 20.8%** | **182.15 ms** | **+1.0%** |
+
+**78% of the benefit survives**, against the first design's 14%. Placement's own contribution is
+**-20.9 ms** (203.03 -> 182.15) where the first design's was zero. The feature's total cost is
+**+1.0%**, inside the baseline's own 4.3% spread — the first configuration this project has had
+that a run cannot distinguish from stock. That is not a claim of break-even: it is a claim that
+this measurement cannot resolve the difference, and resolving it needs the tighter baseline this
+operating point has reached before (0.3%).
+
+Two things are open. The excess loss is **6.0 points** where the distance curve predicts 2.8;
+about 2 of those are coverage, since a lookahead of 4 leaves 41 reachable targets rather than 44
+(the smoke confirms it at 328 launches, not 352), and roughly 1 point is unexplained. And the
+default is still `prediction_target_group = 1`.
+
+**The staging hazard this design would have made likely is removed rather than tolerated.** The
+recorded hazard — `barrier_all` orders arrival, not one rank's next put against another's drain
+— was survivable only because consecutive same-buffer layers were a layer of compute apart. A
+window removes that margin. Verified first with the runtime replica-weight check (real weights,
+window 4, 60 forwards, no mismatch on any of them), and then made impossible: the staging buffer
+is indexed by `target % staging_buffers` with one buffer per window position, at
+`group x 9.00 MiB` per rank — 36 MiB at a window of 4 against the 432 MiB the replica slots
+already hold.
+
 ## Ticket 11, 2026-08-30 night: prediction's cost is half barriers and half launches
 
 Read this with the `06` section below; `11` is new and it is the mainline. `06` established

@@ -482,6 +482,7 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
                 ],
                 lookahead=predictive_config.prediction_lookahead_layers,
                 skip_first_layers=predictive_config.prediction_skip_first_layers,
+                group=predictive_config.prediction_target_group,
             )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(

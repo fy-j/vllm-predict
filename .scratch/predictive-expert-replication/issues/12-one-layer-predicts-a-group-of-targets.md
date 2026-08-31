@@ -19,30 +19,46 @@ against a mechanism already known to be correct, which is ticket 13.
 **Blocked by:** None (can start immediately). Ticket 11 supplies the measurements that justify
 it and is answered.
 
-**Status:** ready-for-agent
+**Status:** DONE 2026-08-31. The mechanism is in, defaulting to a group of 1, and its
+inertness there is asserted twice: by equality in unit tests, and on 8 GPUs with real
+weights where the smoke reports **exactly the figures it reported before the refactor** —
+352 launches (44 targets x 8 ranks), 32 replicas placed, 0 host-path fallbacks, 0 crash
+signatures. 566 tests pass.
 
-- [ ] A group size knob, defaulting to **1**, with validation that rejects a value leaving no
-      source layer or naming a target past the last layer. It interacts with
-      `prediction_lookahead_layers`: inside a group the distances are `1..K`, so the existing
-      lookahead knob becomes the group's *first* distance and the two must not be able to
-      describe contradictory shapes. Decide which one survives and say so in the rejection
-      message.
-- [ ] One source layer's prediction produces `K` count vectors from one set of hidden states,
+**One thing this ticket expected to build and did not have to.** The coordinator needed no
+change to hold `K` pending plans: `_pending` is already a dict keyed by target layer, and
+targets still advance monotonically within a forward because a group's targets are
+consecutive and the next group starts after them. Ticket 06's two invariants — a leftover
+pending plan raises, and a plan from another forward raises — keep holding unmodified. The
+only widening was a `target_offset` argument on `record_prediction`, defaulting to 0, which
+is the call that shipped.
+
+- [x] A group size knob, defaulting to **1**, with validation that rejects a value leaving no
+      source layer or naming a target past the last layer. **Both knobs survive and their
+      meanings are disjoint**: `prediction_lookahead_layers` is the distance to the group's
+      *first* target and `prediction_target_group` is how many follow it, so the distances
+      inside a group are `lookahead .. lookahead + group - 1` and no pair of values describes
+      two different shapes. The binder additionally rejects a group that does not **divide**
+      the reachable target span, because the remainder would be trailing layers that never
+      receive a prediction — invisible in any aggregate, and the same class as the recorded
+      22-against-44 coverage bug. The host-issued path rejects any group above 1, since it
+      holds one recorded prediction at a time.
+- [x] One source layer's prediction produces `K` count vectors from one set of hidden states,
       through one concatenated gate GEMM and one counting kernel launch, not `K` of each. The
       top-k stays per target, because it is vLLM's own kernel and shared with real routing.
-- [ ] One AllGather per group carries `[K, num_logical]`, and the snapshot the planner sees is
+- [x] One AllGather per group carries `[K, num_logical]`, and the snapshot the planner sees is
       `[ep_size, K, num_logical]` with each target layer reading its own row.
-- [ ] The registry binds groups rather than adjacent pairs: a source layer binds `K` targets,
+- [x] The registry binds groups rather than adjacent pairs: a source layer binds `K` targets,
       the layers inside its group bind none, and coverage is unchanged — every layer from
       `prediction_skip_first_layers + 1` to the last is still some group's target.
-- [ ] The coordinator holds up to `K` inbound pending plans, each keyed by its target layer and
+- [x] The coordinator holds up to `K` inbound pending plans, each keyed by its target layer and
       stamped with the forward that produced it, and every one is still produced and consumed
       within the same forward. Ticket 06's two invariants keep holding: a leftover pending plan
       raises, and a plan from another forward raises.
-- [ ] **At K=1 the whole path is bit-identical to the one it replaces**, asserted by equality
+- [x] **At K=1 the whole path is bit-identical to the one it replaces**, asserted by equality
       over randomised hidden states and randomised snapshots: the same predicted counts, the
       same plan rows, the same published `logical_to_physical`, `logical_replica_count`,
       source-local map and layout. This is the criterion the ticket exists for; a K=1 default
       that merely "looks right" is worth nothing.
-- [ ] The existing suites still pass unchanged, and a real server at K=1 still activates on
+- [x] The existing suites still pass unchanged, and a real server at K=1 still activates on
       every reachable layer with the same excess removed as today's 26.5-27.0%.

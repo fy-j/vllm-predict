@@ -22,65 +22,59 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm.distributed.eplb.predictive import CrossLayerLoadPredictor
-
-
-class _Predictor(CrossLayerLoadPredictor):
-    """A predictor with the gate, the router and the EPLB state left out.
-
-    Only the snapshot half is under test here, and building the other half would drag in
-    a model. Constructed through `__new__` so the base class's required collaborators
-    stay honestly absent rather than faked.
-    """
-
-    @staticmethod
-    def build(num_logical: int, ep_size: int) -> _Predictor:
-        predictor = _Predictor.__new__(_Predictor)
-        predictor.num_logical_experts = num_logical
-        predictor._local_counts = None
-        predictor._snapshot_flat = None
-        predictor._work = None
-        predictor._probe_counts = None
-        predictor._ep_size_for_probe = ep_size
-        return predictor
+from vllm.distributed.eplb.predictive import PredictionWindow
 
 
 class TestSkippingTheAllGatherKeepsTheShapeAndTheCounts:
-    """The probe must change one thing: whether a collective runs."""
+    """The probe must change one thing: whether a collective runs.
 
-    def test_the_snapshot_still_has_one_row_per_rank(self, monkeypatch):
-        # The planner indexes `[source rank, logical expert]` and derives the peak rank
-        # from row sums, so a probe returning a different shape would exercise a
-        # different code path and measure something else.
+    It lives on `PredictionWindow` since ticket 13's second design, because that is
+    where
+    the collective moved: a window's sources each write a row and only the last one
+    gathers.
+    """
+
+    def _window(self, size, num_logical, ep_size):
+        window = PredictionWindow(size=size, num_logical_experts=num_logical)
+        window._ep_size = ep_size
+        for position in range(size):
+            window.row(position, torch.device("cpu"), num_logical)
+        return window
+
+    def test_the_snapshot_still_has_a_row_per_rank_and_per_source(self, monkeypatch):
+        # The planner indexes `[source rank, window position, logical expert]`, so a
+        # probe
+        # returning a different shape would exercise a different code path downstream.
         monkeypatch.setattr(
             "vllm.envs.VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER", True, raising=False
         )
-        predictor = _Predictor.build(num_logical=8, ep_size=4)
-        counts = torch.tensor([3, 0, 1, 0, 0, 5, 0, 2], dtype=torch.int32)
+        window = self._window(size=2, num_logical=8, ep_size=4)
+        window.counts[0, 3] = 7
 
-        predictor.start_snapshot(counts)
-        snapshot = predictor.finish_snapshot()
+        window.start_snapshot()
+        snapshot = window.finish_snapshot()
 
         assert snapshot is not None
-        assert snapshot.shape == (4, 8)
+        assert snapshot.shape == (4, 2, 8)
 
-    def test_every_row_is_this_ranks_own_counts(self, monkeypatch):
+    def test_every_rank_row_is_this_ranks_own_counts(self, monkeypatch):
         """Which is exactly why it may not be used to plan: rows are not per rank."""
         monkeypatch.setattr(
             "vllm.envs.VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER", True, raising=False
         )
-        predictor = _Predictor.build(num_logical=4, ep_size=2)
-        counts = torch.tensor([7, 0, 0, 1], dtype=torch.int32)
+        window = self._window(size=1, num_logical=4, ep_size=2)
+        window.counts[0] = torch.tensor([7, 0, 0, 1], dtype=torch.int32)
 
-        predictor.start_snapshot(counts)
-        snapshot = predictor.finish_snapshot()
+        window.start_snapshot()
+        snapshot = window.finish_snapshot()
 
         assert torch.equal(snapshot[0], snapshot[1])
-        assert snapshot[0].tolist() == [7, 0, 0, 1]
+        assert snapshot[0, 0].tolist() == [7, 0, 0, 1]
 
     def test_no_collective_is_started(self, monkeypatch):
         # The whole point. If `all_gather_into_tensor` still ran, the probe would
-        # measure the thing it exists to remove.
+        # measure
+        # the thing it exists to remove.
         monkeypatch.setattr(
             "vllm.envs.VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER", True, raising=False
         )
@@ -90,20 +84,20 @@ class TestSkippingTheAllGatherKeepsTheShapeAndTheCounts:
             "all_gather_into_tensor",
             lambda *a, **k: called.append(1),
         )
-        predictor = _Predictor.build(num_logical=4, ep_size=2)
+        window = self._window(size=2, num_logical=4, ep_size=2)
 
-        predictor.start_snapshot(torch.zeros(4, dtype=torch.int32))
-        predictor.finish_snapshot()
+        window.start_snapshot()
+        window.finish_snapshot()
 
         assert called == []
 
-    def test_finish_without_start_still_returns_nothing(self, monkeypatch):
-        """The runner calls `finish_snapshot` on layers that never predicted."""
+    def test_a_window_that_never_predicted_returns_nothing(self, monkeypatch):
+        """The runner reaches layers whose window has not been written this forward."""
         monkeypatch.setattr(
             "vllm.envs.VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER", True, raising=False
         )
-        predictor = _Predictor.build(num_logical=4, ep_size=2)
-        assert predictor.finish_snapshot() is None
+        window = PredictionWindow(size=1, num_logical_experts=4)
+        assert window.finish_snapshot() is None
 
 
 class TestThePlacementPathRefusesTheProbe:

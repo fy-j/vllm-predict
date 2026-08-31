@@ -315,9 +315,16 @@ class _RecordingRunner:
     def __init__(self, name: str):
         self.name = name
         self.bound_target: _RecordingRunner | None = None
+        self.window = None
+        self.window_position = None
 
-    def bind_prediction_target(self, target: "_RecordingRunner") -> None:
+    def bind_prediction_target(self, target, window=None, position=0) -> None:
+        # One target since ticket 13's second design: a source predicts its own target
+        # from its own hidden states, and what a group shares is the *collective*, which
+        # arrives here as the window.
         self.bound_target = target
+        self.window = window
+        self.window_position = position
 
     @property
     def target_name(self) -> str:
@@ -561,13 +568,17 @@ def _snapshot_worker(rank: int, world_size: int, tmp_dir: str) -> None:
         )
         # Rank r predicts r + 1 tokens for logical expert r, so provenance is
         # visible in the gathered matrix.
-        local_counts = torch.zeros(num_logical, dtype=torch.int32)
+        # Written where `predict_local_counts` writes it: the source's own row of its
+        # window. Handing it to `start_snapshot` was the first design's shape and that
+        # argument is now ignored.
+        local_counts = predictor.window.row(0, torch.device("cpu"), num_logical)
         local_counts[rank % num_logical] = rank + 1
 
-        predictor.start_snapshot(local_counts)
+        predictor.start_snapshot()
         snapshot = predictor.finish_snapshot()
 
-        assert snapshot.shape == (world_size, num_logical)
+        assert snapshot.shape == (world_size, 1, num_logical)
+        snapshot = snapshot[:, 0, :]
         for source_rank in range(world_size):
             expected = torch.zeros(num_logical, dtype=torch.int32)
             expected[source_rank % num_logical] = source_rank + 1
@@ -1843,7 +1854,8 @@ class TestTheLaunchSiteFollowsTheCoordinator:
     """
 
     def _runner(self, tail: bool, layer: int = 3):
-        calls: list[tuple[str, object]] = []
+        # A record now carries its target offset, so the rows are not all pairs.
+        calls: list[tuple] = []
 
         def note(load):
             calls.append(("note", load))
@@ -1856,8 +1868,8 @@ class TestTheLaunchSiteFollowsTheCoordinator:
             calls.append(("publish", index))
             return []
 
-        def record(index, predicted):
-            calls.append(("record", index))
+        def record(index, predicted, target_offset=0):
+            calls.append(("record", index, target_offset))
 
         coordinator = SimpleNamespace(
             launch_at_predicting_layer_tail=tail,
@@ -1870,6 +1882,8 @@ class TestTheLaunchSiteFollowsTheCoordinator:
             placement_coordinator=coordinator,
             moe_layer_index=layer,
             _forward_tokens_per_expert=lambda: 1024.0,
+            # The hook reads the window's size to map a row back to its source's target.
+            load_predictor=SimpleNamespace(window=SimpleNamespace(size=1)),
         )
         return runner, calls
 
@@ -1881,8 +1895,10 @@ class TestTheLaunchSiteFollowsTheCoordinator:
     def _after_snapshot(self, runner, snapshot=None):
         from vllm.model_executor.layers.fused_moe.runner import moe_runner as mod
 
+        # `[ep_size, group, num_logical]` since ticket 12; the group axis is what the
+        # runner iterates to record one plan per target.
         mod.MoERunner._placement_after_snapshot(
-            runner, snapshot if snapshot is not None else torch.ones(4)
+            runner, snapshot if snapshot is not None else torch.ones(2, 1, 4)
         )
 
     def test_the_device_path_launches_after_recording_its_own_prediction(self):
@@ -1891,7 +1907,7 @@ class TestTheLaunchSiteFollowsTheCoordinator:
         self._before_routing(runner)
         self._after_snapshot(runner)
 
-        assert calls == [("publish", 3), ("record", 3), ("launch", None)], (
+        assert calls == [("publish", 3), ("record", 3, 0), ("launch", None)], (
             "the launch must follow this layer's own prediction, so the transfer runs "
             "during the target layer's Attention"
         )
@@ -1902,10 +1918,31 @@ class TestTheLaunchSiteFollowsTheCoordinator:
         self._before_routing(runner)
         self._after_snapshot(runner)
 
-        assert calls == [("launch", None), ("publish", 3), ("record", 3)], (
+        assert calls == [("launch", None), ("publish", 3), ("record", 3, 0)], (
             "the host path must keep launching a layer later, because its planner "
             "synchronises and would stall the predicting layer"
         )
+
+    def test_a_window_records_and_launches_once_per_source_in_order(self):
+        """Ticket 13: one plan per source in the window, one collective for all of them.
+
+        This layer is the window's **last** source, so its own row is the last position
+        and the earlier rows belong to layers behind it — hence the negative offsets. A
+        positive offset here would plan a layer ahead of this window's own target.
+        """
+        runner, calls = self._runner(tail=True)
+        runner.load_predictor = SimpleNamespace(window=SimpleNamespace(size=3))
+
+        self._after_snapshot(runner, torch.ones(2, 3, 4))
+
+        assert calls == [
+            ("record", 3, -2),
+            ("launch", None),
+            ("record", 3, -1),
+            ("launch", None),
+            ("record", 3, 0),
+            ("launch", None),
+        ]
 
     def test_the_target_layers_head_publishes_whatever_the_launch_site(self):
         """Publishing is unconditional: an empty desired set is what reverts."""

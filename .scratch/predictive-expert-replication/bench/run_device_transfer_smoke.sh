@@ -63,10 +63,13 @@ PY
 
 ADDITIONAL=$("$PY" -c "
 import json,sys
-print(json.dumps({'predictive_expert_replication': {
-  'enabled': True, 'cost_profile_path': sys.argv[1],
-  'device_issued_transfer': True,
-}}))" "$PROFILE")
+cfg={'enabled': True, 'cost_profile_path': sys.argv[1],
+     'device_issued_transfer': True}
+if int(sys.argv[2]) > 0:
+    group = int(sys.argv[2])
+    cfg['prediction_target_group'] = group
+    cfg['prediction_lookahead_layers'] = group
+print(json.dumps({'predictive_expert_replication': cfg}))" "$PROFILE" "${PRED_GROUP:-0}")
 
 LOAD=(--load-format dummy)
 [[ "${REAL:-0}" == "1" ]] && LOAD=()

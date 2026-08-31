@@ -1246,7 +1246,13 @@ class EplbState:
             # against the peer's local drain out of that workspace. One extra expert of
             # symmetric memory, 9.00 MiB on this model, against a silent corruption of a
             # replica row.
-            staging = self._symmetric_staging(ep_group, staging_stride, buffers=2)
+            # One staging buffer per source in a prediction window, so no two transfers
+            # launched together can share one. Two is the floor, which is the
+            # single-source configuration and the scheme that shipped.
+            staging_buffers = max(2, predictive.prediction_target_group)
+            staging = self._symmetric_staging(
+                ep_group, staging_stride, buffers=staging_buffers
+            )
             transfer = DeviceExpertTransfer(
                 staging=staging,
                 ep_rank=ep_group.rank(),
@@ -1294,6 +1300,7 @@ class EplbState:
             device=self.device,
             stream=self._placement_stream(),
             staging_stride=staging_stride,
+            staging_buffers=staging_buffers,
         )
         # Remembered so `close` can release the kernels this rank registered. Assigned
         # rather than appended to, because the declaration's default is class-level and

@@ -198,6 +198,44 @@ class PredictiveExpertReplicationConfig:
     land in, and it costs prediction accuracy to do it. With `device_issued_transfer`
     off the launch cannot move, so 1 leaves no window at all and is rejected.
     """
+    prediction_target_group: int = Field(default=1, ge=1)
+    """Source layers that share one snapshot collective. Their window, not their
+    targets.
+
+    Every layer in the source range still predicts **its own** target at
+    `prediction_lookahead_layers`, from its own hidden states. What the group batches is
+    the
+    collective: the window's sources each write one row of a shared count buffer and the
+    window's **last** source issues a single AllGather for all of them, taking the
+    collectives from one per source to one per window.
+
+    **This is the second design, and the first one is why the distinction matters.**
+    Having
+    one source predict `group` targets was built, measured and refuted: four different
+    layers' gates applied to the *same* hidden states select almost the same experts —
+    the
+    four predicted distributions differed by an L1 of 16 to 36 out of 7896 assignments
+    while
+    the four target layers' actual loads differed by 5412 to 7660 — so three of every
+    four
+    targets were planned from a distribution that was not theirs and placement's benefit
+    fell from 26.9% of critical-path excess to 3.7%. Predictions have to come from
+    different
+    source layers to be distinguishable.
+
+    **Default 1, which is the path that shipped.** Ticket 11 measured what raising it
+    buys:
+    of the 23.21 ms prediction adds to mean TTFT at EP=8, 11.04 ms is the 44 per-layer
+    collectives at 0.22 ms of barrier coupling each. Unlike the first design this does
+    not
+    reduce the number of predicting layers, so it attacks that half only.
+
+    Requires `prediction_lookahead_layers >= prediction_target_group`: the collective is
+    issued at the window's last source, so a shorter distance would have the window's
+    first
+    target already behind it. Requires the device-issued transfer, because the host
+    coordinator holds one recorded prediction at a time.
+    """
     prediction_skip_first_layers: int = Field(default=3, ge=0)
     """Leading sparse MoE layers that predict nothing.
 
@@ -318,6 +356,32 @@ class PredictiveExpertReplicationConfig:
                 f"max_replicas_per_layer=1 only, got {self.max_replicas_per_layer}. "
                 f"Set device_issued_transfer=False to use the host path, which honours "
                 f"the cap and pays a host synchronisation per predicted layer."
+            )
+        if self.prediction_target_group > self.prediction_lookahead_layers:
+            # The window's collective is issued at its last source, so with a lookahead
+            # shorter than the window the first target has already run by then. Rejected
+            # at
+            # startup rather than left to the binder, so a bad configuration cannot get
+            # as
+            # far as building a model.
+            raise ValueError(
+                f"Predictive expert replication needs prediction_lookahead_layers "
+                f"({self.prediction_lookahead_layers}) to be at least "
+                f"prediction_target_group ({self.prediction_target_group}): the "
+                f"window's "
+                f"snapshot collective is issued at its last source, and a shorter "
+                f"distance would plan a target layer that has already run."
+            )
+        if self.prediction_target_group > 1 and not self.device_issued_transfer:
+            # The host coordinator keeps one recorded prediction at a time, so a group
+            # larger than one would plan only its last target and leave the rest of the
+            # group unplaced with nothing logged. Rejected rather than silently reduced,
+            # the same way a lookahead of 1 is rejected on that path.
+            raise ValueError(
+                f"Predictive expert replication's host-issued path supports "
+                f"prediction_target_group=1 only, got {self.prediction_target_group}. "
+                f"It holds one recorded prediction at a time, so a larger group would "
+                f"plan only its last target. Set device_issued_transfer=True."
             )
         for field_name, only_supported in (
             ("replica_slots_per_rank", 1),

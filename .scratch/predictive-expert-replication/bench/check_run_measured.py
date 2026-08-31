@@ -41,15 +41,24 @@ from analyse_e2e import is_connected, summarize
 
 
 def _budget_of(arm: str) -> str:
-    """The budget an arm name refers to, with any repeat suffix removed.
+    """The budget an arm name refers to, stripped of every label decoration.
 
-    Repeated runs label arms `off-r1`, `0-r2` and so on, and every check below is about
-    the budget, not the pass. Comparing the whole label against `"off"` made each repeat
-    look like a placing arm, so the guard faulted the stock baseline for having no dump
-    and no activation, failing a run whose nine arms were healthy. A guard that cries
-    wolf gets deleted.
+    An arm label is `<budget>[-<transport>][-g<group>][-r<repeat>]`, and every check
+    below
+    is about the budget alone. This has now cried wolf twice on a label change, and each
+    time the run it failed was healthy:
+
+    * the repeat suffix (`off-r1`, `0-r2`) made every repeat look like a placing arm, so
+      the guard faulted the stock baseline for having no dump and no activation;
+    * the transport and group infixes (`0-device-g1`) made a **zero-budget** arm look
+      non-zero, so the guard called the prediction-only arm inert for correctly placing
+      nothing.
+
+    So the budget is taken as the leading field rather than by removing known suffixes:
+    anything else is a decoration this function must not know about. A guard that
+    cries wolf gets deleted.
     """
-    return arm.split("-r")[0]
+    return arm.split("-")[0]
 
 
 def _arm_records_load(arm: str) -> bool:

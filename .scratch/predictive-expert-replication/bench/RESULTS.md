@@ -3235,3 +3235,115 @@ But +4.8% against a 5.26% ceiling and a ~4% return is **break-even, not positive
 half is 52% of the cost and no batching or device-side reduction touches it, which makes
 **ticket 09 (CUDA graph capture) the largest single lever left**. It is held back by the spec's
 eager-execution mandate, not by evidence.
+
+## 2026-08-31 — ticket 13: two designs for one collective, and only the second holds
+
+### Design one: one source predicts K targets. Refuted on hardware
+
+Built, 566 unit tests green, served on 8 GPUs, and the benefit collapsed:
+
+| | full prefill excess removed |
+| --- | --- |
+| window 1, before ticket 12's refactor | 26.5 / 26.7 / 27.0% |
+| window 1, after it | **26.9 / 26.8%** |
+| design one at 4 | **3.7 / 4.6%** |
+
+`connected: true`, 0 failed requests, 352 launches, coverage 44 of 44. Per layer only 13 of 44
+improved and 4 got worse, spread across every `index % 4`.
+
+Ruled out in order, each by measurement rather than reading: **the refactor** (window 1 after it
+reproduces window 1 before it to 0.1 points, so ticket 12's inertness holds on benefit and not
+only on launch counts); **the row-to-target mapping** (a differential test drives the real runner
+loop with a fixture whose rows imply four different experts); **the collective's layout** (a
+4-rank gloo test: rank-major, target-minor, byte-identical across ranks); **the binder** (11
+sources, 44 distinct targets, no duplicates); **the fused gate projection** (`block_norms` equal
+the per-gate logits element for element: 5853.137 / 5284.649 / 4802.325 / 4841.524); and
+**instantaneous accuracy** (distance 4 delivers 32.1% offline).
+
+**The cause, from the accuracy dump at window 4 on real weights.** Every pair's `predicted` is
+the whole `[4, 128]` group, and the four rows are nearly the same while the four targets' actual
+loads are not:
+
+    within a group, L1 between predicted rows:   0, 16, 24, 36
+    across groups, L1 between row0 and row0:     0, 7186, 7660, 5412
+    (of 7896 assignments)
+
+    target 4 actual[:8] = [56, 185,   3,   0, 135,  59,  85, 981]
+    target 5 actual[:8] = [18,   8, 464, 496,   0, 222,   1, 248]
+    target 6 actual[:8] = [49,  14,   0,   9, 377,   0,  29, 444]
+    target 7 actual[:8] = [ 0, 105,  45,  29,  28, 103,   6,  27]
+
+Four different logit vectors — the norms differ by 20% — whose **top-k selections are nearly
+identical**, because top-k uses only the ranking. So one target per group was planned from its
+own distribution and three were not. The aggregated imbalance moved *more* than at window 1
+(-0.0155 against -0.0134) while the critical path moved a seventh as much: load was shed, just
+not off each layer's own peak.
+
+**The methodological finding.** Ticket 11's curve measures *distance*, one source per target.
+Design one rested on "the same source distinguishes different targets", which is **0.2%** and
+was never measured because nothing had asked for it.
+
+### Design two: a window of K sources, each predicting its own target. It holds
+
+Each source writes one row and the window's last source issues the single AllGather.
+`lookahead >= group` is required and rejected in the binder and at startup, since the collective
+is issued at the window's last source. Four arms, interleaved, three passes:
+
+| arm | full prefill excess | mean TTFT | median | p99 | own spread | vs stock |
+| --- | --- | --- | --- | --- | --- | --- |
+| stock | — | 180.30 ms | 172.01 | 331.09 | 4.3% | — |
+| prediction only, window 1 | — | 203.03 ms | 199.51 | 307.36 | 6.3% | +12.6% |
+| placing, window 1 | 26.8 / 26.7 / 26.8% | 187.25 ms | 179.72 | 317.34 | 1.1% | +3.9% |
+| **placing, window 4** | **20.8 / 20.7 / 20.8%** | **182.15 ms** | 171.33 | 300.19 | 1.5% | **+1.0%** |
+
+**78% of the benefit survives** against design one's 14%. Placement's own contribution is
+**-20.9 ms** (203.03 -> 182.15) where design one's was zero, and the excess spread is 0.1 points
+over three repeats with 33 full-prefill forwards per arm on both sides.
+
+**+1.0% sits inside the baseline's own 4.3% spread.** That is not break-even; it is a run that
+cannot resolve the difference from stock, and resolving it needs the 0.3% baseline this operating
+point has produced before.
+
+**Open: the excess loss is 6.0 points where the distance curve predicts 2.8.** About 2 points are
+coverage — a lookahead of 4 leaves 41 reachable targets rather than 44, and the smoke confirms it
+at 328 launches rather than 352 — leaving roughly 1 point unexplained.
+
+### The staging hazard: checked, then removed
+
+The recorded hazard is that `barrier_all` orders arrival, not one rank's next put against
+another rank's drain, so two layers sharing a staging buffer can collide. Two buffers alternating
+by layer parity survived only on timing: consecutive same-buffer layers were a layer of compute
+plus about 1 ms of host work apart, against a 1.1 us drain. **A window removes that margin** —
+its transfers all launch at its last source, microseconds apart — and at a window of 4 the first
+and third targets share parity.
+
+Checked with the runtime replica-weight verification, real weights, window 4:
+
+    328 launches = 41 targets x 8 ranks,  32 replicas placed over 60 forwards
+    verified 4 dynamically placed replica (layer, expert) pairs hold their canonical weights
+    checksum mismatches: 0 on any forward
+
+The check runs every forward and raises on the one that finds a mismatch, so the absence covers
+all 60. **That is "not observed", not "cannot happen"** — a race is precisely what a 60-forward
+run cannot clear. So it is removed instead: the staging buffer is indexed by
+`target % staging_buffers` with one buffer per window position, so no two transfers launched
+together share one, while buffers a whole window apart keep that window's compute between them.
+Two stays the floor, which is the configuration that shipped. Cost: `group x 9.00 MiB` of
+symmetric memory per rank, 36 MiB at a window of 4 against the 432 MiB the replica slots hold.
+The alternative — a second barrier after each drain — costs a collective per layer, which is
+what this ticket removes.
+
+### Two process failures worth recording
+
+**A guard cried wolf for the second time on a label change.** `check_run_measured.py` parses the
+budget from an arm label, and the new `-device-gN` infix made a **zero-budget** arm look
+non-zero, so a healthy four-arm run was failed as `MEASURED NOTHING` for "no placement log line
+despite a non-zero budget" — on the prediction-only arm, which correctly places nothing. It had
+already been fixed once for the `-rN` suffix. It now takes the leading field rather than
+stripping known suffixes, with tests over every label form.
+
+**A signature changed in the fakes and not in the thing.** The binder moved to a three-argument
+`bind_prediction_target(target, window, position)`; the unit tests' fake runners were updated and
+the real `MoERunner` was not. 566 tests passed and the first 8-GPU server died on
+`TypeError: bind_prediction_target() takes 2 positional arguments but 4 were given`. Same shape
+as design one's failure: the stand-in was tested, not the thing.

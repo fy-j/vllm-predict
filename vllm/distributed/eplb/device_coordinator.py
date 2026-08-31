@@ -116,11 +116,12 @@ class DevicePlacementCoordinator:
         event_factory: Callable[[], torch.cuda.Event] | None = None,
         slot: int = 0,
         staging_stride: int = 0,
+        staging_buffers: int = 2,
     ):
-        """See the class docstring; only `staging_stride` needs a note here.
+        """See the class docstring; only the staging arguments need a note here.
 
         Args:
-            staging_stride: Bytes between the two staging buffers the transfer
+            staging_stride: Bytes between the staging buffers the transfer
                 alternates between: one expert of the largest layer. Zero disables the
                 alternation and is rejected: a silently shared workspace is the failure
                 this argument exists to prevent, and it corrupts a replica row without
@@ -130,6 +131,12 @@ class DevicePlacementCoordinator:
             raise ValueError(
                 f"staging_stride must be one expert's bytes so consecutive layers can "
                 f"alternate staging buffers; got {staging_stride}."
+            )
+        if staging_buffers < 2:
+            # One buffer is the shared workspace this alternation exists to avoid.
+            raise ValueError(
+                f"staging_buffers must be at least 2 so consecutive layers do not "
+                f"share a workspace; got {staging_buffers}."
             )
         self.ep_size = ep_size
         self.ep_rank = ep_rank
@@ -146,6 +153,7 @@ class DevicePlacementCoordinator:
         self.slot = slot
         self.replica_row = replica_row_of(canonical_per_rank, slot)
         self.staging_stride = staging_stride
+        self.staging_buffers = staging_buffers
         self._event_factory = event_factory or torch.cuda.Event
         self.last_event: torch.cuda.Event | None = None
 
@@ -250,17 +258,28 @@ class DevicePlacementCoordinator:
                 self._forwards,
             )
 
-    def record_prediction(self, source_layer: int, predicted: torch.Tensor) -> None:
-        """Keep a source layer's predicted load. No copy, no event, no planning.
+    def record_prediction(
+        self, source_layer: int, predicted: torch.Tensor, target_offset: int = 0
+    ) -> None:
+        """Keep one target's predicted load. No copy, no event, no planning.
 
         The host path copied this to pinned memory and synchronised on it a layer later.
         Nothing here leaves the device, so the snapshot is simply held.
+
+        Args:
+            source_layer: The layer that produced the prediction.
+            predicted: Predicted per-logical-expert load for this target, either an
+                `[ep_size, num_logical]` snapshot slice or already summed.
+            target_offset: Position of this target within the source's group, so the
+                target is `source_layer + lookahead + target_offset`. Zero for a group
+                of
+                one, which is the call that shipped.
 
         Raises:
             ValueError: If the target layer would be past the last one, which means the
                 caller bound a source it should not have.
         """
-        target = source_layer + self.lookahead
+        target = source_layer + self.lookahead + target_offset
         if target >= self.num_layers:
             raise ValueError(
                 f"layer {source_layer} predicts layer {target}, beyond the last layer "
@@ -328,24 +347,30 @@ class DevicePlacementCoordinator:
             if self.stream is not None:
                 self.stream.wait_event(barrier)
             if not _SKIP_TRANSFER:
-                # Alternating staging buffers by layer parity. The sequence per layer is
-                # put, barrier, drain, and `barrier_all` orders *arrival*, not this
-                # rank's
-                # next put against the peer's local drain: once the barrier releases,
-                # one
-                # rank can be issuing layer `L+1`'s put while the other still runs layer
-                # `L`'s drain out of the same workspace. At EP=2 the target is always
-                # the
-                # other rank, so every consecutive placed pair is a candidate. Two
-                # layers
-                # apart share a buffer again and are ordered by the barrier of the layer
-                # between them.
+                # Staging buffers indexed by `target % staging_buffers`, one per source
+                # in a prediction window. The sequence per layer is put, barrier, drain,
+                # and `barrier_all` orders *arrival* — not this rank's next put against
+                # the peer's local drain. Once the barrier releases, one rank can be
+                # issuing a later layer's put while another still runs an earlier drain
+                # out of the same workspace.
+                #
+                # Two buffers were enough while consecutive same-buffer layers were a
+                # whole layer of compute plus about 1 ms of host work apart, against a
+                # 1.1 us drain. Ticket 13's windows remove that margin: a window's
+                # transfers are all launched at its last source, microseconds apart with
+                # no compute between them, so two same-parity targets of one window
+                # would
+                # share a buffer with nothing separating them. One buffer per window
+                # position makes the collision impossible instead of unlikely, and
+                # buffers a whole window apart are still separated by that window's own
+                # compute.
                 self.transfer.transfer(
                     transfer_plan,
                     self.pointers[target],
                     self.replica_row,
                     self.stream or torch.cuda.current_stream(),
-                    staging_offset=(target % 2) * self.staging_stride,
+                    staging_offset=(target % self.staging_buffers)
+                    * self.staging_stride,
                 )
             event = self._event_factory()
             event.record(self.stream)

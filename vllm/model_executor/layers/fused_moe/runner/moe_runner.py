@@ -15,7 +15,10 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
-from vllm.distributed.eplb.predictive import CrossLayerLoadPredictor
+from vllm.distributed.eplb.predictive import (
+    CrossLayerLoadPredictor,
+    PredictionWindow,
+)
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,
@@ -247,7 +250,9 @@ class _PlacementCoordinator(Protocol):
 
     def activate_and_publish(self, layer: int) -> list: ...
 
-    def record_prediction(self, source_layer: int, predicted: torch.Tensor) -> None: ...
+    def record_prediction(
+        self, source_layer: int, predicted: torch.Tensor, target_offset: int = 0
+    ) -> None: ...
 
 
 class MoERunner(MoERunnerInterface):
@@ -1057,18 +1062,56 @@ class MoERunner(MoERunnerInterface):
         # Asserted rather than skipped: a coordinator without an index is a wiring
         # error, and skipping would look like a forward that had nothing to predict.
         assert self.moe_layer_index is not None
-        coordinator.record_prediction(self.moe_layer_index, snapshot)
-        if coordinator.launch_at_predicting_layer_tail:
-            coordinator.plan_and_launch()
+        # One record and one plan per source in the window. The snapshot's middle
+        # axis is
+        # the window position, and row `p` is the prediction the window's `p`-th source
+        # made for its **own** target — which is what makes the rows distinguishable and
+        # is the whole difference from the design this replaces. A target reads its own
+        # `[ep_size, num_logical]` slice, the shape the planner has always consumed.
+        #
+        # This layer is the window's last source, so position `size - 1` is its own and
+        # earlier positions belong to layers behind it: their targets are behind this
+        # layer's target by the same amount, which is what the negative offset says.
+        # At a
+        # window of one the loop runs once with offset 0, the call that shipped.
+        assert self.load_predictor is not None
+        last_position = self.load_predictor.window.size - 1
+        for position in range(snapshot.shape[1]):
+            coordinator.record_prediction(
+                self.moe_layer_index,
+                snapshot[:, position, :],
+                position - last_position,
+            )
+            if coordinator.launch_at_predicting_layer_tail:
+                coordinator.plan_and_launch()
 
-    def bind_prediction_target(self, target: "MoERunner") -> None:
-        """Bind the sparse MoE this layer predicts, `prediction_lookahead_layers` ahead.
+    def bind_prediction_target(
+        self,
+        target: "MoERunner",
+        window: "PredictionWindow | None" = None,
+        position: int = 0,
+    ) -> None:
+        """Bind the sparse MoE this layer predicts, and the window it shares.
 
-        The target's gate module and router selection semantics are retained by
+        Its gate module and router selection semantics are retained by
         reference so ordinary weight loading stays authoritative.
 
+        **One target**, since ticket 13's second design: a source predicts its own
+        target from its own hidden states. Having one source predict a group of targets
+        was built and refuted — four layers' gates on one layer's hidden states select
+        almost the same experts, so three of every four targets were planned from a
+        distribution that was not theirs. What a group shares is the `window`, which
+        batches its sources into one collective: ticket 11 measured each per-layer
+        collective at 0.22 ms of barrier coupling, 44 of them per forward.
+
         Args:
-            target: The adjacent sparse MoE runner whose load is predicted.
+            target: The sparse MoE runner whose load this layer predicts,
+                `prediction_lookahead_layers` ahead.
+            window: The window whose row this source writes, shared with the other
+                sources in it. None means a window of one, which is the shipping
+                configuration and what the predictor builds for itself.
+            position: This source's position in that window. Only the last position
+                issues the collective.
 
         Raises:
             ValueError: If the target cannot be predicted from this layer, or if
@@ -1109,6 +1152,8 @@ class MoERunner(MoERunnerInterface):
             target_router=target.router,
             num_logical_experts=target.moe_config.num_logical_experts,
             eplb_layer_state=eplb_layer_state,
+            window=window,
+            window_position=position,
         )
 
     #########################################################

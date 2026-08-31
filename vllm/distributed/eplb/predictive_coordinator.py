@@ -188,20 +188,27 @@ class PlacementCoordinator:
             and tokens_per_expert <= self.min_tokens_per_expert
         )
 
-    def record_prediction(self, source_layer: int, predicted: torch.Tensor) -> None:
+    def record_prediction(
+        self, source_layer: int, predicted: torch.Tensor, target_offset: int = 0
+    ) -> None:
         """Start copying a source layer's predicted load to the host. No planning.
 
         Args:
             source_layer: The layer that produced the prediction.
-            predicted: Predicted per-logical-expert load for `source_layer +
-                lookahead`. May be a `[ep_size, num_logical]` snapshot or already
+            predicted: Predicted per-logical-expert load for `source_layer + lookahead +
+                target_offset`. May be a `[ep_size, num_logical]` snapshot or already
                 summed.
+            target_offset: Position within the source's group. This path holds one
+                recorded prediction at a time, so a group larger than one would keep
+                only
+                the last; configuration validation rejects that rather than letting it
+                happen, the same way it rejects a lookahead of 1 here.
 
         Raises:
             ValueError: If the target layer would be past the last one, which means
                 the caller bound a source it should not have.
         """
-        target = source_layer + self.lookahead
+        target = source_layer + self.lookahead + target_offset
         if target >= self.num_layers:
             raise ValueError(
                 f"layer {source_layer} predicts layer {target}, which is beyond the "

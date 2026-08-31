@@ -29,8 +29,8 @@ Ticket order is set by each ticket's `Blocked by` field, not by its filename num
 09 CUDA graph feasibility        blocks 08         no blockers; ← the largest single lever
 10 DeepSeek-V4-Flash             terminal          (needs 08)
 11 prediction's collectives      blocks 12,13,14   ANSWERED 2026-08-30; diagnosis only
-12 group of targets per source   blocks 13         no blockers; inert at K=1 by construction
-13 K=4 and what it buys          blocks 08, 14     (needs 12)
+12 group of targets per source   blocks 13         DONE, then REFUTED on hardware
+13 window of sources, 1 gather   blocks 08, 14     (needs 12) works: 78% of benefit kept
 14 snapshot reduction off NCCL   terminal          (needs 13); drop it if 13 leaves nothing
 15 spent budget must not revert  terminal          no blockers; bites the default config
 16 block bar dtype + teardown    terminal          no blockers; two review findings
@@ -139,13 +139,29 @@ prefill windows:
   plus 8.3 ms of launch overhead at unchanged collective count. **My "0.46 ms per collective,
   payload-independent" hypothesis is disproved by the same profile**: at the same 192
   collectives, stock is 88.9 ms and the probe 97.2 ms.
+- **Batching works, but only from *different* source layers — and the first design proved it
+  the expensive way.** Having one source predict `K` targets was built, passed 566 unit tests,
+  served, and removed **3.7%** of critical-path excess where one target per source removes
+  **26.8%**. Four layers' gates on one layer's hidden states select almost the same experts:
+  within a group the predicted distributions differ by an L1 of **16 to 36** out of 7896 while
+  the targets' actual loads differ by **5412 to 7660**. So three of every four targets were
+  planned from a distribution that was not theirs. Ticket 11's accuracy curve could not predict
+  this — it measures *distance*, one source per target, and the quantity this design rested on
+  was never measured because nothing had asked for it. The second design — a **window** of `K`
+  consecutive sources, each predicting its own target, the last one issuing the single
+  AllGather — keeps **20.8%** of excess (78%) and puts the whole feature at **+1.0%** mean TTFT,
+  inside the baseline's own 4.3% spread. It needs `lookahead >= group`, and it made the recorded
+  staging-buffer race likely enough that the buffer is now indexed per window position rather
+  than by layer parity. Default is still `prediction_target_group = 1`.
 - **Accuracy is not the obstacle it looks like, and lookahead 4 is now measured.** On `ko` at
   DP=8, replaying predicted placements against actual load: excess removed **34.9 / 34.4 /
   33.5 / 32.1%** at lookahead 1 / 2 / 3 / 4, with 0 forwards made worse at any distance,
   while `count_error` more than doubles (0.058 -> 0.133). Peak-rank recall@1 stays ~0.95
   throughout, which is why the delivered benefit barely moves: the planner only picks from
-  there. So **lookahead 4 costs 2.8 points of 34.9**, and K=4 grouping trades about 0.14
-  points of TTFT for about 9 — roughly 70 to 1.
+  there. So **lookahead 4 costs 2.8 points of 34.9** — but read that with the bullet above:
+  the curve measures one source per target and cannot price a design that shares a source.
+  Measured on hardware, a window of 4 costs **6.0 points** of 26.8, about 2 of which are the
+  three trailing layers a lookahead of 4 gives up.
 
 **`06` is the ticket the arithmetic turns on, not `03`.** Measured on 2026-08-29: of the
 per-source-layer cost, 2.21 ms scales with launch count and 5.28 ms does not, and the

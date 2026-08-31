@@ -16,7 +16,12 @@ import gzip
 import json
 
 import pytest
-from check_run_measured import check
+from check_run_measured import (
+    _arm_records_load,
+    _arm_should_place,
+    _budget_of,
+    check,
+)
 from check_trace_nonempty import count_step_annotations
 
 PLACEMENT_LINE = "Predictive expert replication: activated 1 replica(s) on layer 5"
@@ -193,3 +198,42 @@ def test_a_repeat_suffixed_placed_arm_is_still_checked(tmp_path):
     problems = check(tmp_path, ["43-r2"], None)
 
     assert any("inert" in p for p in problems)
+
+
+class TestTheBudgetSurvivesEveryLabelDecoration:
+    """An arm label carries transport and group infixes now, and a repeat suffix.
+
+    This parser has cried wolf twice on a label change, and each time the run it
+    failed was
+    healthy: the repeat suffix made the stock arm look like a placing arm, and the
+    transport/group infixes made a zero-budget arm look non-zero, so the guard called the
+    prediction-only arm inert for correctly placing nothing.
+    """
+
+    @pytest.mark.parametrize(
+        "label,budget",
+        [
+            ("off", "off"),
+            ("off-r1", "off"),
+            ("0", "0"),
+            ("0-r2", "0"),
+            ("43", "43"),
+            ("43-host", "43"),
+            ("43-host-r2", "43"),
+            ("0-device-g1", "0"),
+            ("0-device-g4-r3", "0"),
+            ("43-device-g4-r1", "43"),
+        ],
+    )
+    def test_the_leading_field_is_the_budget(self, label, budget):
+        assert _budget_of(label) == budget
+
+    def test_a_zero_budget_arm_is_never_expected_to_place(self):
+        # The false alarm itself: `0-device-g1-r2` has budget 0 and correctly places
+        # nothing, and the guard used to fail the whole run over it.
+        assert _arm_should_place("0-device-g1-r2") is False
+        assert _arm_should_place("43-device-g4-r1") is True
+
+    def test_the_stock_arm_still_records_no_load(self):
+        assert _arm_records_load("off-r4") is False
+        assert _arm_records_load("0-device-g4-r4") is True

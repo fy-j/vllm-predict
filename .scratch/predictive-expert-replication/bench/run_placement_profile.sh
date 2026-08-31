@@ -97,7 +97,12 @@ cfg={'enabled': True, 'cost_profile_path': sys.argv[1],
      'prediction_skip_first_layers': int(sys.argv[3])}
 if int(sys.argv[2]) > 0:
     cfg['max_transfers_per_forward'] = int(sys.argv[2])
-print(json.dumps({'predictive_expert_replication': cfg}))" "$PROFILE" "$budget" "$SKIP_FIRST")
+if int(sys.argv[4]) > 0:
+    group = int(sys.argv[4])
+    cfg['prediction_target_group'] = group
+    cfg['prediction_lookahead_layers'] = group
+print(json.dumps({'predictive_expert_replication': cfg}))" \
+      "$PROFILE" "$budget" "$SKIP_FIRST" "${PRED_GROUP:-0}")
     FEATURE_ARGS=(
       --additional-config "$ADDITIONAL"
       --eplb-config '{"log_balancedness":true,"log_balancedness_interval":1,"step_interval":1000000000,"window_size":1000,"use_async":false}'
@@ -174,7 +179,8 @@ print(json.dumps({'profiler':'torch','torch_profiler_dir':sys.argv[1],
   kill -9 "$PID" 2>/dev/null || true
   wait "$PID" 2>/dev/null || true
   sleep 5
-  for p in $(ps -eo pid,cmd --no-headers | grep "VLLM::" | grep -v grep | awk '{print $1}'); do
+  # `pgrep -f` matches the same workers without the grep-matches-itself hazard.
+  for p in $(pgrep -f "VLLM::" || true); do
     kill -9 "$p" 2>/dev/null
   done
   sleep 10
