@@ -3347,3 +3347,98 @@ stripping known suffixes, with tests over every label form.
 the real `MoERunner` was not. 566 tests passed and the first 8-GPU server died on
 `TypeError: bind_prediction_target() takes 2 positional arguments but 4 were given`. Same shape
 as design one's failure: the stand-in was tested, not the thing.
+
+## 2026-08-31 — ticket 14 priced, and two probe designs that measured the wrong thing
+
+**Ticket 14 should not be built.** Removing the snapshot collective entirely leaves the feature
+negative. Two interleaved three-and-four-arm runs at the knee (`ko`, 512 requests, CONC=16,
+DP=EP=8, 3 passes each):
+
+```
+                      mean TTFT   spread   vs stock
+stock                    171.79     2.8%       —
+prediction only          190.24     4.7%    +10.7%
+placing, window 1        188.88     5.3%     +9.9%
+probe, zero collective   230.09     1.3%    +33.9%    <- invalid, see below
+```
+
+Ticket 11's isolation prices the barriers at 47.6% of prediction's added cost, so **8.78 ms**
+of the placing arm's **17.09 ms** gap. A perfect ticket 14 lands at **+4.8%**: half the gap,
+not the whole one. The other 52.4% is launches and compute — ticket 09.
+
+**The probe was wrong twice, and only the first was a mistake.**
+
+A deterministic rank-identical snapshot removes the collective while leaving placement armed,
+which ticket 11's probe could not do. Both attempts came in slower than the arm they bounded:
+
+1. **Calibration.** Rotating the hot expert every forward re-planned every layer every forward:
+   **1634** activations over 70 forwards against the real arm's **408**. A 4x transfer storm
+   measured as a synchronisation cost. Fixed with a rotation period of 4 and a phase per source
+   layer: **439-483** over 70-80 forwards, matching.
+2. **Impossibility.** Calibrated, it still cost **+38.0%**. Canonical load is identical in both
+   arms (logical imbalance **1.8912** each), but physical imbalance is **1.6598** in the real arm
+   against **1.8807** in the probe — **26.0%** of critical-path excess removed against **1.2%**.
+   A synthetic snapshot places replicas that shed nothing. A rank-identical synthetic snapshot
+   cannot describe real load, and one that could would need the real data, which needs the
+   collective, so no zero-collective probe can bound this ticket.
+
+The lesson generalises past this branch: **a probe that removes work and gets slower has not
+found a surprising cost, it has broken an invariant the measurement depended on.** Both times
+the tell was in a line already being printed — the activation count — and not in the TTFT.
+
+**Incidental, and it reprices ticket 15.** 4x the transfer rate at unchanged traffic costs
+**+27% mean TTFT**. Ticket 15's spent-budget revert is what converts steady reuse into that
+churn, so its cost is first-order. It also suggests lookahead's value lies in the stability of
+what it predicts rather than in hit rate, which the accuracy curve does not measure.
+
+## 2026-09-06 — ticket 18 fuses prediction, and beats the ceiling that said not to build it
+
+**Prediction's gate, selection and count are one Triton kernel.** Four arms, three interleaved
+passes, `ko` at DP=8, the two prediction arms differing in nothing but
+`VLLM_PREDICTIVE_FUSED_PREDICT`:
+
+```
+                      mean TTFT   spread   vs stock
+stock                    183.78     5.0%       —
+prediction unfused       212.56     5.2%    +15.7%
+prediction fused         205.90     0.9%    +12.0%
+placing fused            194.53     4.3%     +5.8%
+```
+
+Paired within each pass: **+12.99, +4.92, +1.94 ms** — faster in 3 of 3, median **2.6%** of
+stock TTFT, range 1.1% to 7.1%. **The sign is solid and the magnitude is not**: this run's stock
+arm drifted 5.0% across passes, wider than the 2.7-2.8% of recent runs and wider than the 3.1%
+mean difference between the two arms. Only the pairing carries this result; the unpaired
+comparison fails this project's own rule. Do not quote the 3.6% mean.
+
+**It beat its own first-order ceiling, and that is the finding.** An 8-rank attribution prices
+prediction's added window at 8.4% dispatch, 1.8% compute, 81% gap, so fusing about 1.7 of 2.7
+launches per layer should have returned 0.9-1.5% of TTFT. It returned a median 2.6%. Removing
+dispatch bought more than the dispatch removed — consistent with launch count driving part of
+the gap through rank skew, which is the second-order effect the attribution could not settle.
+The fused arm's spread of **0.9%** against the unfused arm's **5.2%** points the same way: fewer
+launches made the run more repeatable.
+
+**Two measurement errors in the attribution that priced these tickets, both corrected here.**
+`attribute_prediction_ops.py` counted only `cuda_runtime`, which excludes `cuLaunchKernelEx` and
+so missed every Triton launch; and it read `sorted(glob(...))[0]`, a single rank. On dp0 the
+blocking `cudaEventSynchronize` reads **+1.97 ms** and on dp5 **-2.21 ms** — a quantity whose
+sign depends on which rank you read is an earliness, not a cost. This is the same trap ticket 11
+fell into with the 9.3 us AllGather, in a different script.
+
+**Ticket 09 is now mostly answered from the code, without a run.** `CUDAGraphDispatcher.dispatch`
+returns `CUDAGraphMode.NONE` when `num_tokens > max_cudagraph_capture_size`, which defaults to
+**512** on H100. Every prefill forward here carries ~1024 tokens or more, and TTFT is entirely
+prefill, so no captured graph is ever replayed on the path that matters. Forcing it means
+capturing at >= 1024 and padding every prefill up to a captured size — and enlarging prefill
+work was already measured at 35-46% *worse* TTFT.
+
+**Correction to the shares above, same day.** A review found two defects in
+`attribute_prediction_ops.py`: it subtracted a *summed* `cudaEventSynchronize` from a *unioned*
+host time, and it attributed each event's **whole** duration to the window its start fell in, so
+a collective beginning just inside a window contributed its entire tail and idle could go
+negative. Both are fixed — sync spans are unioned, every span is clipped to its window, and the
+window lookup no longer stops at the latest start when windows nest. Re-derived: **dispatch
+8.4%, compute 1.9%, event-sync 7.8%, gap 81.9%**, against 8.4 / 1.8 / 8.5 / 81.2 before. The
+conclusion is unchanged, which is worth recording: the defects were real and the shares were
+robust to them.

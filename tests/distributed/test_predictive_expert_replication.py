@@ -2242,3 +2242,185 @@ class TestAForwardWithoutDpMetadataStillOpensTheForward:
         runner, context, opened = self._runner(None, layer=1)
         self._open(runner, context)
         assert opened == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU router kernel")
+def test_dispatch_ballast_perturbs_dispatch_and_nothing_else(monkeypatch):
+    """Tickets 09/18's derivative: added launches must not change what is predicted.
+
+    The experiment reads a slope: how the window's gap responds to added dispatch. A
+    slope taken between two paths that compute different things measures nothing.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    hidden_states = torch.randn(16, 32, device=device)
+
+    # One predictor, so the two calls share a gate: rebuilding it would compare two
+    # different random models and the equality would mean nothing.
+    predictor, _, _ = _predictor(device, num_unpadded=16)
+
+    counts = []
+    for ballast in (0, 5):
+        monkeypatch.setattr(
+            "vllm.envs.VLLM_PREDICTIVE_DISPATCH_BALLAST", ballast, raising=False
+        )
+        counts.append(predictor.predict_local_counts(hidden_states).clone())
+
+    assert torch.equal(counts[0], counts[1]), counts
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU router kernel")
+def test_dispatch_ballast_defaults_off_and_allocates_nothing(monkeypatch):
+    """The serving path must not pay for an experiment that is not running."""
+    monkeypatch.setattr("vllm.envs.VLLM_PREDICTIVE_DISPATCH_BALLAST", 0, raising=False)
+    predictor, _, _ = _predictor(torch.device("cuda"), num_unpadded=4)
+
+    predictor.predict_local_counts(torch.randn(4, 32, device="cuda"))
+
+    assert predictor._ballast is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused kernel is Triton")
+def test_fused_prediction_selects_what_the_real_router_selects():
+    """Ticket 18's oracle: the reference path is retained and equality asserted on it.
+
+    The proxy in `test_fused_prediction.py` reimplements the gate and the top-k, so it
+    can only catch a kernel that disagrees with *its own* idea of the reference. This
+    drives the real `FusedTopKRouter`, which is where a disagreement in selection would
+    come from: a tie broken the other way, or logits rounded differently.
+
+    The gate is an `nn.Linear` rather than a `ReplicatedLinear`, which needs a process
+    group this suite does not have. That is a substitution of the wrapper only, and it
+    is checked rather than assumed: an unquantized `ReplicatedLinear` on CUDA applies
+    `default_unquantized_gemm`, which is `torch.nn.functional.linear` -- the same call
+    `nn.Linear` makes. `plan_fused_prediction`'s eligibility rules are covered
+    separately, against a real `UnquantizedLinearMethod`.
+    """
+    from vllm.distributed.eplb.fused_prediction import FusedPredictionPlan
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    num_tokens, hidden_size = 512, 128
+    predictor, _, _ = _predictor(
+        device, num_unpadded=num_tokens, hidden_size=hidden_size
+    )
+    gate = torch.nn.Linear(
+        hidden_size, NUM_LOGICAL_EXPERTS, bias=False, device=device
+    ).to(torch.bfloat16)
+    predictor.target_gate = lambda hidden: (gate(hidden), None)
+    predictor.target_gate.weight = gate.weight
+    hidden_states = torch.randn(
+        num_tokens, hidden_size, device=device, dtype=torch.bfloat16
+    )
+
+    predictor._fused_plan = None
+    reference = predictor.predict_local_counts(hidden_states).clone()
+
+    predictor._fused_plan = FusedPredictionPlan(
+        num_logical_experts=NUM_LOGICAL_EXPERTS, top_k=TOP_K, dtype=torch.bfloat16
+    )
+    fused = predictor.predict_local_counts(hidden_states).clone()
+
+    assert torch.equal(reference, fused), (
+        f"selection diverged on {int((reference - fused).abs().sum()) // 2} assignments"
+    )
+
+
+def test_an_unfusable_gate_falls_back_rather_than_approximating():
+    """Predicting from a different rule than the target will use is worse than not
+    fusing, and it is invisible: the count row still looks plausible."""
+    from vllm.distributed.eplb.fused_prediction import plan_fused_prediction
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    class Gate(torch.nn.Module):
+        def __init__(self, quant_method):
+            super().__init__()
+            self.weight = torch.zeros(NUM_LOGICAL_EXPERTS, 8)
+            self.bias = None
+            self.quant_method = quant_method
+
+    class Router:
+        scoring_func = "softmax"
+        top_k = TOP_K
+
+    Router.__name__ = "FusedTopKRouter"
+    unquantized = UnquantizedLinearMethod()
+    assert (
+        plan_fused_prediction(Gate(unquantized), Router(), NUM_LOGICAL_EXPERTS)
+        is not None
+    )
+    assert plan_fused_prediction(Gate(object()), Router(), NUM_LOGICAL_EXPERTS) is None
+
+
+def test_an_unsupported_router_falls_back():
+    """Grouped top-k and correction bias change *selection*, not just the weights."""
+    from vllm.distributed.eplb.fused_prediction import plan_fused_prediction
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    class Gate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.zeros(NUM_LOGICAL_EXPERTS, 8)
+            self.bias = None
+            self.quant_method = UnquantizedLinearMethod()
+
+    class GroupedRouter:
+        scoring_func = "sigmoid"
+        top_k = TOP_K
+
+    assert plan_fused_prediction(Gate(), GroupedRouter(), NUM_LOGICAL_EXPERTS) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused kernel is Triton")
+def test_a_dummy_forward_returns_zeros_even_without_per_forward_state():
+    """A profile or dummy forward reaches prediction with no EPLB state at all.
+
+    The fused branch was placed before the empty-token guard and so met the state check
+    first, turning the all-zero row this method promises into a RuntimeError. Commit
+    a060c9429 ("open the forward even without DP metadata") is why that path is live.
+    """
+    from vllm.distributed.eplb.fused_prediction import FusedPredictionPlan
+
+    device = torch.device("cuda")
+    predictor, _, layer_state = _predictor(device, num_unpadded=0)
+    layer_state.num_unpadded_tokens_tensors = None
+    predictor._fused_plan = FusedPredictionPlan(
+        num_logical_experts=NUM_LOGICAL_EXPERTS, top_k=TOP_K, dtype=torch.bfloat16
+    )
+
+    counts = predictor.predict_local_counts(
+        torch.zeros(0, 32, device=device, dtype=torch.bfloat16)
+    )
+
+    assert int(counts.sum()) == 0
+
+
+def test_the_ballast_scratch_is_per_predictor():
+    """A class attribute would make the "allocates nothing" assertion unfalsifiable: it
+    would read None whatever this instance did, and pass if a sibling had allocated."""
+    from vllm.distributed.eplb.predictive import CrossLayerLoadPredictor
+
+    assert "_ballast" not in vars(CrossLayerLoadPredictor)
+
+
+def test_an_expert_count_that_would_spill_the_accumulator_falls_back():
+    """Bit-identical and four times slower is still a regression, and no TTFT number
+    would say which path ran. Measured on H100: 384 experts fuse at 234 us against the
+    unfused 61 us, where 128 fuse at 30.8 against 39.0."""
+    from vllm.distributed.eplb.fused_prediction import plan_fused_prediction
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    class Gate(torch.nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.weight = torch.zeros(experts, 8)
+            self.bias = None
+            self.quant_method = UnquantizedLinearMethod()
+
+    class Router:
+        scoring_func = "softmax"
+        top_k = 8
+
+    Router.__name__ = "FusedTopKRouter"
+    assert plan_fused_prediction(Gate(256), Router(), 256) is not None
+    assert plan_fused_prediction(Gate(384), Router(), 384) is None

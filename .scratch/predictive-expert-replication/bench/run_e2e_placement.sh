@@ -102,10 +102,38 @@ for arm in $BUDGETS; do
   # The third field is optional; absent means "whatever PRED_GROUP says", which is how
   # every existing recorded run was labelled.
   arm_group="${PRED_GROUP:-0}"
-  [[ "$rest" == *:* ]] && arm_group="${rest#*:}"
+  arm_probe=0
+  arm_fuse=1
+  if [[ "$rest" == *:* ]]; then
+    arm_group="${rest#*:}"
+    # A trailing `:probe` asks for ticket 14's upper bound: no snapshot collective at
+    # all, with a rank-identical substitute so placement stays armed and safe.
+    # One suffix, matched exhaustively. Two independent `if`s let `1:probe:nofuse` match
+    # only the second, so the requested probe was dropped and the arm ran under a label
+    # naming the other thing. This script's own history is arms measuring one thing under
+    # another's name, so an unrecognised suffix aborts rather than being ignored.
+    #   `:probe`  ticket 14's zero-collective substitute
+    #   `:nofuse` ticket 18's reference prediction path
+    case "$arm_group" in
+      *:*)
+        case "${arm_group#*:}" in
+          probe)  arm_probe=1 ;;
+          nofuse) arm_fuse=0 ;;
+          *)
+            echo "[e2e] ABORT: arm '$arm' has unknown suffix ':${arm_group#*:}'" >&2
+            echo "[e2e] expected one of: probe, nofuse" >&2
+            exit 2
+            ;;
+        esac
+        arm_group="${arm_group%%:*}"
+        ;;
+    esac
+  fi
   label="$budget"
   [[ "$arm" == *:* ]] && label="${budget}-${transport}"
   [[ "$rest" == *:* ]] && label="${label}-g${arm_group}"
+  [[ "$arm_probe" == 1 ]] && label="${label}-probe"
+  [[ "$arm_fuse" == 0 ]] && label="${label}-nofuse"
   # The tag carries the repeat only when there is more than one, so a single-pass run keeps
   # the filenames every existing reader and every recorded result already expects.
   if [[ "$REPEATS" -gt 1 ]]; then tag="b${label}-r${repeat}"; else tag="b$label"; fi
@@ -160,6 +188,8 @@ print(json.dumps({'predictive_expert_replication': cfg}))" \
       # working arm inert. 10 keeps the one synchronisation it costs out of the way while
       # still producing the line every reader here looks for.
       "VLLM_PREDICTIVE_PLACEMENT_REPORT_EVERY=10"
+      "VLLM_PREDICTIVE_DETERMINISTIC_SNAPSHOT=$arm_probe"
+      "VLLM_PREDICTIVE_FUSED_PREDICT=$arm_fuse"
     )
   fi
 
@@ -268,7 +298,18 @@ for repeat in $(seq 1 "$REPEATS"); do
     label="${arm%%:*}"
     rest="${arm#*:}"
     if [[ "$arm" == *:* ]]; then label="${label}-${rest%%:*}"; fi
-    if [[ "$rest" == *:* ]]; then label="${label}-g${rest#*:}"; fi
+    if [[ "$rest" == *:* ]]; then
+      g="${rest#*:}"
+      case "$g" in
+        *:probe)  label="${label}-g${g%%:*}-probe" ;;
+        *:nofuse) label="${label}-g${g%%:*}-nofuse" ;;
+        *:*)
+          echo "[e2e] ABORT: arm '$arm' has unknown suffix ':${g#*:}'" >&2
+          exit 2
+          ;;
+        *)        label="${label}-g${g}" ;;
+      esac
+    fi
     if [[ "$REPEATS" -gt 1 ]]; then guard_arms+=("${label}-r${repeat}"); else guard_arms+=("$label"); fi
   done
 done

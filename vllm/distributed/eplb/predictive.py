@@ -18,6 +18,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm import envs
+from vllm.distributed.eplb.fused_prediction import (
+    plan_fused_prediction,
+    predict_counts_fused,
+)
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -249,6 +253,22 @@ def count_logical_experts_triton(
     return out
 
 
+# How many forwards a probe window keeps the same hot expert. Calibrated, not chosen:
+# rotating every forward re-plans every layer every forward and the probe activated 1634
+# replicas over 70 forwards where the real arm activates 408, so it measured a 4x
+# transfer storm (+33.9% TTFT) instead of the cost of removing a collective. Windows are
+# also staggered by `phase`, so about a quarter of them rotate on any given forward
+# rather than all of them at once: a bursty probe and a steady one do not cost the same.
+# Whenever this probe is run, compare its activation-count line against the real arm's
+# before reading its TTFT.
+_PROBE_ROTATE_EVERY = 4
+
+_NO_FORWARD_STATE = (
+    "Predictive expert replication requires EPLB per-forward state; "
+    "EplbState.prepare_forward must run before the model forward."
+)
+
+
 class PredictionWindow:
     """One snapshot collective shared by a window of consecutive source layers.
 
@@ -274,7 +294,9 @@ class PredictionWindow:
             collective one source early.
     """
 
-    def __init__(self, size: int, num_logical_experts: int | None = None):
+    def __init__(
+        self, size: int, num_logical_experts: int | None = None, phase: int = 0
+    ):
         if size < 1:
             raise ValueError(
                 f"a prediction window needs at least one source, got {size}."
@@ -288,6 +310,9 @@ class PredictionWindow:
         self._snapshot_flat: torch.Tensor | None = None
         self._work: torch.distributed.Work | None = None
         self._ep_size: int | None = None
+        # Only the deterministic cost probe uses these.
+        self._probe_forward = 0
+        self._probe_phase = phase
 
     def issues_at(self, position: int) -> bool:
         """Whether the source at `position` is the one that starts the collective."""
@@ -331,6 +356,12 @@ class PredictionWindow:
     def start_snapshot(self) -> None:
         """Begin the window's one AllGather over the EPLB group."""
         assert self.counts is not None, "no source wrote a row before the collective"
+        if envs.VLLM_PREDICTIVE_DETERMINISTIC_SNAPSHOT:
+            # Ticket 14's upper-bound probe: no collective at all, and the substitute is
+            # rank-identical so placement stays safe. See `finish_snapshot`.
+            self._work = None
+            self._probe_forward += 1
+            return
         if envs.VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER:
             # Cost probe; see `CrossLayerLoadPredictor.start_snapshot` for why this may
             # not be combined with placement.
@@ -354,6 +385,10 @@ class PredictionWindow:
         A source at window position `p` reads `snapshot[:, p, :]`, which is the
         `[ep_size, num_logical_experts]` shape the planner has always consumed.
         """
+        if envs.VLLM_PREDICTIVE_DETERMINISTIC_SNAPSHOT:
+            if self.counts is None:
+                return None
+            return self._deterministic_snapshot()
         if envs.VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER:
             if self.counts is None:
                 return None
@@ -365,6 +400,47 @@ class PredictionWindow:
         self._work = None
         assert self._snapshot_flat is not None
         return self._snapshot_flat.view(-1, self.size, self.num_logical_experts)
+
+    def _deterministic_snapshot(self) -> torch.Tensor:
+        """A rank-identical snapshot that costs no synchronisation.
+
+        Ticket 14 asks what a device-side reduction could return. Its ceiling is
+        whatever removing the snapshot's synchronisation is worth, and the honest way
+        to bound that is to remove it entirely while leaving prediction's compute and
+        the whole placement machinery running. Ticket 11's probe did that but produced
+        a per-rank snapshot, so placement had to be withheld and the bound covered
+        only the prediction arm.
+
+        This substitute comes from a counter every rank increments, so it is identical
+        on every rank **as long as every rank predicts on the same forwards** -- which
+        is the assumption, not a guarantee. The collective this probe removes is what
+        used to enforce it: a divergent `_prediction_is_worth_it()` hung visibly, and
+        without the collective the counters drift and the ranks derive different plans
+        with nothing to say so. Under that assumption the plans agree, a put pairs with
+        a receive, and placement can be armed. The load it describes is
+        arbitrary, so the excess such a run removes means nothing — the number it
+        produces is a *cost*.
+
+        One expert is made clearly hottest so the planner always finds an admissible
+        placement and the transfer path runs, which is what makes this a bound on the
+        real path rather than on an idle one. **How often that choice changes has to be
+        calibrated, and getting it wrong invalidates the probe in either direction** —
+        see `_PROBE_ROTATE_EVERY`.
+        """
+        assert self.counts is not None
+        assert self.num_logical_experts is not None
+        ep_size = self._probe_ep_size()
+        snapshot = torch.full(
+            (ep_size, self.size, self.num_logical_experts),
+            200,
+            dtype=torch.int32,
+            device=self.counts.device,
+        )
+        rotation = (self._probe_forward + self._probe_phase) // _PROBE_ROTATE_EVERY
+        for position in range(self.size):
+            hot = (rotation + position) % self.num_logical_experts
+            snapshot[0, position, hot] = 20_000
+        return snapshot
 
     def _probe_ep_size(self) -> int:
         if self._ep_size is None:
@@ -426,6 +502,14 @@ class CrossLayerLoadPredictor:
         window_position: int = 0,
     ):
         self.target_gate = target_gate
+        self._ballast: torch.Tensor | None = None
+        # Decided once, from static properties: see `plan_fused_prediction`. None keeps
+        # the reference path, which predicts the same thing more expensively.
+        self._fused_plan = (
+            plan_fused_prediction(target_gate, target_router, num_logical_experts)
+            if envs.VLLM_PREDICTIVE_FUSED_PREDICT
+            else None
+        )
         self.target_router = target_router
         self.num_logical_experts = num_logical_experts
         self.eplb_layer_state = eplb_layer_state
@@ -459,11 +543,6 @@ class CrossLayerLoadPredictor:
             An int32 `[group_size, num_logical_experts]` count tensor, valid until this
             predictor's next `predict_local_counts` call.
         """
-        target_logits, _ = self.target_gate(hidden_states)
-        logical_ids = self.target_router.select_logical_experts(
-            hidden_states, target_logits
-        )
-
         # Straight into the window's row, so the collective sends what the kernel wrote
         # with no per-layer copy.
         counts = self.window.row(
@@ -471,19 +550,37 @@ class CrossLayerLoadPredictor:
         )
         num_tokens = hidden_states.shape[0]
         if num_tokens == 0:
-            # Both counting implementations zero their output, so the only path that has
-            # to do it here is the one that returns before calling either.
+            # Before the fused branch, not after: a dummy or profile forward gets
+            # here with no per-forward EPLB state, and the fused path would raise on
+            # that state rather than return the all-zero row this method promises.
+            # Both counting kernels zero their output, so this is the only path that
+            # has to do it itself.
             counts.zero_()
             return counts
 
+        if self._fused_plan is not None and hidden_states.is_cuda:
+            num_unpadded = self.eplb_layer_state.num_unpadded_tokens_tensors
+            if num_unpadded is None:
+                raise RuntimeError(_NO_FORWARD_STATE)
+            counts = predict_counts_fused(
+                hidden_states,
+                self.target_gate.weight,
+                num_unpadded[dbo_current_ubatch_id()],
+                self._fused_plan,
+                counts,
+            )
+            self._issue_dispatch_ballast(counts.device)
+            return counts
+
+        target_logits, _ = self.target_gate(hidden_states)
+        logical_ids = self.target_router.select_logical_experts(
+            hidden_states, target_logits
+        )
         # Real tokens occupy the leading rows; everything past the unpadded count is
         # padding and must not reach the predicted load.
         num_unpadded = self.eplb_layer_state.num_unpadded_tokens_tensors
         if num_unpadded is None:
-            raise RuntimeError(
-                "Predictive expert replication requires EPLB per-forward state; "
-                "EplbState.prepare_forward must run before the model forward."
-            )
+            raise RuntimeError(_NO_FORWARD_STATE)
         # `num_unpadded_tokens_tensors` is a **list** of per-ubatch scalars, so this
         # indexes rather than slices — a list slice would hand the kernel a Python list
         # and Triton would refuse to specialize it. The ubatch id matters even though
@@ -500,12 +597,38 @@ class CrossLayerLoadPredictor:
             if logical_ids.is_cuda
             else count_logical_experts_reference
         )
-        return count(
+        counts = count(
             logical_ids,
             num_unpadded[dbo_current_ubatch_id()],
             self.num_logical_experts,
             counts,
         )
+        self._issue_dispatch_ballast(counts.device)
+        return counts
+
+    def _issue_dispatch_ballast(self, device: torch.device) -> None:
+        """Issue `VLLM_PREDICTIVE_DISPATCH_BALLAST` extra launches, for the derivative.
+
+        Tickets 09 and 18 both remove host dispatch, and an 8-rank attribution prices
+        prediction's added window at 8.4% dispatch, 1.8% device compute and 81% gap. The
+        open question is whether dispatch *drives* the gap: if slow dispatch skews rank
+        arrival, removing it would be worth more than its first-order share, and if it
+        does not, both tickets are capped at that share and should be closed.
+
+        A barrier cannot answer this. Forcing the ranks into alignment relocates the
+        waiting into the barrier rather than removing it, so the window does not move
+        either way. Perturbing dispatch and reading the slope does answer it.
+
+        The launches accumulate into a scratch scalar nothing reads, so predicted counts
+        are bit-identical with this set — asserted in the tests rather than assumed.
+        """
+        count = envs.VLLM_PREDICTIVE_DISPATCH_BALLAST
+        if count <= 0:
+            return
+        if self._ballast is None or self._ballast.device != device:
+            self._ballast = torch.zeros(1, dtype=torch.int32, device=device)
+        for _ in range(count):
+            self._ballast.add_(1)
 
     def start_snapshot(self, local_counts: torch.Tensor | None = None) -> None:
         """Begin this source's window's snapshot collective, if this source issues it.
@@ -670,7 +793,7 @@ def bind_moe_prediction_targets(
     for position, index in enumerate(source_indices):
         if position % group == 0:
             remaining = len(source_indices) - position
-            window = PredictionWindow(min(group, remaining))
+            window = PredictionWindow(min(group, remaining), phase=index)
         runners[index].bind_prediction_target(
             runners[index + lookahead], window, position % group
         )

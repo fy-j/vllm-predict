@@ -31,10 +31,11 @@ Ticket order is set by each ticket's `Blocked by` field, not by its filename num
 11 prediction's collectives      blocks 12,13,14   ANSWERED 2026-08-30; diagnosis only
 12 group of targets per source   blocks 13         DONE, then REFUTED on hardware
 13 window of sources, 1 gather   blocks 08, 14     (needs 12) works: 78% of benefit kept
-14 snapshot reduction off NCCL   terminal          (needs 13); drop it if 13 leaves nothing
+14 snapshot reduction off NCCL   terminal          DO NOT BUILD 2026-08-31; ceiling 8.78 ms
 15 spent budget must not revert  terminal          no blockers; bites the default config
 16 block bar dtype + teardown    terminal          no blockers; two review findings
 17 spec says what was measured   blocks 08         no blockers; docs only
+18 prediction fuses to 1 kernel  terminal          no blockers; ceiling 9.67 ms, launch half
 ```
 
 **`11` is answered and it re-shaped the rest.** `06` showed placement is *negative cost* and
@@ -43,8 +44,16 @@ prediction is the whole overhead; `11` then split prediction's +13.68% by measur
 
 - `12` and `13` attack the barrier half (one source layer predicts K targets, one collective per
   group). Worth about 9 points of TTFT for about 0.14, but it lands at break-even, not positive.
-- `09` is the **only** ticket that attacks the launch half, which is the larger one at 52%. That
-  is why it moved from "exploratory, off the mainline" to blocking the verdict.
+- `09` was called the only ticket attacking "the launch half, the larger one at 52%".
+  **That framing is withdrawn (2026-09-06).** The 52% was a *residual* — everything left after
+  removing the collective, labelled launches without being measured. An 8-rank attribution
+  measures it: of the 8.14 ms per forward prediction adds, **host dispatch is 8.4%, device
+  compute 1.9%, blocking event-sync 7.8% and gap 81.9%**. The old figure came from one rank
+  (`sorted(glob)[0]`, dp0) and from counting only `cuda_runtime`, which excludes Triton's
+  `cuLaunchKernelEx`. Read `bench/attribute_prediction_ops.py`'s own output, not this label.
+  `09` is further reduced by the dispatcher: `num_tokens > max_cudagraph_capture_size` returns
+  `CUDAGraphMode.NONE`, that cap is **512** on H100, and every prefill forward here is ~1024
+  tokens — so **no captured graph is ever replayed on the path TTFT is made of**.
 - `08` is **blocked**. Writing the verdict now would measure a cost `13` and `09` are removing,
   and its stop gate as worded fires on the sum while placement is returning 70-80% of the
   ceiling — see the amendment in the ticket.
@@ -261,6 +270,18 @@ alternative is ruled out by measurement.
 there were many: five defects in this path were each individually enough to make the
 feature inert or harmful. Do not assume a green run means a connected one — check the
 activation log line and that physical per-rank load diverges from canonical ownership.
+
+**`18` is implemented and measured (2026-09-06).** Prediction's gate, selection and count are
+one Triton kernel; launches per source layer go 2.7 -> 1. Four arms, three interleaved passes at
+the knee: stock 183.78, prediction unfused 212.56, prediction fused 205.90, placing fused 194.53.
+Paired within each pass it is faster **3 of 3** — +12.99, +4.92, +1.94 ms — **median 2.6% of
+stock TTFT**. The sign is solid; the magnitude is not, because this run's stock arm drifted 5.0%,
+wider than the 3.1% mean gap between the two arms, so only the pairing carries it. **Do not quote
+the 3.6% mean.** It beat its own first-order dispatch ceiling of 0.9-1.5%, which is evidence that
+launch count drives part of the 82% gap through rank skew — the fused arm's spread is 0.9%
+against the unfused arm's 5.2%. Selection is held bit-identical to the reference (fp32 forces
+IEEE over TF32; bf16 rounds the accumulator back to bf16 before selecting; ties break low), and
+anything unreproducible falls back on static, rank-identical properties.
 
 `09` still has no blockers, and it is **not** true that it gates only `05`: it is
 the sole owner of the under-load interconnect bandwidth that `04` requires. Its

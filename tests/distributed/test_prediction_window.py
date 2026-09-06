@@ -315,3 +315,110 @@ class TestStagingBuffersCoverAWholeWindow:
                 staging_stride=1,
                 staging_buffers=1,
             )
+
+
+class TestTheDeterministicSnapshotBoundsWhatAReductionCanReturn:
+    """Ticket 14's ceiling: no synchronisation at all, with placement still armed.
+
+    Ticket 11's probe removed the collective but produced a *per-rank* snapshot, so
+    placement had to be withheld and the bound only covered the prediction arm. This one
+    is rank-identical by construction, so the plans still agree and the whole placement
+    machinery runs — which is what makes its number a bound on the real path.
+    """
+
+    def _window(self, size, num_logical, ep_size):
+        window = PredictionWindow(size=size, num_logical_experts=num_logical)
+        window._ep_size = ep_size
+        for position in range(size):
+            window.row(position, torch.device("cpu"), num_logical)
+        return window
+
+    def _armed(self, monkeypatch):
+        monkeypatch.setattr(
+            "vllm.envs.VLLM_PREDICTIVE_DETERMINISTIC_SNAPSHOT", True, raising=False
+        )
+
+    def test_no_collective_runs(self, monkeypatch):
+        self._armed(monkeypatch)
+        called = []
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_into_tensor",
+            lambda *a, **k: called.append(1),
+        )
+        window = self._window(size=2, num_logical=8, ep_size=4)
+
+        window.start_snapshot()
+        assert window.finish_snapshot() is not None
+        assert called == []
+
+    def test_two_windows_at_the_same_count_agree_exactly(self, monkeypatch):
+        """This is the property placement depends on: two ranks must see one snapshot.
+
+        Two windows stepped the same number of times stand in for two ranks in lockstep.
+        If they diverged, each rank would derive its own plan and a put would pair
+        with a
+        peer expecting nothing — the failure the other probe is rejected for.
+        """
+        self._armed(monkeypatch)
+        left = self._window(size=2, num_logical=8, ep_size=4)
+        right = self._window(size=2, num_logical=8, ep_size=4)
+        for _ in range(3):
+            left.start_snapshot()
+            right.start_snapshot()
+            assert torch.equal(left.finish_snapshot(), right.finish_snapshot())
+
+    def _hot_over(self, window, forwards):
+        hot = []
+        for _ in range(forwards):
+            window.start_snapshot()
+            hot.append(int(window.finish_snapshot()[0, 0].argmax()))
+        return hot
+
+    def test_the_hot_expert_changes_eventually_but_not_every_forward(self, monkeypatch):
+        """The probe's churn rate is the thing that decides whether it bounds anything.
+
+        Both directions invalidate it. A fixed choice lets residency make every transfer
+        free, so the probe measures an idle path. Rotating every forward re-plans every
+        layer every forward: measured, that activated 1634 replicas over 70 forwards
+        where the real arm activates 408, and the probe came in 46 ms *slower* than the
+        arm it was meant to bound. So both are asserted here, not just the first.
+        """
+        self._armed(monkeypatch)
+        hot = self._hot_over(self._window(size=1, num_logical=8, ep_size=2), 12)
+
+        changes = sum(a != b for a, b in zip(hot, hot[1:]))
+        assert changes > 0, f"never rotated, so residency would hide the cost: {hot}"
+        assert changes < len(hot) - 1, f"rotated every forward, a transfer storm: {hot}"
+
+    def test_windows_are_staggered_so_they_do_not_all_rotate_together(
+        self, monkeypatch
+    ):
+        """A bursty probe and a steady one do not cost the same.
+
+        44 layers rotating on the same forward spends the whole budget in one forward
+        and leaves the next three idle; a real path's transfers arrive spread out, so
+        windows at different source layers rotate on different forwards.
+        """
+        self._armed(monkeypatch)
+        first = PredictionWindow(size=1, num_logical_experts=8, phase=0)
+        second = PredictionWindow(size=1, num_logical_experts=8, phase=1)
+        for window in (first, second):
+            window._ep_size = 2
+            window.row(0, torch.device("cpu"), 8)
+
+        changed_on = [
+            {index for index, (a, b) in enumerate(zip(hot, hot[1:])) if a != b}
+            for hot in (self._hot_over(first, 12), self._hot_over(second, 12))
+        ]
+        assert changed_on[0] and changed_on[1]
+        assert changed_on[0] != changed_on[1], changed_on
+
+    def test_the_snapshot_always_admits_a_placement(self, monkeypatch):
+        """A snapshot with no clear peak would leave the transfer path unexercised."""
+        self._armed(monkeypatch)
+        window = self._window(size=1, num_logical=8, ep_size=2)
+        window.start_snapshot()
+        snapshot = window.finish_snapshot()
+        summed = snapshot[:, 0, :].sum(dim=0)
+        assert summed.max() > 10 * summed.median()

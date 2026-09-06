@@ -149,6 +149,21 @@ def reject_snapshot_probe_with_placement() -> None:
     """
     if (
         envs.VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER
+        and envs.VLLM_PREDICTIVE_DETERMINISTIC_SNAPSHOT
+    ):
+        # Both replace the snapshot and the deterministic one silently wins, so an
+        # operator who left the other set would be running a probe they did not choose:
+        # on a placing arm the stale variable is a hard failure below, on a
+        # prediction-only arm it substitutes a snapshot with nothing in the log. The
+        # harness pins only one of the two, so the stale one is inherited.
+        raise RuntimeError(
+            "VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER and "
+            "VLLM_PREDICTIVE_DETERMINISTIC_SNAPSHOT are two different snapshot probes "
+            "and cannot both be armed: the deterministic one would win silently. Set "
+            "exactly one, and set the other to 0 explicitly rather than unsetting it."
+        )
+    if (
+        envs.VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER
         and envs.VLLM_PREDICTIVE_PLACE_PER_FORWARD
     ):
         raise RuntimeError(

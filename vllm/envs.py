@@ -302,6 +302,9 @@ if TYPE_CHECKING:
     VLLM_PREDICTIVE_VERIFY_INACTIVE_SLOTS: bool = False
     VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS: bool = False
     VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER: bool = False
+    VLLM_PREDICTIVE_DETERMINISTIC_SNAPSHOT: bool = False
+    VLLM_PREDICTIVE_DISPATCH_BALLAST: int = 0
+    VLLM_PREDICTIVE_FUSED_PREDICT: bool = True
     VLLM_PREDICTIVE_PLACE_PER_FORWARD: int = 0
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -2075,6 +2078,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is this branch's most expensive class of bug.
     "VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS": lambda: bool(
         int(os.getenv("VLLM_PREDICTIVE_VERIFY_REPLICA_WEIGHTS", "0"))
+    ),
+    # Cost probe for ticket 14's upper bound: replace the snapshot with a value derived
+    # from a per-window counter, identical on every rank, and run no collective at all.
+    # Unlike SKIP_SNAPSHOT_ALLGATHER this **is** safe with placement armed, because the
+    # substitute is rank-identical by construction, so every rank still derives the same
+    # plan and a put still pairs with a receive. The placement it makes is arbitrary, so
+    # the excess it removes is meaningless. **It did not bound ticket 14 and cannot**: a
+    # synthetic snapshot places replicas that shed nothing, so it pays placement's whole
+    # cost for no benefit (26.0% of excess removed against 1.2%), and a rank-identical
+    # snapshot that did describe real load would need the collective it removes. Kept as
+    # a calibrated churn generator — see `_PROBE_ROTATE_EVERY`.
+    "VLLM_PREDICTIVE_DETERMINISTIC_SNAPSHOT": lambda: bool(
+        int(os.getenv("VLLM_PREDICTIVE_DETERMINISTIC_SNAPSHOT", "0"))
+    ),
+    # Ticket 18/09's derivative test: extra no-op kernel launches per source layer, to
+    # measure d(gap)/d(dispatch). Prediction's added cost is 8.4% dispatch and 81% gap,
+    # and whether removing dispatch also shrinks the gap decides whether a captured
+    # graph is worth more than its first-order 1.5%. The launches touch a scratch
+    # scalar, so predicted counts are bit-identical with it set.
+    "VLLM_PREDICTIVE_DISPATCH_BALLAST": lambda: int(
+        os.getenv("VLLM_PREDICTIVE_DISPATCH_BALLAST", "0")
+    ),
+    # Ticket 18's fused prediction kernel. Defaults **on**, unlike every other switch
+    # here, because it is the optimisation rather than a probe; set it to 0 to measure
+    # against the unfused path in the same run.
+    "VLLM_PREDICTIVE_FUSED_PREDICT": lambda: bool(
+        int(os.getenv("VLLM_PREDICTIVE_FUSED_PREDICT", "1"))
     ),
     # Cost probe, not a serving option: keep prediction's compute and remove only its
     # per-layer snapshot AllGather, so the two halves of prediction's cost can be told
