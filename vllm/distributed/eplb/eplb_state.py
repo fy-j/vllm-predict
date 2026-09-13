@@ -428,6 +428,21 @@ class EplbModelState:
     """
 
 
+def _predicted_row(snapshot: torch.Tensor, runner) -> list[float]:
+    """This source's predicted per-logical-expert load, summed over source ranks.
+
+    A window's snapshot carries one row per position and the rows belong to *different*
+    target layers, so they may never be summed: four layers' predictions added together
+    is the distribution that made ticket 12's design remove 3.7% of excess where one
+    target per source removes 26.8%.
+    """
+    summed = snapshot.sum(dim=0)
+    if summed.dim() == 1:
+        return summed.tolist()
+    predictor = runner.load_predictor
+    return summed[predictor.window_position].tolist()
+
+
 class EplbState:
     """
     EplbState of each expert parallel model. Key is the model config hash.
@@ -1265,8 +1280,13 @@ class EplbState:
             # launched together can share one. Two is the floor, which is the
             # single-source configuration and the scheme that shipped.
             staging_buffers = max(2, predictive.prediction_target_group)
+            # Each buffer holds one expert per replica slot: a layer's whole set moves
+            # under one barrier, so its puts are in flight together and cannot share a
+            # span. Slot `i` of buffer `b` sits at `(b * slots + i)` experts in.
             staging = self._symmetric_staging(
-                ep_group, staging_stride, buffers=staging_buffers
+                ep_group,
+                staging_stride,
+                buffers=staging_buffers * predictive.replica_slots_per_rank,
             )
             transfer = DeviceExpertTransfer(
                 staging=staging,
@@ -1972,8 +1992,15 @@ class EplbState:
                         "source": source_index,
                         "target": target_index,
                         # Summed over source ranks so both sides count the same
-                        # population: the actual load is likewise a global count.
-                        "predicted": snapshot.sum(dim=0).tolist(),
+                        # population: the actual load is likewise a global count,
+                        # then indexed to this source's own window position. Ticket
+                        # 13 gave the snapshot a window dimension and this line kept
+                        # summing only over ranks, so every record since has carried
+                        # a `[size, num_logical]` row where the scorer expects
+                        # `[num_logical]` -- which made `prediction_accuracy.py` fail
+                        # outright rather than quietly, and the accuracy curve has not
+                        # been measurable since.
+                        "predicted": _predicted_row(snapshot, runner),
                         "actual": actual[target_index],
                     }
                 )

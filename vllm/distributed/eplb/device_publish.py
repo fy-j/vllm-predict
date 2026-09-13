@@ -56,6 +56,21 @@ class LayerResidency:
         """A layer holding no replica, as startup normalization leaves it."""
         return LayerResidency(torch.full((2,), -1, dtype=torch.int64, device=device))
 
+    @staticmethod
+    def empty_slots(device: torch.device, slots: int) -> LayerResidency:
+        """A layer with `slots` replica slots, all empty: `[slots, 2]`.
+
+        Separate from `empty` rather than a default argument on it, because the two
+        shapes are not interchangeable: the single-slot publish kernel indexes `[2]`
+        directly and would read a slot count as an expert id. The multi-slot path is the
+        one the coordinator runs; `empty` remains for the oracles it is tested against.
+        """
+        if slots < 1:
+            raise ValueError(f"a layer needs at least one replica slot, got {slots}.")
+        return LayerResidency(
+            torch.full((slots, 2), -1, dtype=torch.int64, device=device)
+        )
+
     @property
     def expert(self) -> torch.Tensor:
         return self.state[0]

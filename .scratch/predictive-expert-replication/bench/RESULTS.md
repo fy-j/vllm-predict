@@ -3442,3 +3442,323 @@ window lookup no longer stops at the latest start when windows nest. Re-derived:
 8.4%, compute 1.9%, event-sync 7.8%, gap 81.9%**, against 8.4 / 1.8 / 8.5 / 81.2 before. The
 conclusion is unchanged, which is worth recording: the defects were real and the shares were
 robust to them.
+
+## 2026-09-07 — the feature is net positive at 8k prompts, and one measured variable explains why it was not before
+
+**Every negative verdict on this branch was taken at ~877 tokens per forward.** At ~4200 it
+reverses. Same code, same domain, same node, same eight ranks; the only change is prompt length.
+
+```
+regime            mean TTFT                      total token throughput        paired
+1k / CONC=16      -0.0%   (unreadable)           —                             2/3 worse
+8k / CONC=16      -2.50%  95% CI [-3.48, -1.53]  +2.80%  CI [+1.85, +3.74]     6/6
+8k / CONC=32      -1.20%  95% CI [-1.80, -0.61]  +1.35%  CI [+0.61, +2.10]     6/6
+```
+
+This is the whole feature against a stock server — prediction *and* placement, not placement
+against prediction. Most earlier figures in this file lack that denominator.
+
+**The mean/spread verdict fails on all three runs and the pairing carries them**, as in ticket
+18: stock's own drift across passes (1.9-2.8%) is comparable to the effect. Six interleaved
+passes make the paired CI exclude zero; three do not. Report the pairing, never the means.
+
+### Expert stability: the variable that decides it
+
+Measured directly from the dumps, so independent of TTFT noise. The quantity is the fraction of
+consecutive forwards where **the expert the planner actually picks** — the peak rank's hottest
+logical expert — is unchanged:
+
+| | 1k prompts | 8k prompts |
+| --- | --- | --- |
+| local tokens per forward | 877 | 4203 |
+| tokens per logical expert | 438 | 1978 |
+| **expert stability** | **20.1%** | **93.4%** |
+| peak rank unchanged | 45.2% | 95.1% |
+| canonical critical-path imbalance | 1.8910 | 1.9163 |
+| critical-path excess removed | 26.7% | 26.2% |
+| transfers per 1000 tokens | 4.74 | 0.86 |
+
+Two halves of the same fact. **The opportunity did not change** — imbalance is 1.89 either way,
+and placement removes 26% of excess either way, to three significant figures across every pass.
+**What changed is whether the transfer amortises.** At 1k, 80% of layers want a different
+replica every forward, so a replica is stale before it is used and the budget is spent on churn.
+The kernel docstring's premise — "in a steady state the honest charge is zero and the budget
+bounds churn rather than coverage" — describes the 8k regime and not the 1k one.
+
+The mechanism is sampling noise, not a property of the workload: the fewer tokens a forward
+carries, the more "which expert is hottest" depends on which requests happen to be in that
+batch. So it is a property of the **measurement configuration**, and every cost or benefit
+figure in this file needs its tokens-per-forward stated beside it.
+
+### Why the gain halves at CONC=32, and it is not the feature doing less
+
+Every mechanism number is slightly *better* at 32, and there is no preemption in either arm:
+
+| | CONC=16 | CONC=32 |
+| --- | --- | --- |
+| local tokens per forward | 4203 | 5739 |
+| expert stability | 93.2% | 93.8% |
+| excess removed | 26.2% | 26.5% |
+| **queueing as a share of TTFT** | **46%** | **72%** |
+| TTFT / own compute | 1.84x | 3.52x |
+
+The feature shortens compute, and compute falls from 54% to 28% of TTFT. The gain falling from
+2.50% to 1.20% tracks that almost exactly. Welch's t on the two effects: TTFT t=-2.93,
+throughput t=+3.09 (df~8) — **the two concurrencies genuinely differ**, which three passes could
+not have shown (that run gave -0.90% with a CI of +/-4.3%, consistent with anything).
+
+Queueing is computed from the dumps rather than from engine logs, which
+`--uvicorn-log-level warning` suppresses: forwards executed and tokens per forward give a wall
+clock per forward, times the forwards a request needs, gives its own compute; the rest of TTFT
+is waiting. **This also corrects a claim in this file**: CONC=16 at 1k is 47% queueing too, so
+"concurrency 16 is the highest that does not queue" is too strong — it is the *least queued*
+usable point, not an unqueued one.
+
+**Testable prediction, not yet run:** lowering concurrency should *raise* the TTFT gain, because
+compute is a larger share of a shorter queue.
+
+### The replica count: more balance, and at 1k it costs more than it returns
+
+`replica_slots_per_rank=2` was wired and measured for the first time (ticket 19). At 1k it
+delivers what the offline replay predicted and loses TTFT anyway:
+
+```text
+1k / CONC=16    excess removed   activations/forward   vs stock (3 passes)
+cap 1                  26.7%                    5.8    +0.0%  (unreadable)
+cap 2                  37.7%                   13.0    +5.6%  (worse, 2/3)
+```
+
+Offline replay predicted 32.2% -> 46.1% for one slot -> two, a ratio of 1.43; hardware gives
+26.7% -> 37.7%, a ratio of **1.41**. **The offline replay's scaling is confirmed on hardware**,
+which is the first time this branch has checked it. But the transfer rate goes up 2.24x, and at
+20% expert stability that churn costs more than the extra balance returns.
+
+The control that separates slots from budget is closed: `86:device:1` (one slot, doubled budget)
+is indistinguishable from `43:device:1` at both prompt lengths, so cap 2's loss is the slot
+count and not the budget. That control was owed — the earlier run changed both at once, and the
+reasoning that this was safe was reasoning, not measurement.
+
+**Cap 2 at 8k is unmeasured.** The mechanism that defeated it — churn — is down 5.5x, so it may
+well be positive there. That is a run, not an inference.
+
+### Memory: the feature costs KV, and balancing does not reduce activation
+
+Read from the startup profile, three arms of one interleaved run:
+
+| arm | weights + non-torch | peak activation | KV cache |
+| --- | --- | --- | --- |
+| stock | 14.01 GiB | **0.38 GiB** | 55.23 GiB / 603,248 tokens |
+| prediction only | 17.17 GiB | **0.96 GiB** | 51.48 GiB / 562,288 tokens |
+| placing, cap 1 | 19.83 GiB | **0.96 GiB** | 48.82 GiB / 533,248 tokens |
+
+**Peak activation rises and balance does not lower it.** The placing and prediction-only arms
+report the *same* 0.96 GiB and differ only in whether replicas are placed, so if balance shrank
+the activation these two would differ. They do not. The reason is in
+`fused_moe/experts/triton_moe.py`: `workspace1 = (M, topk, max(activation_out_dim, K))` is a
+shape formula over the chunk's token count, and `expert_tokens_meta` — the real per-expert
+counts — is passed to `workspace_shapes` and ignored on this path. Under
+`allgather_reducescatter` every rank's MoE also runs over all ranks' tokens, so the workspace is
+byte-identical on every rank whatever the routing does. **A batched layout would behave
+differently** (`(local_experts, max_tokens_per_expert, K)` really does pad per expert), so this
+answer is backend-specific and this branch runs the backend where balancing buys no memory.
+
+Net: **-6.4 GiB of KV, -70,000 tokens, -11.6%.** It has no consequence at the configurations
+measured — CONC=16 at 8k needs 131,072 tokens against 533,248 — but it does at CONC=64, where
+the feature arm would sit at 98% of its KV while stock sits at 87%. **Do not measure CONC=64
+without equalising KV between arms**, or the result will be the memory cost wearing the
+feature's name.
+
+### Two process errors, both repeatable
+
+- **Editing a running bash script.** `run_e2e_placement.sh` was edited mid-run to add
+  `PROMPT_LEN`; bash reads a script by byte offset, the inserted lines shifted everything after
+  them, and the run died with a syntax error in the guard. The 12 arms were unharmed only
+  because bash parses a whole `for` compound command before executing it, so the loop body was
+  already in memory. "Not touching `vllm/`" is not the same as safe.
+- **Three passes after learning three is not enough.** The first 8k run failed its verdict at
+  three passes and passed at six; CONC=32 was then launched at three passes and produced
+  -0.90% +/- 4.3%, which was read as "the gain shrank". Six passes later the gain is -1.20% and
+  the earlier run was not wrong, merely powerless.
+
+## 2026-09-08 — the curve over prompt length and concurrency, and the domain that qualifies all of it
+
+Ten runs, 2026-09-07 21:03 to 2026-09-08 05:48, all DP=EP=8, all six interleaved passes unless
+stated, all **the whole feature against a stock server**. Every figure below is paired within a
+pass; the means-and-spread verdict fails on most of them, exactly as on 2026-09-07.
+
+### The best measured configuration on this branch
+
+16k prompts, CONC=8, `ko`, two replica slots:
+
+```text
+                          mean TTFT              total token throughput   paired
+cap 1  43:device:1        -5.38%  +/- 1.33       +5.98%                    6/6
+cap 2  86:device:1:c2     -6.17%  +/- 2.32       +7.03%                    6/6
+```
+
+### Prompt length, and one confound in it
+
+| prompt | CONC | tokens/forward | mean TTFT | paired |
+| --- | --- | --- | --- | --- |
+| 2k | 16 | 1404 | **+2.29%** +/- 1.14 | 0/6 (worse) |
+| 4k | 16 | 2859 | -2.39% +/- 3.91 | 5/6 |
+| 8k | 16 | 4203 | -2.50% +/- 0.98 | 6/6 |
+| 16k | 8 | 4108 | **-4.67%** +/- 1.74 | 6/6 |
+
+**The 16k point changes concurrency as well as length** — 16 x 18432 tokens of KV does not fit,
+so it runs at CONC=8 — and the honest comparison is at fixed concurrency: at CONC=8, 8k is
+**-3.36%** and 16k is **-4.67%**. Length still pays after the concurrency is held, but less than
+the column suggests. Do not quote the four rows as a length curve.
+
+### Concurrency at 8k, and a prediction of this file's that its own experiment refuted
+
+| CONC | mean TTFT | paired |
+| --- | --- | --- |
+| 4 | **+0.67%** +/- 0.88 | 1/6 (worse) |
+| 8 | **-3.36%** +/- 1.45 | 6/6 |
+| 16 | -2.50% +/- 0.98 | 6/6 |
+| 32 | -1.20% +/- 0.59 | 6/6 |
+
+2026-09-07 recorded a testable prediction: lowering concurrency should *raise* the gain, because
+the feature shortens compute and compute is a larger share of a shorter queue. **It holds from 32
+to 8 and breaks at 4**, where the feature is worse than stock on 5 of 6 passes. The curve has a
+turning point, so the monotone reasoning behind the prediction is wrong or incomplete. CONC=8 is
+the best point measured, not the lowest.
+
+### Expert stability does not carry the explanation on its own any more
+
+Recomputed from the dumps across the curve — the fraction of consecutive forwards where the peak
+rank's hottest logical expert is unchanged, the same quantity as 2026-09-07:
+
+| config | tokens/forward | expert stability | mean TTFT |
+| --- | --- | --- | --- |
+| 1k / c16 (2026-09-07) | 877 | 20.1% | -0.0% unreadable |
+| 2k / c16 | 1404 | **88.5%** | **+2.29%** |
+| 4k / c16 | 2859 | 88.7% | -2.39% |
+| 8k / c16 | 4203 | 93.3% | -2.50% |
+| 8k / c8 | 3085 | 93.6% | -3.36% |
+| 16k / c8 | 4108 | 95.1% | -4.67% |
+
+**Stability saturates by 2k and the sign flips between 2k and 4k**, so it cannot be the variable
+that decides it. The 2026-09-07 framing — "one measured variable explains it" — is too strong and
+is corrected here: stability is a *precondition*, satisfied from 2k onward, and what decides the
+sign above that is amortisation, cost being per forward and benefit per token. Nor does
+tokens-per-forward finish the job: 16k/c8 and 8k/c16 carry almost the same tokens per forward
+(4108 against 4203) and differ by 2.2 points, which is the queueing share of 2026-09-07's second
+table. **Two axes, not one.**
+
+### The domain that qualifies every result on this branch
+
+`ko` is 161 concatenated Korean instructions per prompt. `gov` (govreport) is 1.6 segments — real
+long documents — and it is the only domain here that is not a concatenation:
+
+| domain @ 8k / c16 | expert stability | mean TTFT | paired |
+| --- | --- | --- | --- |
+| ko | 93.3% | -2.50% | 6/6 |
+| **gov** | **72.4%** | **+1.12%** +/- 2.42 | **3/6** |
+| gov @ 16k / c8 | 79.2% | -2.70% +/- 1.79 | 5/6 |
+
+**Concatenation inflates expert stability**, and that is measured, not supposed: repeated short
+segments route repeatedly, real documents do not. So **the 8k verdict does not transfer to real
+documents** — on gov at 8k the feature is unreadable and its point estimate is positive. It takes
+16k for gov to turn, and it turns to -2.70% rather than ko's -4.67%. Every "8k is net positive"
+statement in this file and in CLAUDE.md needs "on concatenated prompts" attached to it.
+
+### Four domains at 8k, and screening that could not even rank
+
+| domain | 3-pass screen | 6-pass confirm |
+| --- | --- | --- |
+| books (pg19) | +0.89% (1/3) | **-2.41%** (6/6) |
+| pubmed | -1.29% (3/3) | **-1.49%** (6/6) |
+| chat (ShareGPT) | -0.68% (2/3) | not confirmed |
+| arxiv | +0.18% (2/3) | not confirmed |
+
+The screen ranked books **last of four** and the confirm ranked it **first**; the sign reversed.
+Three passes cannot rank these domains, let alone quote one, and the sweep driver labels its own
+screen `SCREENING ONLY` for this reason. The result of a sweep is the range across domains.
+
+### Three tickets closed by these runs
+
+**14 — the snapshot reduction: dead at 8k, and not by argument.** Its ceiling was 8.78 ms at 1k,
+a share of prediction's cost. Re-measured at 8k (3 passes, so read the direction not the size):
+prediction alone is **+0.24%** +/- 1.38 against stock, and removing the AllGather leaves
+**+1.30%**. Prediction's whole cost has amortised away at 4.8x the tokens, so the barrier share of
+it is nothing. There is no longer anything for this ticket to remove.
+
+**15 — the coverage ratchet holds at the default budget.** 8k, 3 passes: budget **4** (the
+default) gives **-1.76%** +/- 1.88, 3/3; budget 43 gives -2.13% +/- 0.55, 3/3. The 1k run could
+not test this — at 20% stability there is no steady state to converge to — and this is the
+hardware criterion the ticket was left open on.
+
+**19 — two replica slots pay, at both lengths.** 8k/c16: cap 2 **-3.17%** against cap 1 -2.51%,
+both 6/6. 16k/c8: cap 2 **-6.17%** against cap 1 -5.38%, both 6/6. At 1k cap 2 cost +5.6%, and
+the difference is churn: the transfer rate that made a second slot unaffordable at 20% stability
+is 5.5x lower here.
+
+### The transfer budget: where 43 came from, and what the activation rate really is
+
+`43` and `86` are in every arm on this branch and **neither is the current reachable-layer
+count.** The binder's rule is `range(prediction_skip_first_layers, num_layers - lookahead)`, and
+Qwen3-30B-A3B has **48** decoder layers, all sparse (`mlp_only_layers: []`, `decoder_sparse_step:
+1`), 128 experts, top-8:
+
+| lookahead | source layers | reachable |
+| --- | --- | --- |
+| 2 (the old default) | `range(3, 46)` | **43** |
+| 1 (default since ticket 07, 2026-08-30) | `range(3, 47)` | **44** |
+
+So 43 is the count from *before* ticket 07 moved the lookahead, and `86` is `2 x 43` inheriting
+the same off-by-one. This file already recorded "Reachable layers went 43 -> 44"; the arm
+constants never followed.
+
+**The budget charges what moves, not what is held**, which is why it is nowhere near binding.
+From `fused_placement.py`: `keep = found * resident * same`, `needs = found * (1 - keep)`, and
+only `needs` is charged. A layer whose planned expert equals its resident one transfers nothing.
+At 93-95% expert stability, only 3 layers of 44 change their mind per forward.
+
+Measured per 10-forward report window, 16k / CONC=8:
+
+```text
+cap 1                                  cap 2
+forwards  0..10:  65   (6.5/forward)   185  (18.5/forward)
+forwards 10..20:  27   (2.7/forward)   181  (18.1/forward)
+forwards 20..30:  31   (3.1/forward)   156  (15.6/forward)
+forwards 30..40:  32   (3.2/forward)   170  (17.0/forward)
+```
+
+**Steady state is 2.7-3.2 activations per forward against a cap of 43**, and the whole-run
+average of 4.0 quoted earlier in this section is inflated by the cold start. `44 x (1 - joint
+stability)` predicts 2.2 where joint stability — peak rank *and* its hottest expert both
+unchanged — is 95.1%; measured steady state is 2.7-3.2. Same order, and the residual is small
+enough to be the difference between that proxy and the planner's own `same` test.
+
+**The first forward looked like it might bind, and it does not.** Nothing is resident then, so
+all 44 layers want a transfer at once and a budget of 43 could refuse exactly one; the first
+window's 65 activations were consistent both with "forward 1 capped at 43" and with a gentler
+ramp, and 10-forward granularity cannot separate them. **Raising the budget settles it without a
+new instrument**: at 48 the first window holds **61** activations against 43's **65**. It did not
+grow, so forward 1 was never capped — coverage ramps because not every layer clears the
+planner's `found` test in the first forward, not because the budget refused it. **The off-by-one
+has never affected a measurement on this branch, first forward included.**
+
+**cap 2 shows no cold start at all.** Its second slot holds the *second*-hottest expert, which
+is far less stable than the first, so it churns at 17 per forward continuously and the one-off
+44 disappears into it. That, not "twice the transfers", is why cap 2 costs what it costs: at 1k
+it is +5.6% and at 16k it is -6.17%, on the same mechanism.
+
+**Re-measured at 48 and 96** (2026-09-08), which are above 44 and 88 by construction so the
+question stops existing. At **8k / CONC=16 the conclusion is unchanged**: cap 1 gives -2.27%
++/- 0.62 against 43's -2.50% +/- 0.98, and cap 2 gives -2.77% +/- 0.35 against 86's -3.17%
++/- 0.42, all four 6/6 paired and each pair inside the other's interval.
+
+**At 16k the two runs disagree by more than the budget can explain**, and the honest reading is
+that the 16k effect size does not reproduce across runs. Budget 48 cap 1 came in at -0.37% with
+an interval of +/- 7.36 because **one pass of six is an outlier** — +13.62% against the other
+five's -1.75% to -5.81%, with p99 TTFT 3075 ms against 1342-1408 ms and all 96 requests
+completed, so a tail-latency blip rather than a failure. Dropping it gives -3.17%, and dropping
+the worst pass to obtain the expected answer is the error this file exists to prevent, so it is
+not reported as a result. Even excluding it, cap 1 is -3.17% here against -5.38% before and cap
+2 is -3.48% against -6.17%, on arms differing only in a budget that never binds. **Within-run
+pairing does not remove between-run drift**, so the budgets are being re-compared inside a
+single interleave — `off 43 48 86:c2 96:c2`, six passes — which is the only design that answers
+it.

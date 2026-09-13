@@ -59,7 +59,9 @@ class DelayedReader:
         self.late_read: torch.Tensor | None = None
         self.done: torch.cuda.Event | None = None
 
-    def transfer(self, plan, pointers, replica_row, stream, staging_offset=0) -> None:
+    def transfer(
+        self, plan, pointers, replica_row, stream, staging_offset=0, **kwargs
+    ) -> None:
         self.address = plan.data_ptr()
         with torch.cuda.stream(stream):
             torch.cuda._sleep(_DELAY_CYCLES)
@@ -121,7 +123,9 @@ def test_the_transfer_reads_the_planned_expert_and_not_what_replaced_it():
     )
 
     predicted = hot_load(device)
-    expected = plan_one_layer_on_device(predicted, EP_SIZE, MIN_TOKENS)
+    # The coordinator plans a `[slots, 4]` table now; at one slot its single row is
+    # asserted elsewhere to be bit-identical to this oracle.
+    expected = plan_one_layer_on_device(predicted, EP_SIZE, MIN_TOKENS).view(1, 4)
     coordinator.note_forward_token_load(1024.0)
     coordinator.record_prediction(0, predicted)
     coordinator.plan_and_launch()
@@ -248,7 +252,7 @@ def test_each_layer_keeps_its_own_plan_while_several_are_in_flight():
 
     class Recorder:
         def transfer(
-            self, plan, pointers, replica_row, stream, staging_offset=0
+            self, plan, pointers, replica_row, stream, staging_offset=0, **kwargs
         ) -> None:
             seen.append((plan.data_ptr(), plan.tolist()))
 
@@ -433,7 +437,13 @@ def test_the_transfer_waits_for_the_compute_stream_before_reading_anything():
 
     class ReadsTheMarker:
         def transfer(
-            self, plan, pointers, replica_row, transfer_stream, staging_offset=0
+            self,
+            plan,
+            pointers,
+            replica_row,
+            transfer_stream,
+            staging_offset=0,
+            **kwargs,
         ) -> None:
             with torch.cuda.stream(transfer_stream):
                 seen.append(marker.clone())
@@ -499,7 +509,7 @@ def test_consecutive_layers_do_not_share_one_staging_buffer():
 
     class RecordsTheOffset:
         def transfer(
-            self, plan, pointers, replica_row, stream, staging_offset=0
+            self, plan, pointers, replica_row, stream, staging_offset=0, **kwargs
         ) -> None:
             offsets.append(staging_offset)
 

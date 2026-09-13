@@ -1,0 +1,539 @@
+<title>预测式专家复制</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root{
+  --ground:#f7f8f8; --paper:#ffffff; --tint:#eef1f2; --line:#dce1e4; --line-2:#c3cbd0;
+  --ink:#15181b; --ink-2:#3d464e; --muted:#5f6b76; --faint:#8b959d;
+  --predict:#1f4e79; --predict-bg:#e7eef5;
+  --replica:#0f766e; --replica-bg:#e3f0ee;
+  --bytes:#b45309; --bytes-bg:#f8ece0;
+  --rule:#c9d2d8;
+  --maxw:1080px;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#14171a; --paper:#1b1f23; --tint:#22272c; --line:#31383e; --line-2:#48525a;
+    --ink:#e8eaec; --ink-2:#c3cace; --muted:#9aa5ad; --faint:#6f7a83;
+    --predict:#7aa7d9; --predict-bg:#1d2a38;
+    --replica:#4fbfa8; --replica-bg:#152b28;
+    --bytes:#e0a05a; --bytes-bg:#33261a;
+    --rule:#3a444c;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#14171a; --paper:#1b1f23; --tint:#22272c; --line:#31383e; --line-2:#48525a;
+  --ink:#e8eaec; --ink-2:#c3cace; --muted:#9aa5ad; --faint:#6f7a83;
+  --predict:#7aa7d9; --predict-bg:#1d2a38;
+  --replica:#4fbfa8; --replica-bg:#152b28;
+  --bytes:#e0a05a; --bytes-bg:#33261a;
+  --rule:#3a444c;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:"Noto Serif SC",Songti SC,SimSun,Georgia,serif;
+  font-size:16px; line-height:1.9; -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+}
+.wrap{max-width:var(--maxw); margin:0 auto; padding:0 32px}
+.sans{font-family:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+.mono{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace; font-variant-numeric:tabular-nums}
+h1,h2,h3{font-family:"Noto Sans SC","PingFang SC",system-ui,sans-serif; text-wrap:balance; margin:0; font-weight:700}
+h1{font-size:clamp(1.75rem,4.4vw,2.6rem); line-height:1.3; letter-spacing:.01em}
+h2{font-size:clamp(1.15rem,2.3vw,1.42rem); line-height:1.45; letter-spacing:.005em}
+h3{font-size:1rem; font-weight:600; line-height:1.5}
+p{margin:0}
+a{color:var(--predict); text-decoration:none; border-bottom:1px solid var(--line-2)}
+a:hover{border-bottom-color:var(--predict)}
+code{font-family:"JetBrains Mono",monospace; font-size:.86em; background:var(--tint); padding:.08em .3em; border-radius:2px; font-variant-numeric:tabular-nums}
+
+/* ---------- 标题区 ---------- */
+.masthead{border-bottom:2px solid var(--ink); padding-bottom:30px; margin-bottom:14px}
+.crumb{
+  font-family:"JetBrains Mono",monospace; font-size:.72rem; letter-spacing:.14em;
+  color:var(--faint); text-transform:uppercase; padding:44px 0 26px;
+}
+.masthead h1{margin-bottom:16px}
+.subtitle{
+  font-family:"Noto Sans SC",system-ui,sans-serif; font-size:1.02rem; font-weight:400;
+  color:var(--muted); line-height:1.7; max-width:62ch; text-align:justify;
+}
+.meta{
+  display:flex; flex-wrap:wrap; gap:8px 34px; padding:20px 0 0; margin-top:22px;
+  border-top:1px solid var(--line);
+  font-family:"JetBrains Mono",monospace; font-size:.78rem; color:var(--muted);
+}
+.meta b{color:var(--ink); font-weight:600}
+
+/* ---------- 摘要 ---------- */
+.abstract{
+  background:var(--paper); border:1px solid var(--line); border-left:3px solid var(--ink);
+  padding:24px 28px; margin:34px 0 56px;
+}
+.abstract .lbl{
+  font-family:"JetBrains Mono",monospace; font-size:.72rem; letter-spacing:.16em;
+  color:var(--faint); text-transform:uppercase; display:block; margin-bottom:12px;
+}
+.abstract p{font-size:.95rem; line-height:1.95; color:var(--ink-2); text-align:justify}
+.abstract p + p{margin-top:12px}
+
+/* ---------- 章节 ---------- */
+section{margin:0 0 62px}
+.sechead{display:flex; align-items:baseline; gap:12px; margin-bottom:22px; padding-bottom:10px; border-bottom:1px solid var(--line-2)}
+.sechead .n{font-family:"JetBrains Mono",monospace; font-size:1rem; font-weight:600; color:var(--ink); min-width:1.5em}
+.sechead h2{flex:1}
+p.body{text-align:justify; margin-bottom:16px}
+p.body:last-child{margin-bottom:0}
+em.term{font-style:normal; font-weight:600; color:var(--predict)}
+em.rep{font-style:normal; font-weight:600; color:var(--replica)}
+em.byt{font-style:normal; font-weight:600; color:var(--bytes)}
+
+/* ---------- 图 ---------- */
+figure{margin:0 0 42px}
+.figbox{
+  background:var(--paper); border:1px solid var(--line); padding:26px 24px 18px;
+  overflow-x:auto;
+}
+svg{display:block; margin:0 auto}
+figcaption{
+  font-family:"Noto Sans SC",system-ui,sans-serif; font-size:.84rem; line-height:1.75;
+  color:var(--muted); padding:14px 4px 0; text-align:justify;
+}
+figcaption b{color:var(--ink); font-weight:700}
+.fig-title{
+  font-family:"Noto Sans SC",system-ui,sans-serif; font-size:.88rem; font-weight:600;
+  color:var(--ink); padding:0 4px 14px;
+}
+.legend{
+  display:flex; flex-wrap:wrap; gap:8px 26px; padding:14px 4px 0; margin-top:14px;
+  border-top:1px solid var(--line);
+  font-family:"Noto Sans SC",system-ui,sans-serif; font-size:.8rem; color:var(--muted);
+}
+.legend span{display:inline-flex; align-items:center; gap:8px}
+.chip{width:12px; height:12px; border-radius:2px; flex:none}
+
+/* ---------- 表格 ---------- */
+.tw{overflow-x:auto; border:1px solid var(--line); background:var(--paper)}
+table{width:100%; border-collapse:collapse; font-size:.86rem}
+th,td{padding:10px 14px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top}
+th{
+  font-family:"Noto Sans SC",system-ui,sans-serif; font-size:.76rem; font-weight:600;
+  color:var(--ink-2); background:var(--tint); border-bottom:1px solid var(--line-2); white-space:nowrap;
+}
+td.n,th.n{font-family:"JetBrains Mono",monospace; font-variant-numeric:tabular-nums; white-space:nowrap; text-align:right}
+tr:last-child td{border-bottom:none}
+.pos{color:var(--replica); font-weight:600}
+.neg{color:var(--bytes); font-weight:600}
+.tcap{
+  font-family:"Noto Sans SC",system-ui,sans-serif; font-size:.84rem; color:var(--muted);
+  padding:12px 2px 0; line-height:1.7; text-align:justify;
+}
+.tcap b{color:var(--ink); font-weight:700}
+
+/* ---------- 模块定义 ---------- */
+.defs{display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:24px 30px}
+.def{border-top:2px solid var(--predict); padding-top:14px; display:flex; flex-direction:column; gap:8px}
+.def.b{border-top-color:var(--bytes)}
+.def.r{border-top-color:var(--replica)}
+.def h3{font-family:"JetBrains Mono",monospace; font-size:.82rem; font-weight:600; word-break:break-word; line-height:1.5}
+.def .k{font-family:"JetBrains Mono",monospace; font-size:.68rem; letter-spacing:.1em; color:var(--faint); text-transform:uppercase}
+.def p{font-size:.86rem; line-height:1.8; color:var(--ink-2); text-align:justify}
+
+.note{
+  font-family:"Noto Sans SC",system-ui,sans-serif; font-size:.86rem; line-height:1.85;
+  color:var(--muted); text-align:justify;
+}
+.note b{color:var(--ink); font-weight:600}
+
+footer{
+  border-top:1px solid var(--line-2); margin-top:20px; padding:26px 0 64px;
+  font-family:"JetBrains Mono",monospace; font-size:.76rem; color:var(--faint);
+  display:flex; flex-wrap:wrap; gap:8px 30px; justify-content:space-between;
+}
+@media (max-width:640px){ .wrap{padding:0 18px} }
+</style>
+
+<div class="wrap">
+  <div class="crumb">vLLM MoE · 设备侧放置 · 实现报告</div>
+  <div class="masthead">
+    <h1>预测式专家复制</h1>
+    <p class="subtitle">稀疏 MoE 的每一层只把 token 路由到当下最热的专家上，于是热点专家所在的 rank 成为整层的关键路径。而下一层的热点专家，在当前层就能提前知道：把目标层的路由 gate 作用到当前层的隐状态上，即可得到那个层自己的专家选择。本方案据此提前把专家权重复制到即将需要它的 rank，并把这次权重搬运完全藏在两层之间本来就要执行的一段 Attention 之后。</p>
+    <div class="meta">
+      <span>模型 <b>Qwen3-30B-A3B</b></span>
+      <span>层数 <b>48</b>（可达源层 <b>44</b>）</span>
+      <span>拓扑 <b>DP = EP = 8</b></span>
+      <span>硬件 <b>8 × H100 SXM</b></span>
+      <span>放置开销 <b>0</b> 次 host 读取</span>
+    </div>
+  </div>
+
+  <div class="abstract">
+    <span class="lbl">摘要</span>
+    <p>本文描述一种在 MoE 推理中动态复制专家权重的机制。它在第 <span class="mono">L</span> 层的 MoE 尾部读取该层隐状态，用第 <span class="mono">L+1</span> 层自己的 gate 求出一份专家负载预测；据此在设备端选出一个目标 rank，用单边 <span class="mono">put</span> 把该专家的权重写入其副本槽；写入在 <span class="mono">L+1</span> 层的 Attention 期间完成，并在该层路由之前发布为新的路由表。整条路径上，放置计划从不到达主机。</p>
+    <p>测量结论是分裂的：<em class="rep">放置本身是负成本</em>，它卸掉关键路径上 <span class="mono">26–36%</span> 的失衡而几乎不增加开销；<em class="term">预测</em>则是全部开销所在，也是该方案在短 prompt 上净为负的原因。在长 prompt、低并发区间，端到端 prefill TTFT 取得 <span class="mono">2–5%</span> 的可复现收益。</p>
+  </div>
+</div>
+
+<main class="wrap">
+
+<!-- ================= 图 1 ================= -->
+<section>
+  <div class="sechead"><span class="n">1</span><h2>方案总览</h2></div>
+  <p class="body">整个方案可以拆成四个动作，图 1 按顺序给出。判断依据是这样一个事实：某一层的路由结果由 <code>logits = hidden_states @ gateᵀ</code> 决定，而 <code>gate</code> 的权重本来就在手里。因此用<strong>目标层</strong>的 gate 去作用于<strong>当前层</strong>的隐状态，得到的就是目标层自己的专家选择——这不是启发式猜测，而是一次真实的 gate 求值，唯一的误差来源是隐状态旧了一层。</p>
+
+  <figure>
+    <div class="figbox">
+      <div class="fig-title">图 1　方案总览</div>
+      <svg viewBox="0 0 1060 600" width="1000" role="img"
+           aria-label="四联图：专家负载倾斜、跨层 gate 预测、藏于 Attention 后的权重传输、副本分担负载">
+        <defs>
+          <marker id="a-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--ink-2)"/>
+          </marker>
+          <marker id="a-pre" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--predict)"/>
+          </marker>
+          <marker id="a-byt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--bytes)"/>
+          </marker>
+          <pattern id="hatch-hot" width="6" height="6" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+            <line x1="0" y1="0" x2="0" y2="6" stroke="var(--bytes)" stroke-width="1.6" opacity=".38"/>
+          </pattern>
+        </defs>
+        <style>
+          .pt{font-family:"Noto Sans SC",system-ui,sans-serif; font-size:12.5px; font-weight:700; fill:var(--ink); letter-spacing:.02em}
+          .pl{font-family:"Noto Sans SC",system-ui,sans-serif; font-size:11px; fill:var(--muted)}
+          .pn{font-family:"JetBrains Mono",monospace; font-size:11px; fill:var(--ink-2)}
+          .pk{font-family:"JetBrains Mono",monospace; font-size:10.5px; fill:var(--faint)}
+          .pdiv{stroke:var(--line); stroke-width:1; fill:none}
+          .paxis{stroke:var(--line-2); stroke-width:1}
+          .bar{fill:var(--predict); opacity:.5; stroke:var(--predict); stroke-width:.8}
+          .barhot{fill:url(#hatch-hot); stroke:var(--bytes); stroke-width:1.1}
+          .barrep{fill:var(--replica); opacity:.42; stroke:var(--replica); stroke-width:.9}
+          .ghost{fill:none; stroke:var(--bytes); stroke-width:1; stroke-dasharray:2.5 3}
+        </style>
+
+        <!-- ===== (a) 问题 ===== -->
+        <text class="pt" x="46" y="34">(a)　问题：热点专家把某个 rank 变成关键路径</text>
+        <line class="paxis" x1="64" y1="252" x2="472" y2="252"/>
+        <!-- 8 ranks, w=34 gap=16, start 66 -->
+        <rect class="bar" x="66"  y="182" width="34" height="70"/>
+        <rect class="bar" x="116" y="157" width="34" height="95"/>
+        <rect class="bar" x="166" y="192" width="34" height="60"/>
+        <rect class="barhot" x="216" y="77" width="34" height="175"/>
+        <rect class="bar" x="266" y="172" width="34" height="80"/>
+        <rect class="bar" x="316" y="187" width="34" height="65"/>
+        <rect class="bar" x="366" y="162" width="34" height="90"/>
+        <rect class="bar" x="416" y="177" width="34" height="75"/>
+        <!-- 均值线 -->
+        <line x1="64" y1="163" x2="472" y2="163" stroke="var(--line-2)" stroke-width="1" stroke-dasharray="5 4"/>
+        <text class="pk" x="476" y="166">均值</text>
+        <!-- 关键路径标注 -->
+        <line x1="233" y1="77" x2="233" y2="52" stroke="var(--bytes)" stroke-width="1"/>
+        <text class="pn" x="240" y="56" style="fill:var(--bytes)">关键路径：专家 e 全部落在 rank 3</text>
+        <text class="pl" x="64" y="278">rank</text>
+        <text class="pk" x="64" y="296">层 L+1 的专家负载分布。失衡的代价是每层最慢 rank 的耗时，而非平均负载。</text>
+
+        <!-- ===== (b) 预测 ===== -->
+        <text class="pt" x="556" y="34">(b)　预测：把目标层的 gate 作用于当前层</text>
+        <rect class="pdiv" x="586" y="196" width="132" height="48" rx="3" fill="var(--tint)"/>
+        <text class="pn" x="652" y="217" text-anchor="middle" style="font-size:12px">层 L</text>
+        <text class="pk" x="652" y="233" text-anchor="middle">MoE 尾部</text>
+        <rect class="pdiv" x="880" y="196" width="132" height="48" rx="3" fill="var(--tint)"/>
+        <text class="pn" x="946" y="217" text-anchor="middle" style="font-size:12px">层 L+1</text>
+        <text class="pk" x="946" y="233" text-anchor="middle">尚未执行</text>
+        <!-- gate 盒 -->
+        <rect x="712" y="106" width="146" height="46" rx="3" fill="var(--predict-bg)" stroke="var(--predict)" stroke-width="1.2"/>
+        <text class="pn" x="785" y="127" text-anchor="middle" style="fill:var(--predict); font-weight:600">gate  W⁽ᴸ⁺¹⁾</text>
+        <text class="pk" x="785" y="142" text-anchor="middle">权重已持有</text>
+        <!-- h_L 上行 -->
+        <path class="pdiv" d="M652 196 L652 129 L712 129" stroke="var(--predict)" marker-end="url(#a-pre)"/>
+        <text class="pl" x="600" y="176" style="fill:var(--predict)">h⁽ᴸ⁾</text>
+        <!-- gate 出 -->
+        <path class="pdiv" d="M858 129 L946 129 L946 196" stroke="var(--predict)" marker-end="url(#a-pre)"/>
+        <!-- 输出说明 -->
+        <rect x="600" y="270" width="416" height="44" rx="3" fill="var(--predict-bg)" stroke="var(--line)"/>
+        <text class="pn" x="616" y="289">→ logits → top-8 → 逐专家计数</text>
+        <text class="pk" x="616" y="305">与真实路由的一致性：峰值 rank 的 recall@1 ≈ 0.95</text>
+        <path class="pdiv" d="M785 152 L785 270" stroke="var(--predict)" stroke-dasharray="3 3" marker-end="url(#a-pre)"/>
+
+        <!-- ===== (c) 掩盖 ===== -->
+        <text class="pt" x="46" y="358">(c)　传输：藏在目标层 Attention 之后</text>
+        <rect x="66" y="386" width="128" height="40" rx="3" fill="var(--tint)" stroke="var(--line-2)"/>
+        <text class="pn" x="130" y="411" text-anchor="middle">Attention</text>
+        <rect x="200" y="386" width="150" height="40" rx="3" fill="var(--predict-bg)" stroke="var(--predict)"/>
+        <text class="pn" x="275" y="411" text-anchor="middle" style="fill:var(--predict)">MoE（层 L）</text>
+        <rect x="356" y="386" width="142" height="40" rx="3" fill="var(--bytes-bg)" stroke="var(--bytes)" stroke-width="1.3"/>
+        <text class="pn" x="427" y="411" text-anchor="middle" style="fill:var(--bytes); font-weight:600">Attention</text>
+        <rect x="504" y="386" width="150" height="40" rx="3" fill="var(--tint)" stroke="var(--line-2)"/>
+        <text class="pn" x="579" y="411" text-anchor="middle">MoE（层 L+1）</text>
+        <!-- 发起标记 -->
+        <line x1="356" y1="372" x2="356" y2="446" stroke="var(--bytes)" stroke-width="1.2"/>
+        <text class="pk" x="356" y="368" text-anchor="end" style="fill:var(--bytes)">在此发起 put</text>
+        <!-- 窗口带 -->
+        <rect x="356" y="386" width="142" height="40" rx="3" fill="var(--bytes)" opacity=".13"/>
+        <path d="M356 462 L498 462" stroke="var(--bytes)" stroke-width="1.2" marker-start="url(#a-byt)" marker-end="url(#a-byt)"/>
+        <text class="pn" x="427" y="484" text-anchor="middle" style="fill:var(--bytes)">重叠窗口 = 一段 Attention</text>
+        <text class="pk" x="427" y="500" text-anchor="middle">可用 37.5 µs　·　需要 33.0 µs</text>
+        <text class="pk" x="66" y="530">发起点在预测层的 MoE 尾部，因此整个目标层 Attention 都可用于覆盖搬运。</text>
+        <text class="pk" x="66" y="546">该 Attention 本来就要执行，重叠窗口不是额外加入调度的时间。</text>
+
+        <!-- ===== (d) 结果 ===== -->
+        <text class="pt" x="556" y="358">(d)　结果：副本把峰值负载劈成两半</text>
+        <line class="paxis" x1="574" y1="512" x2="982" y2="512"/>
+        <rect class="bar" x="576"  y="442" width="34" height="70"/>
+        <rect class="bar" x="626"  y="417" width="34" height="95"/>
+        <rect class="bar" x="676"  y="452" width="34" height="60"/>
+        <rect class="barrep" x="726" y="424" width="34" height="88"/>
+        <rect class="bar" x="776"  y="432" width="34" height="80"/>
+        <rect class="barrep" x="826" y="359" width="34" height="153"/>
+        <rect class="bar" x="876"  y="422" width="34" height="90"/>
+        <rect class="bar" x="926"  y="437" width="34" height="75"/>
+        <rect class="ghost" x="726" y="337" width="34" height="175"/>
+        <line x1="574" y1="423" x2="982" y2="423" stroke="var(--line-2)" stroke-width="1" stroke-dasharray="5 4"/>
+        <text class="pk" x="986" y="426">均值</text>
+        <!-- 说明 -->
+        <path d="M768 337 L830 337" stroke="var(--bytes)" stroke-width="1" stroke-dasharray="2.5 3" marker-end="url(#a-byt)"/>
+        <text class="pn" x="776" y="330" style="fill:var(--bytes)">副本落在此处</text>
+        <text class="pl" x="574" y="538">层 L+1 的负载分布，虚线为复制前的峰值。</text>
+        <text class="pk" x="574" y="556">峰值 175 → 153（−12.6%），关键路径相应缩短。</text>
+
+        <!-- 分隔线 -->
+        <line class="pdiv" x1="530" y1="20" x2="530" y2="570" stroke-dasharray="4 5"/>
+      </svg>
+    </div>
+    <div class="legend">
+      <span><span class="chip" style="background:var(--predict)"></span>预测　读取目标层 gate</span>
+      <span><span class="chip" style="background:var(--bytes)"></span>传输　权重在途中</span>
+      <span><span class="chip" style="background:var(--replica)"></span>副本　分担执行</span>
+    </div>
+    <figcaption><b>图 1</b>　方案总览。<b>(a)</b> 层 L+1 上专家 e 过热，其全部 token 落在 rank 3，使该 rank 成为这一层的关键路径；阴影柱为复制前的峰值。<b>(b)</b> 在层 L 的 MoE 尾部，用层 L+1 自己的 gate 对 h⁽ᴸ⁾ 求值，得到层 L+1 的专家选择；这是一次真实的 gate 求值，误差仅来自隐状态旧了一层。<b>(c)</b> 传输在预测层的 MoE 尾部发起，覆盖目标层的整段 Attention；该 Attention 本就要执行，因此重叠窗口不占用额外时间。<b>(d)</b> 副本把峰值 rank 的负载劈成两半，峰值由 175 降至 153。四幅图中 (b) 与 (c) 是本方案的全部内容，(a) 与 (d) 分别是它的动机与效果。</figcaption>
+  </figure>
+
+  <div class="defs">
+    <div class="def r">
+      <span class="k">贯穿全篇的约定</span>
+      <h3>源 rank 路由</h3>
+      <p>路由表以 <code>(源 rank, 逻辑专家)</code> 为键。因此同一源 rank 上选择同一逻辑专家的 token，必然解析到同一个物理副本——逐 token 的选择退化为一次查表，而一个副本恰好卸掉半个专家，卸载量永远是整数。</p>
+    </div>
+    <div class="def">
+      <span class="k">预测的量</span>
+      <h3>峰值 rank 自己的分布</h3>
+      <p>放置只能把负载从最热的那个 rank 上搬走，且只能在该 rank 持有的专家中选择。因此真正重要的量是峰值 rank 自身的分布，而非全局专家负载。</p>
+    </div>
+    <div class="def b">
+      <span class="k">距离的由来</span>
+      <h3>lookahead 是结果，不是旋钮</h3>
+      <p>预测精度随距离增大而下降（<code>34.9 / 34.4 / 33.5 / 32.1%</code> 对应 lookahead <code>1 / 2 / 3 / 4</code>），但重叠窗口决定了距离的下界。该下界由传输方式给出，故距离取 <code>1</code>。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 图 2 ================= -->
+<section>
+  <div class="sechead"><span class="n">2</span><h2>两条 stream 与三个同步点</h2></div>
+  <p class="body">图 1(c) 说明窗口是什么，图 2 说明这个窗口靠什么撑开。关键在于本方案<strong>使用了两条 CUDA stream</strong>：计算流按层顺序执行，另有一条专用的<em class="byt">预测流</em>承载权重搬运。三条搬运步骤——写入、建立可见性、落到副本槽——全部排在预测流上，因此它们与计算流上的后续层<strong>真正并行</strong>，而不是被塞进时间轴上的某段空隙。两条流只在两个事件处相交：计划写好后记录一个事件，目标层取用前等待那个事件。</p>
+
+  <figure>
+    <div class="figbox">
+      <div class="fig-title">图 2　两条 stream 上的时序与三个同步点</div>
+      <svg viewBox="0 0 1000 470" width="960" role="img"
+           aria-label="双泳道时序图：计算流按层顺序执行预测与路由，预测流并行执行 put、barrier 与 drain，两者仅以两个事件同步">
+        <defs>
+          <marker id="b-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--ink-2)"/>
+          </marker>
+          <marker id="b-byt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--bytes)"/>
+          </marker>
+          <marker id="b-rep" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--replica)"/>
+          </marker>
+        </defs>
+        <style>
+          .sl{font-family:"Noto Sans SC",system-ui,sans-serif; font-size:12px; font-weight:700; fill:var(--ink)}
+          .sb{font-family:"Noto Sans SC",system-ui,sans-serif; font-size:11px; fill:var(--ink-2)}
+          .sn{font-family:"JetBrains Mono",monospace; font-size:10.5px; font-weight:600; fill:var(--ink)}
+          .sk{font-family:"JetBrains Mono",monospace; font-size:10px; fill:var(--faint)}
+          .sm{font-family:"JetBrains Mono",monospace; font-size:9.5px; fill:var(--muted)}
+          .lane{fill:none; stroke:var(--line); stroke-width:1}
+        </style>
+
+        <!-- 泳道底纹 -->
+        <rect x="60" y="52" width="900" height="120" fill="var(--tint)" opacity=".55"/>
+        <rect x="60" y="244" width="900" height="120" fill="var(--tint)" opacity=".55"/>
+
+        <!-- 泳道标签 -->
+        <text class="sl" x="60" y="42">计算流（compute stream）</text>
+        <text class="sl" x="60" y="234">预测流（predictive stream）</text>
+        <text class="sk" x="252" y="42">层 L+1 的 Attention 与 MoE 与之并行执行</text>
+        <text class="sk" x="252" y="234">put → barrier → drain 三步全在此</text>
+
+        <!-- ================= 计算流 ================= -->
+        <rect x="70" y="82" width="118" height="40" rx="3" fill="var(--tint)" stroke="var(--line-2)"/>
+        <text class="sb" x="129" y="107" text-anchor="middle" font-size="10.5">层 L　Attention</text>
+
+        <rect x="194" y="82" width="96" height="40" rx="3" fill="var(--predict-bg)" stroke="var(--predict)" stroke-width="1.1"/>
+        <text class="sn" x="242" y="99" text-anchor="middle" style="fill:var(--predict); font-size="9.5">gate GEMM</text>
+        <text class="sk" x="242" y="113" text-anchor="middle">+ _fused_predict</text>
+
+        <rect x="296" y="82" width="76" height="40" rx="3" fill="var(--predict-bg)" stroke="var(--predict)" stroke-width="1.1"/>
+        <text class="sn" x="334" y="99" text-anchor="middle" style="fill:var(--predict); font-size="9.5">AllGather</text>
+        <text class="sk" x="334" y="113" text-anchor="middle">窗口快照</text>
+
+        <rect x="378" y="82" width="104" height="40" rx="3" fill="var(--predict-bg)" stroke="var(--predict)" stroke-width="1.1"/>
+        <text class="sn" x="430" y="99" text-anchor="middle" style="fill:var(--predict); font-size="9.5">plan_and_charge</text>
+        <text class="sk" x="430" y="113" text-anchor="middle">写计划行</text>
+
+        <rect x="488" y="82" width="96" height="40" rx="3" fill="var(--tint)" stroke="var(--line-2)"/>
+        <text class="sb" x="536" y="107" text-anchor="middle" font-size="10.5">层 L　MoE</text>
+
+        <!-- 层 L+1 -->
+        <rect x="590" y="82" width="170" height="40" rx="3" fill="var(--bytes-bg)" stroke="var(--bytes)" stroke-width="1.2"/>
+        <text class="sb" x="675" y="100" text-anchor="middle" font-size="10.5" style="fill:var(--bytes)">层 L+1　Attention</text>
+        <text class="sk" x="675" y="114" text-anchor="middle">传输在此区间内完成</text>
+
+        <rect x="766" y="82" width="84" height="40" rx="3" fill="var(--tint)" stroke="var(--line-2)"/>
+        <text class="sb" x="808" y="99" text-anchor="middle" font-size="9.5">取用点</text>
+        <text class="sk" x="808" y="113" text-anchor="middle">event.wait</text>
+
+        <rect x="856" y="82" width="94" height="40" rx="3" fill="var(--replica-bg)" stroke="var(--replica)" stroke-width="1.1"/>
+        <text class="sn" x="903" y="99" text-anchor="middle" style="fill:var(--replica); font-size="9.5">publish</text>
+        <text class="sk" x="903" y="113" text-anchor="middle">改写路由表</text>
+
+        <circle cx="536" cy="102" r="3.4" fill="var(--bytes)"/>
+        <text class="sm" x="536" y="140" text-anchor="middle" style="fill:var(--bytes)">① 记事件 recorded</text>
+
+        <circle cx="808" cy="102" r="3.4" fill="var(--bytes)"/>
+        <text class="sm" x="808" y="140" text-anchor="middle" style="fill:var(--bytes)">② 等事件 wait_event</text>
+
+        <!-- ================= 预测流 ================= -->
+        <rect x="488" y="252" width="96" height="40" rx="3" fill="var(--tint)" stroke="var(--line-2)" stroke-dasharray="3 3"/>
+        <text class="sk" x="536" y="277" text-anchor="middle">空闲（等待 ①）</text>
+
+        <rect x="590" y="252" width="120" height="40" rx="3" fill="var(--bytes-bg)" stroke="var(--bytes)" stroke-width="1.2"/>
+        <text class="sn" x="650" y="277" text-anchor="middle" style="fill:var(--bytes); font-size="10">put_expert</text>
+
+        <rect x="716" y="252" width="96" height="40" rx="3" fill="var(--bytes-bg)" stroke="var(--bytes)" stroke-width="1.2"/>
+        <text class="sn" x="764" y="271" text-anchor="middle" style="fill:var(--bytes); font-size="9.5">barrier_all</text>
+        <text class="sk" x="764" y="285" text-anchor="middle">全组</text>
+
+        <rect x="818" y="252" width="106" height="40" rx="3" fill="var(--bytes-bg)" stroke="var(--bytes)" stroke-width="1.2"/>
+        <text class="sn" x="871" y="277" text-anchor="middle" style="fill:var(--bytes); font-size="10">drain_expert</text>
+
+        <circle cx="930" cy="272" r="3.4" fill="var(--bytes)"/>
+        <text class="sm" x="930" y="310" text-anchor="middle" style="fill:var(--bytes)">③ 记事件</text>
+
+        <!-- 跨泳道事件线 -->
+        <path d="M536 122 L536 252" stroke="var(--bytes)" stroke-width="1.1" stroke-dasharray="3 3" marker-end="url(#b-byt)"/>
+        <path d="M930 292 L930 122 L866 122" stroke="var(--bytes)" stroke-width="1.1" stroke-dasharray="3 3" fill="none" marker-end="url(#b-byt)"/>
+
+        <!-- 说明 -->
+        <text class="sk" x="70" y="404">① 计划行写在计算流上，事件在进入预测流上下文<b>之前</b>显式记录——否则 record() 取到的是预测流，等待便落回自身。本项目曾在快照拷贝上犯过此错，后果是各 rank 从半填缓冲规划并无错死锁。</text>
+        <text class="sk" x="70" y="424">② 取用点是 event.wait()，是流等待而非主机等待：主机从不读取计划，也不阻塞。因为之后每层需要副本的路由都排在计算流上，流的顺序即是全部要求。</text>
+        <text class="sk" x="70" y="444">③ barrier_all 只阻塞预测流。若把它放在计算流，全体 rank 将在那里对齐，等于把等待搬进计算路径——这正是"barrier 不消除等待"在这一层的含义。</text>
+        <text class="sk" x="70" y="464">延迟一笔：层 L 的 put 在预测流上，与层 L+1 的 Attention 及 MoE 起始重叠。全部就绪的窗口是一整段 Attention（可用 37.5 µs，需要 33.0 µs）。</text>
+      </svg>
+    </div>
+    <figcaption><b>图 2</b>　两条 stream 上的时序。上泳道为计算流，下泳道为预测流，横轴为时间。<b>①</b> 层 L 的计划行写在计算流上；事件在进入预测流上下文<b>之前</b>显式记录，否则 <code>record()</code> 取到的当前流是预测流，等待会落回自己身上。<b>②</b> 层 L+1 在路由之前执行 <code>event.wait()</code>——这是流等待，主机全程不读取计划、也不阻塞。<b>③</b> <code>barrier_all</code> 只阻塞预测流：把它放在计算流会让全体 rank 在那里对齐，等于把等待搬进计算路径。层 L 发起的 <code>put</code> 与层 L+1 的 Attention 及 MoE 起始在时间上重叠，因此可用窗口是一整段 Attention（37.5 µs），而搬运需要 33.0 µs。图中的层 L+1 与 <code>publish</code> 落在同一泳道，是因为它们必须有序：路由表改完，该层 MoE 才能读到副本。</figcaption>
+  </figure>
+</section>
+
+<!-- ================= 内核 ================= -->
+<section>
+  <div class="sechead"><span class="n">3</span><h2>实现组成</h2></div>
+  <p class="body">表 1 列出构成该方案的六个计算单元。前三个用 Triton 编写、处理专家负载与放置决策；后三个用 CUDA C++ 调用 NVSHMEM，处理权重搬运及其可见性。所有 Triton 内核都与一份张量实现互为断言：融合版本必须与其逐位一致，后者作为参照实现保留。</p>
+
+  <div class="tw">
+    <table>
+      <thead><tr><th style="width:15%">单元</th><th style="width:9%">类型</th><th style="width:9%">频次</th><th>职责</th></tr></thead>
+      <tbody>
+        <tr>
+          <td class="mono" style="color:var(--predict)">_fused_predict_kernel</td>
+          <td>Triton</td><td class="n">1 / 源层</td>
+          <td>gate 矩阵乘、top-8 选择与逐专家计数合并于一个 program。128 个专家补齐到 2 的幂，使整行 logits 常驻寄存器——此前需要落地的五份 <code>[tokens, top_k]</code> 中间量至此全部消失。选择结果与参照实现逐位一致：fp32 强制 IEEE 而非 TF32，bf16 在选前把累加器舍回 bf16，并列时取小。</td>
+        </tr>
+        <tr>
+          <td class="mono" style="color:var(--replica)">plan_replicas_fused</td>
+          <td>Triton</td><td class="n">1 / 层</td>
+          <td>一层的全部放置决策、预算记账与两张计划表，由单个 program 完成。所有归约的规模不超过 <code>ep_size × per_rank</code> 个整数，因而无需跨 block 协商——这也移除了最后两处两个 rank 可能以不同次序归约、进而得出不同计划的位置。全部算术以加倍单位进行，使"卸掉半个专家"始终是整数。</td>
+        </tr>
+        <tr>
+          <td class="mono" style="color:var(--replica)">publish_plan_fused</td>
+          <td>Triton</td><td class="n">1 / 层</td>
+          <td>把路由表改成计划要求的样子。<b>先回退，再放置</b>：一个槽从专家 a 改给专家 b 时同时属于两者，若在放置之后回退，会清掉刚刚认领的那一行。副本行可能落在其规范行的<b>下方</b>，故按物理行升序书写——假定顺序为 <code>[规范行, 副本行]</code> 会在这些情形下写入错误的行。</td>
+        </tr>
+        <tr>
+          <td class="mono" style="color:var(--bytes)">put_expert</td>
+          <td>CUDA C++<br>NVSHMEM</td><td class="n">1 / 层</td>
+          <td>所有 rank 都执行；持有该专家的 rank 把其权重行写入目标 rank 的暂存区。<b>由本 rank 是否持有该专家，是在设备上依据计划判定的</b>——这是该设计的核心，它使计划无需回到主机。实测 9.00 MiB 单边写入为 47.6 µs（设备发起）对 53.7 µs（主机发起）：耗时相同，主机被移除。</td>
+        </tr>
+        <tr>
+          <td class="mono" style="color:var(--bytes)">nvshmemx_barrier_all</td>
+          <td>CUDA C++</td><td class="n">1 / 层</td>
+          <td>由主机下发，且不依赖任何计划取值，因而不会把计划拉回主机。其作用是建立可见性。CUDA event 无法替代：一个曾得出相反结论的探针，其检查区间内混入了一次 <code>dist.barrier()</code>；去掉它之后 112 个权重张量中有 51 个是错的。</td>
+        </tr>
+        <tr>
+          <td class="mono" style="color:var(--bytes)">drain_expert</td>
+          <td>CUDA C++</td><td class="n">1 / 层</td>
+          <td>所有 rank 都执行；目标 rank 把暂存区数据拷入副本槽。用整个 block 搬运 9 MiB 实测 206 µs，而用 32 个 block 为 47.6 µs——单个 block 只能用自己的 load/store 单元，无法借用拷贝引擎。</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="tcap"><b>表 1</b>　实现组成。<b>频次</b>一列为每个 MoE 层的调用次数。放置侧自 2026-08-30 起每层由 132 次 kernel launch 降至 2 次——设备侧规划、发布与记账原本都是极小的逐元素算子，而在 eager 模式下每一次都是一次主机派发；如今放置的每层主机开销为零，其卸载的失衡量保持不变。</p>
+</section>
+
+<!-- ================= 测量 ================= -->
+<section>
+  <div class="sechead"><span class="n">4</span><h2>实验测量</h2></div>
+  <p class="body">全部测量在 8 × H100 SXM 上进行，<code>DP = EP = 8</code>，prompt 取自真实文本。每个配置以多次交错的服务器实例重复，同一遍内配对比较。基线自身的漂移若超过两臂之差，该轮均值即不可读，表中以"可读性"一列标出——这是本项目的既定判据，此前已有三次仅凭 3 遍重复得出、在 6 遍下翻转或消失的结论。</p>
+
+  <div class="tw">
+    <table>
+      <thead><tr><th style="width:34%">配置</th><th class="n">Δ TTFT</th><th class="n">配对</th><th class="n">基线漂移</th><th>可读性</th></tr></thead>
+      <tbody>
+        <tr><td>32k prompt，每请求 1 次前向，2 副本槽</td><td class="n pos">−7.73%</td><td class="n">6/6</td><td class="n">4.6%</td><td>均值与配对均成立</td></tr>
+        <tr><td>16k，CONC = 8，2 副本槽</td><td class="n pos">−4.89%</td><td class="n">6/6</td><td class="n">6.6%</td><td>仅配对成立</td></tr>
+        <tr><td>8k，CONC = 16，2 副本槽</td><td class="n pos">−2.77%</td><td class="n">6/6</td><td class="n">1.1%</td><td>均值与配对均成立</td></tr>
+        <tr><td>8k，CONC = 16，1 副本槽</td><td class="n pos">−2.27%</td><td class="n">6/6</td><td class="n">1.1%</td><td>均值与配对均成立</td></tr>
+        <tr><td>8k，默认传输预算</td><td class="n pos">−1.76%</td><td class="n">3/3</td><td class="n">0.8%</td><td>均值与配对均成立</td></tr>
+        <tr><td>8k，长文档（pg19，无拼接）</td><td class="n pos">−2.41%</td><td class="n">6/6</td><td class="n">6.1%</td><td>仅配对成立</td></tr>
+        <tr><td>1k prompt</td><td class="n neg">+5.6%</td><td class="n">—</td><td class="n">—</td><td>净为负</td></tr>
+        <tr><td>8k，政府报告（govreport）</td><td class="n neg">+1.12%</td><td class="n">3/6</td><td class="n">—</td><td>不可读</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="tcap"><b>表 2</b>　端到端 prefill TTFT，均在同一遍内与 stock 服务器配对。机制本身在关键路径上卸掉 <span class="mono">26–36%</span> 的失衡，该数字已在真实权重上验证，且物理负载确实偏离了规范归属。<b>上表所有正收益均在输出长度为 1 token 的条件下测得，即纯 prefill</b>；解码侧从未得到解决，两次记录在案的测量在<b>符号</b>上互相矛盾（−20.0% 与 +3.0%）。</p>
+</section>
+
+<!-- ================= 讨论 ================= -->
+<section>
+  <div class="sechead"><span class="n">5</span><h2>讨论：方案的边界</h2></div>
+  <div class="defs">
+    <div class="def r">
+      <span class="k">已经确定</span>
+      <h3>两半的符号相反</h3>
+      <p><em class="rep">放置是负成本</em>：它卸掉失衡，本身几乎不增加开销，捕获了上限 5.26% 中的约 70–80%。<em class="term">预测是全部开销所在</em>——每层 44 次 gate 矩阵乘与 44 次集合通信，也正是短 prompt 上净为负的原因。因此该方案的成本在"使能"的一半，而非"动作"的一半。</p>
+    </div>
+    <div class="def b">
+      <span class="k">尚未解决</span>
+      <h3>全部正收益都是 prefill</h3>
+      <p>输出长度为 1 token 意味着收益不会被摊薄到整个请求上。真实负载的输出是数百至数千 token，而副本是跨前向常驻的——解码阶段是否要为此付出代价，仍无定论。这是唯一能否定上述全部结论的变量。</p>
+    </div>
+    <div class="def">
+      <span class="k">已被证伪</span>
+      <h3>两个被实测否决的设计</h3>
+      <p>其一，让一个源层跨多个目标层做预测：四层的 gate 作用于<b>同一份</b>隐状态会选出几乎相同的专家，四分之三的目标实际使用了并非自己的分布，收益自 26.9% 跌至 3.7%。其二，把快照规约改为设备端实现：其天花板为 <span class="mono">8.78 ms</span>，而缺口为 <span class="mono">17.09 ms</span>——即使实现为完全免费，方案仍落在 <span class="mono">+4.8%</span>。</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <span>预测式专家复制 · 实现报告</span>
+  <span>8 × H100 SXM　DP = EP = 8　Qwen3-30B-A3B　48 层</span>
+</footer>
+
+</main>

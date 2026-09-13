@@ -68,8 +68,26 @@ extern "C" __global__ void put_expert(
     int num_tensors,
     char *staging,
     int my_pe,
-    int per_rank_experts)
+    int per_rank_experts,
+    int num_slots,
+    long long staging_span)
 {
+    // Blocks are handed out across (slot, tensor, chunk). The slot dimension lives in
+    // the grid rather than in a loop of launches for one reason: a launch per slot
+    // would need a barrier per slot, and a barrier costs 0.22 ms here -- four slots
+    // over 44 layers would add 132 of them and spend more than the replicas return.
+    int per_slot = gridDim.x / num_slots;
+    if (per_slot < 1) {
+        per_slot = 1;
+    }
+    int slot = blockIdx.x / per_slot;
+    int within = blockIdx.x % per_slot;
+    if (slot >= num_slots) {
+        return;
+    }
+    plan += (long long)slot * 4;
+    staging += (long long)slot * staging_span;
+
     if (plan[PLAN_FOUND] == 0) {
         return;
     }
@@ -80,14 +98,12 @@ extern "C" __global__ void put_expert(
     int pe = (int)plan[PLAN_TARGET];
     long long row = expert % per_rank_experts;
 
-    // Blocks are handed out across (tensor, chunk) so an expert's several tensors move
-    // in parallel rather than one after another.
-    int chunks = gridDim.x / num_tensors;
+    int chunks = per_slot / num_tensors;
     if (chunks < 1) {
         chunks = 1;
     }
-    int tensor = blockIdx.x / chunks;
-    int chunk = blockIdx.x % chunks;
+    int tensor = within / chunks;
+    int chunk = within % chunks;
     if (tensor >= num_tensors) {
         return;
     }
@@ -127,17 +143,35 @@ extern "C" __global__ void drain_expert(
     int num_tensors,
     const char *staging,
     int my_pe,
-    int replica_row)
+    int first_replica_row,
+    int num_slots,
+    long long staging_span)
 {
+    int per_slot = gridDim.x / num_slots;
+    if (per_slot < 1) {
+        per_slot = 1;
+    }
+    int slot = blockIdx.x / per_slot;
+    int within = blockIdx.x % per_slot;
+    if (slot >= num_slots) {
+        return;
+    }
+    plan += (long long)slot * 4;
+    staging += (long long)slot * staging_span;
+    // Slot `i` owns replica column `i`, which is the same row the publish writes into
+    // the layout. They are derived from the same rule rather than passed together,
+    // because a disagreement would put one replica's weights under another's map.
+    int replica_row = first_replica_row + slot;
+
     if (plan[PLAN_FOUND] == 0 || (int)plan[PLAN_TARGET] != my_pe) {
         return;
     }
-    int chunks = gridDim.x / num_tensors;
+    int chunks = per_slot / num_tensors;
     if (chunks < 1) {
         chunks = 1;
     }
-    int tensor = blockIdx.x / chunks;
-    int chunk = blockIdx.x % chunks;
+    int tensor = within / chunks;
+    int chunk = within % chunks;
     if (tensor >= num_tensors) {
         return;
     }
@@ -371,6 +405,8 @@ class DeviceExpertTransfer:
         replica_row: int,
         stream: torch.cuda.Stream,
         staging_offset: int = 0,
+        num_slots: int = 1,
+        staging_span: int = 0,
     ) -> None:
         """Move the planned expert into the target's replica row.
 
@@ -380,21 +416,42 @@ class DeviceExpertTransfer:
         a host round trip to find out.
 
         Args:
-            plan: `[4]` int64 device tensor from `plan_one_layer_on_device`.
+            plan: `[num_slots, 4]` int64 device tensor from the planner, or `[4]` at
+                one slot.
             pointers: This layer's weight addresses.
-            replica_row: The physical row to land in. A host constant, since it is
-                `per_rank_experts + slot` for every rank and every layer.
+            replica_row: The physical row slot 0 lands in. A host constant, since it
+                is `per_rank_experts + slot` for every rank and every layer; slot `i`
+                lands in the row `i` after it, derived in the kernel from the same rule
+                the publish uses, so the two cannot disagree about where a replica is.
             stream: The predictive stream.
             staging_offset: Byte offset of the staging buffer to use. Alternated by the
                 caller so a later layer's put cannot land in the buffer an earlier
                 layer's drain is still reading — `barrier_all` orders arrival, not this
                 rank's next put against the peer's local drain.
+            num_slots: Replica slots this layer plans, moved under one barrier. A launch
+                per slot would need a barrier per slot, and at 0.22 ms each, four slots
+                over 44 layers would spend more than the replicas return.
+            staging_span: Bytes between consecutive slots' staging areas -- one expert.
+                Required above one slot: two slots sharing a span would have one
+                replica's put overwrite the other's before either drains.
         """
         from cuda.core import launch
 
+        if num_slots < 1:
+            raise ValueError(
+                f"a layer needs at least one replica slot, got {num_slots}."
+            )
+        if num_slots > 1 and staging_span <= 0:
+            raise ValueError(
+                f"{num_slots} slots need a staging_span of one expert's bytes to "
+                f"separate them; got {staging_span}. A shared span lets one slot's put "
+                f"overwrite another's before either drains, and nothing raises."
+            )
         core_stream = self._core_stream(stream)
         count = int(pointers.base.numel())
-        grid = count * _GRID_CHUNKS_PER_TENSOR
+        # The slot dimension is in the grid rather than in the launch count; see
+        # `num_slots` above for why it is not a loop.
+        grid = count * _GRID_CHUNKS_PER_TENSOR * num_slots
         config = self._launch_config(grid=grid, block=_BLOCK)
         common = (
             np.uint64(plan.data_ptr()),
@@ -415,6 +472,8 @@ class DeviceExpertTransfer:
                 self._put,
                 *common,
                 np.int32(self._per_rank_experts),
+                np.int32(num_slots),
+                np.int64(staging_span),
             )
         # Arrival. Collective and stream-ordered, so no host involvement and no per-rank
         # decision about whether data landed — and safe to be collective because the
@@ -424,7 +483,15 @@ class DeviceExpertTransfer:
         if _STAGE != "no-barrier":
             bindings.barrier_all_on_stream(stream.cuda_stream)
         if _STAGE not in ("barrier-only", "put-only"):
-            launch(core_stream, config, self._drain, *common, np.int32(replica_row))
+            launch(
+                core_stream,
+                config,
+                self._drain,
+                *common,
+                np.int32(replica_row),
+                np.int32(num_slots),
+                np.int64(staging_span),
+            )
 
     def _core_stream(self, stream: torch.cuda.Stream):
         """Wrap torch's stream for `cuda.core`, rather than creating another one.

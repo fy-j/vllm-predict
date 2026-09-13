@@ -178,7 +178,21 @@ class PredictiveExpertReplicationConfig:
     cost_profile_path: str | None = None
     """Path to the offline cost profile. Required when `enabled`."""
     replica_slots_per_rank: int = Field(default=1, ge=1)
-    """Inactive replica slots reserved per EP rank. The PoC accepts 1."""
+    """Inactive replica slots reserved per EP rank, and so replicas placed per layer.
+
+    A placement-side parameter: prediction's cost does not move with it, and prediction
+    is the half that costs. Replayed offline against real dumps, a layer's critical-path
+    excess removed goes 32.2% at one slot, 46.1% at two, 59.2% at four and 70.2% at
+    eight, against an oracle-fed ceiling — so this is the one knob that buys benefit
+    without first making prediction cheaper.
+
+    It is not free. Each slot costs a physical expert row per rank per layer (432 MiB
+    per rank on this model at one slot), one more staging expert per window position,
+    and up to one more transfer per layer per forward against
+    `max_transfers_per_forward` — and churn is a first-order cost here: four times the
+    transfer rate at unchanged traffic measured +27% mean TTFT. Default 1, which is the
+    configuration every recorded measurement on this branch was taken at.
+    """
     prediction_lookahead_layers: int = Field(default=1, ge=1)
     """Distance in sparse MoE layers from the predicting layer to its target.
 
@@ -383,8 +397,16 @@ class PredictiveExpertReplicationConfig:
                 f"It holds one recorded prediction at a time, so a larger group would "
                 f"plan only its last target. Set device_issued_transfer=True."
             )
+        if self.replica_slots_per_rank > 1 and not self.device_issued_transfer:
+            # The host path plans one replica per layer and reads it back; giving it
+            # more slots would silently place only the first, which reads as a working
+            # multi-replica arm in every aggregate.
+            raise ValueError(
+                f"replica_slots_per_rank={self.replica_slots_per_rank} needs "
+                f"device_issued_transfer=True; the host path plans a single replica "
+                f"per layer and would place only the first."
+            )
         for field_name, only_supported in (
-            ("replica_slots_per_rank", 1),
             ("hot_stable_steps", 2),
             ("min_residency_steps", 4),
         ):

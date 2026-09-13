@@ -2,6 +2,28 @@
 
 ## Predictive expert replication CUDA PoC
 
+> **Every negative verdict below was measured at ~877 tokens per forward on concatenated
+> prompts, and at long prompts the sign reverses.** Same code and node, six interleaved passes,
+> the whole feature against a stock server. The best measured point is **16k prompts, CONC=8,
+> two replica slots: -6.17% mean TTFT, +7.03% total token throughput, 6/6 paired**; at 8k /
+> CONC=16 with one slot it is -2.50% / +2.80%, 6/6; at 1k it is unreadable.
+>
+> **Two axes decide it, and a third qualifies every number.** (1) **Tokens per forward** — the
+> cost is per forward (44 barriers, 44 launches, neither scaling with tokens) and the benefit is
+> per token, so nothing here means anything without it stated. (2) **Queueing share** — the
+> feature shortens compute, so the gain falls as queueing grows: -3.36% at CONC=8, -2.50% at 16,
+> -1.20% at 32, and it **turns positive again at CONC=4** (+0.67%, 5/6 worse), which refutes the
+> monotone prediction this file recorded on 2026-09-07. (3) **The domain.** `ko` is 161
+> concatenated Korean instructions and concatenation inflates expert stability; `gov` is real
+> long documents, and at 8k it has 72.4% stability against ko's 93.3% and is **+1.12%, 3/6 —
+> unreadable and positive**. It takes 16k for gov to turn (-2.70%). **"8k is net positive" is
+> true of concatenated prompts only.**
+>
+> **Expert stability is a precondition, not the explanation.** 2026-09-07 said one variable
+> explained the reversal; that is corrected. Stability is 20.1% at 1k but already 88.5% at 2k,
+> while 2k is still **+2.29%, 0/6** — it saturates well below where the sign flips. See
+> `RESULTS.md` 2026-09-08.
+
 Before working on this feature, read in order:
 
 1. `.scratch/predictive-expert-replication/spec.md`
@@ -25,18 +47,33 @@ Ticket order is set by each ticket's `Blocked by` field, not by its filename num
 05 transfer lands in the slot    blocks 06         (needs 04)  DONE 2026-08-30
 06 no host sync on the path      blocks 07         (needs 05)  DONE 2026-08-30, 17/17 at DP=8
 07 window = target's Attention   blocks 08         (needs 06)  DONE 2026-08-30
-08 three-arm verdict + stop gate blocks 10         (needs 03, 07, 09, 13, 17)  ← BLOCKED, do not write it
+08 three-arm verdict + stop gate blocks 10         BLOCKED; must be a curve over tokens/forward
 09 CUDA graph feasibility        blocks 08         no blockers; ← the largest single lever
 10 DeepSeek-V4-Flash             terminal          (needs 08)
 11 prediction's collectives      blocks 12,13,14   ANSWERED 2026-08-30; diagnosis only
 12 group of targets per source   blocks 13         DONE, then REFUTED on hardware
 13 window of sources, 1 gather   blocks 08, 14     (needs 12) works: 78% of benefit kept
-14 snapshot reduction off NCCL   terminal          DO NOT BUILD 2026-08-31; ceiling 8.78 ms
-15 spent budget must not revert  terminal          no blockers; bites the default config
+14 snapshot reduction off NCCL   terminal          CLOSED, DO NOT BUILD: nothing left at 8k
+15 spent budget must not revert  terminal          DONE 2026-09-08, 5/5 at 8k on default budget
 16 block bar dtype + teardown    terminal          no blockers; two review findings
 17 spec says what was measured   blocks 08         no blockers; docs only
 18 prediction fuses to 1 kernel  terminal          no blockers; ceiling 9.67 ms, launch half
+19 more than one replica/layer   terminal          DONE 2026-09-08; cap2 pays at 8k and 16k
 ```
+
+**`19` is the only lever on what placement *returns*, and it is measured on hardware now.** The
+replica count is a placement-side parameter: prediction runs the same 44 gate GEMMs whatever it
+is set to, and placement is the half that is negative cost. **Two slots pay at long prompts and
+lose at short ones**: 8k/CONC=16 gives -3.17% against one slot's -2.51%, 16k/CONC=8 gives -6.17%
+against -5.38%, all four 6/6 paired — but at 1k it costs +5.6%, because the transfer rate doubles
+and at 20% expert stability that churn is unaffordable. `replica_slots_per_rank` still defaults
+to 1; raising it is a long-prompt decision, and **raising it past 2 needs the budget raised first**
+— see below. Offline replay predicted excess removed of 32.2% ->
+46.1% for one slot -> two, a ratio of 1.43, and hardware gave 26.7% -> 37.7%, a ratio of 1.41 —
+**the replay's scaling is confirmed**, which had never been checked. Its figures for four and
+eight slots (59.2%, 70.2%) remain unrun, and `max_transfers_per_forward` defaults to 43 while
+four slots over 44 layers want 176. The docstring figure of **68.1% at four slots is withdrawn**
+— it is unreproducible on two dumps and is roughly what *eight* return.
 
 **`11` is answered and it re-shaped the rest.** `06` showed placement is *negative cost* and
 prediction is the whole overhead; `11` then split prediction's +13.68% by measurement:
@@ -44,6 +81,9 @@ prediction is the whole overhead; `11` then split prediction's +13.68% by measur
 
 - `12` and `13` attack the barrier half (one source layer predicts K targets, one collective per
   group). Worth about 9 points of TTFT for about 0.14, but it lands at break-even, not positive.
+  **All of this is a 1k accounting.** At 8k prediction alone costs **+0.24%** against stock and
+  removing its AllGather leaves **+1.30%** — its whole cost amortises away, which is why `14` is
+  closed rather than built and why the barrier/launch split no longer drives the work.
 - `09` was called the only ticket attacking "the launch half, the larger one at 52%".
   **That framing is withdrawn (2026-09-06).** The 52% was a *residual* — everything left after
   removing the collective, labelled launches without being measured. An 8-rank attribution
@@ -57,9 +97,36 @@ prediction is the whole overhead; `11` then split prediction's +13.68% by measur
 - `08` is **blocked**. Writing the verdict now would measure a cost `13` and `09` are removing,
   and its stop gate as worded fires on the sum while placement is returning 70-80% of the
   ceiling — see the amendment in the ticket.
-- `15` is a real defect at the **default** `max_transfers_per_forward=4`: a spent budget reverts
-  still-valid resident replicas, collapsing coverage from 44 layers to 4 on a traffic shift. It
-  did not affect any recorded measurement, all of which ran at budget 43.
+- `15` is **done (2026-09-08), 5 of 5**. At the **default**
+  `max_transfers_per_forward=4` a spent budget used to revert still-valid resident replicas,
+  collapsing coverage from 44 layers to 4 on a traffic shift. The publish row now carries the
+  *resident* placement when the planned one is unaffordable — in both fused kernels, the tensor
+  oracle and the host coordinator. **Narrow on purpose: `found == 0` still reverts**, because
+  that is the planner judging load rather than a budget accident. It affected no recorded
+  measurement, all of which ran at budget 43. Its last criterion, the hardware run, closed at 8k:
+  the **default budget of 4** gives -1.76% mean TTFT, 3/3, against budget 43's -2.13%. The 1k run
+  could not have shown this — at 20% expert stability there is no steady state for the coverage
+  ratchet to settle into — which is why the criterion stayed open. It matters more since `19`: at
+  four slots a layer charges 4, so exhaustion goes from occasional to every forward, and each
+  revert-and-re-transfer cycle is churn, which costs +27% mean TTFT at 4x.
+
+**The transfer budget: `43` is stale, and the rate it bounds is 3 per forward.** The arms on this
+branch all say `43`/`86`; the model has **48** layers and **44** are reachable
+(`range(skip_first_layers=3, 48 - lookahead=1)`). 43 was the reachable count under the *old*
+default lookahead of 2, and ticket 07 changed that on 2026-08-30 without the arm constants
+following. It is nearly harmless because **the budget charges what moves, not what is held**:
+`keep = found * resident * same` and only the rest is charged, so at 93-95% expert stability just
+3 layers of 44 change their mind per forward. Measured steady state is **2.7-3.2 activations per
+forward at cap 1** and 17 at cap 2, against caps of 43 and 86 — an order of magnitude of slack.
+**The first forward looked like an exception and is not**: raising the budget to 48 leaves the
+first report window at 61 activations against 43's 65, so forward 1 was never capped — coverage
+ramps because the planner's `found` test does not pass for all 44 layers at once. **The
+off-by-one has never affected a measurement.** Re-measured at 48 and 96 on 2026-09-08: at 8k the
+conclusion is unchanged within intervals; **at 16k the two runs disagree by about 2 points on
+arms that differ only in a budget that never binds**, so the 16k effect size does not reproduce
+across runs and is being re-measured inside one interleave. At four slots the slack is gone — 44 layers x 4 wants 176 against 86 — and the budget
+would stop bounding churn and start bounding coverage, which is exactly what `15` exists to
+prevent.
 
 Edges are listed rather than drawn: an ASCII diagram of this silently misaligned its
 edges into neighbouring labels once, and each ticket's `Blocked by` field is
@@ -208,8 +275,8 @@ four configurations. The ceiling on this node is 3.3%, so the cost exceeds the b
 possible benefit by roughly five times — a decode-shaped conclusion arrived at for
 prefill, and not something tuning closes.
 
-**VERDICT (2026-08-29, 8x H100 SXM): negative, and about the mechanism rather than the
-interconnect.** Ticket 14's third arm finally measured the feature against a stock
+**VERDICT (2026-08-29, 8x H100 SXM): negative — but at ~877 tokens per forward only, and
+superseded for the long-prompt regime by 2026-09-07 above.** Ticket 14's third arm finally measured the feature against a stock
 server: prediction and its infrastructure cost **+7.6% mean TTFT** against a
 perfect-balance ceiling of
 **5.05% of a prefill step**, so the mechanism that creates the transfer window spends

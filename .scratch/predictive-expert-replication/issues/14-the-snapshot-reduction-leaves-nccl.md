@@ -20,14 +20,21 @@ than built, and dropping it is an acceptable outcome.
 **Blocked by:** nothing. It was blocked by 13; 13 landed at window 1 as the default, so this
 ticket is priced against window 1 directly.
 
-**Status: DO NOT BUILD (2026-08-31). Its ceiling is measured and it is not enough.**
+**Status: CLOSED, DO NOT BUILD (2026-09-08). Recomputed at 8k, and there is nothing left to
+remove.** The 2026-08-31 verdict below was taken at ~877 tokens per forward and this ticket was
+left open on exactly the right doubt: the ceiling is a share of prediction's cost, prediction's
+cost is per *forward*, and the window it hides in scales with tokens. Measured at ~4200 tokens
+per forward (3 passes, so read the direction not the size): **prediction alone is +0.24% +/- 1.38
+mean TTFT against stock, and removing its snapshot AllGather leaves +1.30%.** The cost this
+ticket exists to attack has amortised away — at 1k it was +13.5%. A ticket whose ceiling is a
+fraction of nothing does not get built. See `RESULTS.md` 2026-09-08.
 
 Ticket 11's isolation already prices what this ticket can return: removing all 44 barriers is
 **47.6%** of prediction's added cost (11.04 of 23.21 ms). Applied to a clean interleaved run at
 the knee today — stock 171.79, prediction only 190.24, placing at window 1 188.88 — that
 ceiling is **8.78 ms**, against a placing gap of **17.09 ms**:
 
-```
+```text
 placing now            +17.09 ms  (+9.9%)
 placing, perfect 14     +8.31 ms  (+4.8%)   <- a free snapshot exchange, still negative
 ```
@@ -67,20 +74,20 @@ churn, so its cost is first-order, not second. It also means lookahead's value i
 
 **Status:** ready-for-agent
 
-- [ ] The reduction produces a `[num_logical]` sum that is **bit-identical to the AllGather
+* [ ] The reduction produces a `[num_logical]` sum that is **bit-identical to the AllGather
       path's**, over randomised per-rank counts including empty and all-zero inputs. Integer
       throughout, for the same reason the planner is: every rank must derive the same plan, and
       a float reduction whose order differs by rank is how two ranks pick different experts.
-- [ ] Reads only this forward's values. A per-forward sequence number written with the payload,
+* [ ] Reads only this forward's values. A per-forward sequence number written with the payload,
       checked on read, and a value from another forward is an invariant violation rather than
       something to average in. Ticket 06's plan-ownership rule is the precedent.
-- [ ] **No group-wide barrier and no host read**, asserted by measurement rather than by grep:
+* [ ] **No group-wide barrier and no host read**, asserted by measurement rather than by grep:
       `set_sync_debug_mode("error")` clean, and the host returns in microseconds with 100 ms
       queued on the compute stream, which is the shape ticket 06's test used.
-- [ ] Every rank agrees on whether this path is in use, through the existing
+* [ ] Every rank agrees on whether this path is in use, through the existing
       `agree_across_ranks`, and a group that falls back closes what it opened. A rank deciding
       this alone is the deadlock that helper exists to prevent, and the fallback path must not
       land on a configuration the validator forbids — which it did once already.
-- [ ] Measured against ticket 13's numbers at the same operating point: collectives per prefill
+* [ ] Measured against ticket 13's numbers at the same operating point: collectives per prefill
       window, window wall-clock, and three-arm TTFT. The claim to test is that the remaining
       barrier cost goes to zero, not that the reduction is faster.

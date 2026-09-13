@@ -146,6 +146,13 @@ _Avoid_: memory-capacity benchmark
 **Memory-capacity benchmark**：评估 replica slots 的静态权重开销与动态 MoE buffer 峰值变化，记录 KV block 数、峰值显存、最大并发和 OOM 边界。
 _Avoid_: compute-limited benchmark
 
+**Expert stability**：相邻两个 forward 之间，**规划器实际选中的那个专家**（峰值 rank 上最热的逻辑专家）保持不变的比例。这个量决定 predictive expert replication 成不成立，而它此前没有名字，也从未被测量。原因是这个 feature 的成本是**每 forward** 的（44 个 barrier、44 次 kernel 发射，都不随 token 数缩放），收益却要求副本**已经在位**——稳定率低时副本刚放好就过期，成本照付而收益不兑现。
+
+2026-09-07 实测，同一份代码、同一个域（`ko`）、DP=EP=8：**1k prompt 下是 20.1%，8k prompt 下是 93.4%**。同时规范 critical-path imbalance 几乎不变（1.891 对 1.916），也就是说收益机会没变，变的是能不能赚到。每千 token 的传输次数因此从 4.74 降到 0.86。这一个量解释了这个 feature 为什么在短 prompt 下净负、在长 prompt 下净正。
+
+根因是采样噪声而非 workload 性质：每 forward 的 token 越少，"谁是最热专家"越取决于这一批恰好是哪几个请求的哪几个 chunk。所以它**不是模型或数据集的属性，是测量配置的属性**——引用任何本项目的成本或收益数字时都必须同时说明当时的每 forward token 数。
+_Avoid_: prediction accuracy（那是预测对不对，这是目标变不变）；churn rate（那是结果，这是原因）
+
 **Prediction accuracy**：predicted load 与同一层同一 forward 的 actual load 的一致程度，以 **hot-expert 集合重叠率**与**每专家计数误差**表示。gate logit 相似度**不是**这个指标 —— 高 logit 相似度仍可能改变 top-k 的选中集合，从而错判负载。
 _Avoid_: logits similarity, cosine similarity
 

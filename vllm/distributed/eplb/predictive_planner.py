@@ -655,3 +655,125 @@ def plan_one_layer_on_device(
     # all `-inf` mask, so the other entries would otherwise name a real placement that
     # was rejected.
     return out * found.to(torch.int64)
+
+
+def plan_layer_replicas_on_device(
+    expert_load: torch.Tensor,
+    ep_size: int,
+    min_tokens: float,
+    cap: int,
+) -> torch.Tensor:
+    """A layer's `cap` placements, decided on the device with no value read back.
+
+    `plan_one_layer_on_device` at `cap = 1`, and its generalisation above that. Ticket
+    19: replayed offline against real dumps, one replica per layer removes 32.2% of
+    critical-path excess, four remove 59.2% and eight 70.2%, while prediction's cost
+    does not move -- the replica count is a placement-side parameter and placement is
+    the half that is negative cost. (An earlier draft of this docstring put four at
+    68.1%; that is withdrawn, unreproducible on two dumps, and about what eight give.)
+
+    Two properties are load-bearing and neither is obvious:
+
+    * **At most one replica per logical expert.** The unconstrained greedy re-picks the
+      same expert in 61% of layers, which would need a third copy of it and so a wider
+      `logical_to_physical_map` and a `logical_replica_count` above two. Forbidding it
+      costs **2.82%** of the benefit on the same dumps, because the peak rank's
+      second-hottest expert is nearly as good a shed, and it leaves both structures
+      untouched.
+    * **The result is sorted by logical expert, not by gain.** Slots are matched against
+      residency position by position, so an unchanged set of replicas arriving in a
+      different order would read as a wholesale change and re-transfer all of them.
+      Churn is not a second-order cost here: four times the transfer rate at unchanged
+      traffic measured **+27% mean TTFT**.
+
+    Args:
+        expert_load: `[num_logical_experts]` predicted load, integer-valued and already
+            reduced across the EP group, so every rank sees identical values.
+        ep_size: EP group size.
+        min_tokens: Refuse a placement moving less than this.
+        cap: Replica slots this layer may fill.
+
+    Returns:
+        A `[cap, 4]` int64 device tensor whose rows are
+        `(found, logical_expert, target_rank, moved_x2)`, sorted by `logical_expert`
+        with the not-found rows last. A not-found row is all zeros.
+    """
+    if cap < 1:
+        raise ValueError(f"a layer needs at least one replica slot, got {cap}.")
+    num_logical = expert_load.numel()
+    if num_logical % ep_size != 0:
+        raise ValueError(
+            f"{num_logical} logical experts do not divide across {ep_size} EP ranks."
+        )
+    per_rank = num_logical // ep_size
+    device = expert_load.device
+    owned = expert_load.to(torch.float64).view(ep_size, per_rank).clone()
+    ranks = torch.arange(ep_size, device=device)
+    # Excluded rather than halved-and-reconsidered, which is what keeps one logical
+    # expert to one replica.
+    spent = torch.zeros(ep_size, per_rank, dtype=torch.bool, device=device)
+    # A replica's half lands on a rank that does not *own* that logical expert, so it
+    # cannot be added to any column of `owned`: doing so corrupts whatever expert the
+    # target holds at that offset, and the corruption is invisible because the rank
+    # totals still look right. It is carried apart and only ever added to the totals.
+    extra = torch.zeros(ep_size, dtype=owned.dtype, device=device)
+    total = owned.sum()
+
+    rows = []
+    for _ in range(cap):
+        rank_load = owned.sum(dim=1) + extra
+        peak_load = rank_load.max()
+        peak = (rank_load == peak_load).to(torch.int64).argmax()
+        peak_experts = owned.index_select(0, peak.view(1)).squeeze(0)
+        # A spent expert offers nothing to move, so it fails `moved > 0` below without
+        # needing a rule of its own.
+        available = ~spent.index_select(0, peak.view(1)).squeeze(0)
+        moved = peak_experts * 0.5 * available.to(owned.dtype)
+
+        trial = (
+            rank_load.view(1, 1, ep_size)
+            - moved.view(per_rank, 1, 1)
+            * (ranks == peak).to(owned.dtype).view(1, 1, ep_size)
+            + moved.view(per_rank, 1, 1)
+            * (ranks.view(1, ep_size, 1) == ranks.view(1, 1, ep_size)).to(owned.dtype)
+        )
+        gain = peak_load - trial.max(dim=2).values
+        admissible = (
+            (moved.view(per_rank, 1) >= min_tokens)
+            & (moved.view(per_rank, 1) > 0)
+            & (ranks.view(1, ep_size) != peak)
+            & (gain > 0)
+        )
+        found = admissible.any() & (total > 0)
+
+        masked = torch.where(admissible, gain, torch.full_like(gain, float("-inf")))
+        flat = masked.reshape(-1)
+        winner = (flat == flat.max()).to(torch.int64).argmax()
+        offset = winner // ep_size
+        target = winner % ep_size
+        moved_x2 = peak_experts.index_select(0, offset.view(1)).squeeze(0)
+
+        found_i = found.to(torch.int64)
+        rows.append(
+            torch.stack(
+                [
+                    found_i,
+                    (peak * per_rank + offset) * found_i,
+                    target * found_i,
+                    moved_x2.to(torch.int64) * found_i,
+                ]
+            )
+        )
+
+        # The next step sees the load this one moved, so a second replica is planned
+        # against what the first left behind rather than against the original peak.
+        half = moved.index_select(0, offset.view(1)).squeeze(0) * found.to(owned.dtype)
+        owned[peak, offset] = owned[peak, offset] - half
+        extra[target] = extra[target] + half
+        spent[peak, offset] = spent[peak, offset] | found
+
+    plan = torch.stack(rows)
+    # Not-found rows sort last: their expert is 0, which would otherwise place them
+    # first and shift every real row's slot as soon as one placement is refused.
+    key = torch.where(plan[:, 0] > 0, plan[:, 1], torch.full_like(plan[:, 1], 1 << 40))
+    return plan.index_select(0, torch.argsort(key, stable=True))

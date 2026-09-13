@@ -34,8 +34,8 @@ import torch
 from vllm.distributed.eplb.device_publish import LayerResidency
 from vllm.distributed.eplb.device_transfer import DeviceExpertTransfer, WeightPointers
 from vllm.distributed.eplb.fused_placement import (
-    plan_and_charge_fused,
-    publish_plan_fused,
+    plan_replicas_fused,
+    publish_replicas_fused,
 )
 from vllm.distributed.eplb.predictive_planner import replica_row_of
 from vllm.logger import init_logger
@@ -132,6 +132,22 @@ class DevicePlacementCoordinator:
                 f"staging_stride must be one expert's bytes so consecutive layers can "
                 f"alternate staging buffers; got {staging_stride}."
             )
+        if slot != 0:
+            # Slot `i` owns replica column `i` and the drain derives its row as
+            # `first_replica_row + i`, so the coordinator's slots are 0..cap-1 by
+            # construction. A non-zero base would make the transfer and the publish
+            # disagree about which row a replica occupies, which is invisible: the
+            # weights are one row away from the map that points at them.
+            raise ValueError(
+                f"the device coordinator owns replica slots 0..{replica_slots_per_rank}"
+                f" exclusive and derives each from its plan row, so its base slot must "
+                f"be 0; got {slot}."
+            )
+        if replica_slots_per_rank < 1:
+            raise ValueError(
+                f"a layer needs at least one replica slot, got "
+                f"{replica_slots_per_rank}."
+            )
         if staging_buffers < 2:
             # One buffer is the shared workspace this alternation exists to avoid.
             raise ValueError(
@@ -161,7 +177,8 @@ class DevicePlacementCoordinator:
         # what was placed and reconstructing either by reading the plan would put the
         # synchronisation straight back.
         self._residency = [
-            LayerResidency.empty(device) for _ in range(max(num_layers, 1))
+            LayerResidency.empty_slots(device, replica_slots_per_rank)
+            for _ in range(max(num_layers, 1))
         ]
         self._budget = torch.tensor(budget, dtype=torch.int64, device=device)
         self._spent = torch.zeros((), dtype=torch.int64, device=device)
@@ -180,12 +197,9 @@ class DevicePlacementCoordinator:
         # whatever the forward allocated there, so `pe` is not a rank, and the put lands
         # NVSHMEM's proxy thread in a segfault — which is exactly the crash that kept
         # `device_issued_transfer` switched off.
-        self._transfer_plans = torch.zeros(
-            (max(num_layers, 1), 4), dtype=torch.int64, device=device
-        )
-        self._publish_plans = torch.zeros(
-            (max(num_layers, 1), 4), dtype=torch.int64, device=device
-        )
+        shape = (max(num_layers, 1), replica_slots_per_rank, 4)
+        self._transfer_plans = torch.zeros(shape, dtype=torch.int64, device=device)
+        self._publish_plans = torch.zeros(shape, dtype=torch.int64, device=device)
 
         # Evidence that the path did something, counted on the device and read rarely.
         # `analyse_e2e.py` and the bench runners treat an activation log line as the
@@ -319,7 +333,10 @@ class DevicePlacementCoordinator:
         # whatever the forward allocated in its place.
         transfer_plan = self._transfer_plans[target]
         publish_plan = self._publish_plans[target]
-        plan_and_charge_fused(
+        # The cap comes from the residency's own leading dimension, so the three
+        # tables cannot disagree about how many slots this layer has -- a disagreement
+        # would write one table's row into another's slot and show up in no aggregate.
+        plan_replicas_fused(
             predicted,
             self._residency[target].state,
             self._budget,
@@ -370,7 +387,10 @@ class DevicePlacementCoordinator:
                     self.replica_row,
                     self.stream or torch.cuda.current_stream(),
                     staging_offset=(target % self.staging_buffers)
+                    * self.replica_slots_per_rank
                     * self.staging_stride,
+                    num_slots=self.replica_slots_per_rank,
+                    staging_span=self.staging_stride,
                 )
             event = self._event_factory()
             event.record(self.stream)
@@ -419,7 +439,7 @@ class DevicePlacementCoordinator:
         # One kernel, where the tensor version measured 67 — the largest single piece of
         # the 132 launches a placed layer used to cost. `publish_plan_on_device` is
         # retained as the oracle it is tested against.
-        publish_plan_fused(
+        publish_replicas_fused(
             plan=plan,
             residency=self._residency[layer].state,
             logical_to_physical=maps.logical_to_physical,
@@ -429,13 +449,13 @@ class DevicePlacementCoordinator:
             per_rank_experts=self.canonical_per_rank,
             replica_slots_per_rank=self.replica_slots_per_rank,
             source_rank=self.ep_rank,
-            # The same slot the transfer wrote into. Omitting it published row
-            # `per_rank_experts + 0` while `drain_expert` wrote
-            # `replica_row_of(canonical_per_rank, slot)`, so at any slot but 0 routing
-            # would point at an unwritten row with the weights one row over, and nothing
-            # would raise. Unreachable while `replica_slots_per_rank` is validated to 1,
-            # which is exactly how a trap like this survives.
-            slot=self.slot,
+            # No slot argument: plan row `i` owns replica column `i`, and the drain
+            # derives the row it writes from the same rule. They were once passed
+            # separately, and omitting the argument published row `per_rank_experts + 0`
+            # while the transfer wrote `per_rank_experts + slot` -- routing pointing at
+            # an unwritten row with the weights one row over, raising nothing. Deriving
+            # both from the row index is what removes that trap rather than documenting
+            # it.
         )
         # The source-local count is all-ones invariantly — that *is* source-rank
         # routing: one copy on offer, so a rank's chunk cannot be split — so it is set

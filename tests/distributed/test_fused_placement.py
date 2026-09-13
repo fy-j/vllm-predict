@@ -71,7 +71,20 @@ def reference_plan_and_charge(
     spent += charged
     placed_total += charged
     transfer = torch.stack([charged, raw[1], raw[2], raw[3]])
-    publish = torch.stack([(keep | affordable).to(torch.int64), raw[1], raw[2], raw[3]])
+    # Ticket 15: an unaffordable layer that already holds a replica keeps it, so the
+    # publish row names the **resident** placement rather than the refused one. `found`
+    # gates it: with no admissible placement the layer reverts, which is the planner's
+    # judgement about load and not a budget accident.
+    hold = found & ~keep & ~affordable & (residency[0] >= 0)
+    zero = torch.zeros_like(raw[3])
+    publish = torch.stack(
+        [
+            (keep | affordable | hold).to(torch.int64),
+            torch.where(hold, residency[0], raw[1]),
+            torch.where(hold, residency[1], raw[2]),
+            torch.where(hold, zero, raw[3]),
+        ]
+    )
     return transfer, publish
 
 

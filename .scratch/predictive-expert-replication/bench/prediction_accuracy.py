@@ -92,6 +92,26 @@ def peak_expert_hit(predicted: Sequence[float], actual: Sequence[float]) -> bool
     return top_k_experts(predicted, 1) == top_k_experts(actual, 1)
 
 
+def _flatten_predicted(predicted, record):
+    """Accept a window row, refuse a whole window.
+
+    Ticket 13 gave the snapshot a window dimension and the recorder kept summing only
+    over ranks, so records written since carry `[size, num_logical]`. A single row
+    flattens and means what it always did. Several rows may **not** be summed: they
+    belong to different target layers, and adding them is the distribution that took
+    ticket 12's design from 26.8% of excess removed to 3.7%.
+    """
+    if not predicted or not isinstance(predicted[0], list):
+        return predicted
+    if len(predicted) == 1:
+        return predicted[0]
+    raise ValueError(
+        f"record for source {record.get('source')} -> target {record.get('target')} "
+        f"carries {len(predicted)} window rows. They belong to different target layers "
+        f"and cannot be summed; re-dump with one row per pair."
+    )
+
+
 def aggregate(records: Sequence[dict], ks: Sequence[int] = (1, 2, 4, 8)) -> dict:
     """Score every record and reduce to overall and per-target-layer figures.
 
@@ -111,7 +131,7 @@ def aggregate(records: Sequence[dict], ks: Sequence[int] = (1, 2, 4, 8)) -> dict
         if float(sum(actual)) <= 0.0:
             skipped += 1
             continue
-        predicted = record["predicted"]
+        predicted = _flatten_predicted(record["predicted"], record)
         if float(sum(predicted)) <= 0.0:
             # Symmetric with the actual-side skip, and for the same reason. An
             # all-zero prediction normalizes to zeros, `top_k_experts` then falls

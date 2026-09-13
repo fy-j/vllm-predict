@@ -158,7 +158,6 @@ def test_predictive_replication_cannot_be_combined_with_dbo(tmp_path):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("replica_slots_per_rank", 2),
         ("hot_stable_steps", 3),
         ("min_residency_steps", 8),
     ],
@@ -168,6 +167,31 @@ def test_predictive_replication_rejects_unimplemented_policy_values(
 ):
     with pytest.raises(ValueError, match=field):
         _build(tmp_path, **{field: value})
+
+
+@pytest.mark.parametrize("slots", [1, 2, 4, 8])
+def test_more_than_one_replica_slot_is_accepted_on_the_device_path(tmp_path, slots):
+    """The replica count is the one knob that buys benefit without touching prediction.
+
+    Replayed offline against real dumps, critical-path excess removed goes 32.2% at one
+    slot to 70.2% at eight, while prediction's cost -- the half that makes this feature
+    negative -- does not move with it.
+    """
+    config = _build(tmp_path, replica_slots_per_rank=slots)
+
+    predictive = config.parallel_config.predictive_expert_replication_config
+    assert predictive.replica_slots_per_rank == slots
+
+
+def test_more_than_one_replica_slot_needs_the_device_path(tmp_path):
+    """The host planner places one replica per layer and would drop the rest.
+
+    Silently: every activation count, dump and log line would still look like a working
+    multi-replica arm, which is the shape of five defects this branch has already paid
+    for.
+    """
+    with pytest.raises(ValueError, match="device_issued_transfer"):
+        _build(tmp_path, replica_slots_per_rank=2, device_issued_transfer=False)
 
 
 # --------------------------------------------------------------------------

@@ -693,3 +693,91 @@ class TestTheTransferBudgetChargesForTransfers:
         assert coordinator.plan_and_launch() == [], (
             "a second layer must be refused once the budget is spent"
         )
+
+
+class TestASpentBudgetDoesNotRevertAResidentReplica:
+    """Ticket 15, on the host path, which is the oracle the fused kernels are held to.
+
+    The device coordinator does this inside `_plan_and_charge_kernel`. Keeping the two
+    in step is the point: an oracle that disagrees with the code under test is worse
+    than no oracle, because every equality test then reads as a failure of whichever
+    was changed last.
+
+    The budget resets when a forward begins, and layers are visited in increasing order,
+    so the *first* layer of a forward never meets a spent budget. Only a later one does
+    -- which is why each test here drives whole forwards rather than assigning `_spent`.
+    A first draft did assign it, and the reset silently made every case the affordable
+    one.
+    """
+
+    def _shifted(self, num_logical=16):
+        """A load whose *second* expert dominates, so it wants a different replica."""
+        load = torch.ones(num_logical)
+        load[1] = 40.0
+        return load
+
+    def _forward(self, coordinator, loads):
+        """One whole forward: sources 0 and 1, then both targets activated."""
+        coordinator.note_forward_token_load(tokens_per_expert=4096.0)
+        plans = []
+        for source, load in enumerate(loads):
+            coordinator.record_prediction(source_layer=source, predicted=load)
+            plans.append(coordinator.plan_and_launch())
+        for target in (2, 3):
+            coordinator.activate_and_publish(layer=target)
+        return plans
+
+    def _warmed(self):
+        """Both layers resident, reached by the ratchet a budget of 1 allows.
+
+        Forward 1 can only afford layer 2; forward 2 finds layer 2 resident, charges
+        nothing for it, and spends its unit on layer 3. That ratchet is the property the
+        charge-for-what-moves rule buys, and this fix must not cost it.
+        """
+        coordinator = _coordinator(budget=1, layers=8, lookahead=2)
+        self._forward(coordinator, [_skewed(), _skewed()])
+        self._forward(coordinator, [_skewed(), _skewed()])
+        assert coordinator._active.get(2) and coordinator._active.get(3), (
+            f"coverage did not ratchet to both layers: {coordinator._active}"
+        )
+        return coordinator
+
+    def test_the_layer_keeps_what_it_holds_when_it_cannot_afford_a_change(self):
+        coordinator = self._warmed()
+        resident = set(coordinator._active[3])
+
+        # Traffic moves. Layer 2 plans first and spends the unit; layer 3 wants a
+        # different replica too and cannot pay for it.
+        plans = self._forward(coordinator, [self._shifted(), self._shifted()])
+
+        assert coordinator._active[3] == resident, (
+            f"layer 3 lost its replica because a different one was unaffordable: "
+            f"{coordinator._active[3]} was {resident}"
+        )
+        assert plans[1], (
+            "the unaffordable layer must still describe the replica it holds"
+        )
+
+    def test_a_layer_holding_nothing_still_places_nothing(self):
+        """The fix must not invent a replica for a layer that never had one."""
+        coordinator = _coordinator(budget=1, layers=8, lookahead=2)
+
+        # First forward: layer 2 spends the unit, layer 3 has nothing and cannot pay.
+        plans = self._forward(coordinator, [_skewed(), _skewed()])
+
+        assert plans[0], "the first layer must place"
+        assert plans[1] == [], "the second must place nothing, not something arbitrary"
+
+    def test_holding_a_replica_charges_nothing_and_moves_no_bytes(self):
+        """Keeping is free: reverting never touches weights, so the row still holds."""
+        coordinator = self._warmed()
+        moved_before = coordinator.communicator.executed
+
+        self._forward(coordinator, [self._shifted(), self._shifted()])
+
+        assert coordinator._spent == 1, (
+            f"holding charged budget: {coordinator._spent} spent against a budget of 1"
+        )
+        assert coordinator.communicator.executed == moved_before + 1, (
+            "holding must move no bytes; only the one affordable layer transfers"
+        )

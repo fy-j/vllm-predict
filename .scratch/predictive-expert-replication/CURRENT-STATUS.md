@@ -20,19 +20,36 @@ Implement only the vLLM CUDA tickets in `issues/00` through `issues/09`.  Do not
 
 - Branch: `feature/predictive-expert-replication`
 - Original vLLM base: `10704541aaf72567fe9d6229b3e3d84d37f2ddba`
-- Tickets `01` `03` `04` `05` `06` `07` are **done**; `02` is 3 of 5, with the byte bound
-  (`max_concurrent_transfer_bytes`) still declared and never read. `08` is
-  ready-for-agent and is the ticket that decides the project; `09` is ready-for-agent,
-  terminal and off the mainline; `10` waits on `08`. `00` answered for both regimes.
-  (This line previously mixed the superseded `00`-`14` numbering into the current
-  `01`-`10` set, and said `07` was unstarted while it was done.)
+- Tickets `01` `03` `04` `05` `06` `07` `13` `14` `15` `18` `19` are **done or closed**;
+  `02` is 3 of 5, with the byte bound (`max_concurrent_transfer_bytes`) still declared and
+  never read. `08` was **unblocked on 2026-09-08** — the curve it was waiting for exists —
+  and is the ticket that decides the project; `09` is ready-for-agent, terminal and off the
+  mainline; `10` waits on `08`. `00` answered for both regimes. (This line previously mixed
+  the superseded `00`-`14` numbering into the current set, and said `07` was unstarted while
+  it was done.)
 - The feature runs end to end and is **correct**: replicas are transferred, published
-  where routing reads, routed to, and reverted. It removes about **15% of prefill
-  critical-path excess** against an oracle of 35%.
-- It is **net negative on this node**: mean TTFT +13% to +29% across four
-  configurations, TPOT +7%.
-- **The cost is host synchronisation, not the transfers.** See the section below
-  before touching anything.
+  where routing reads, routed to, and reverted. It removes **26%** of prefill
+  critical-path excess at one replica slot and **38%** at two, stable across every
+  prompt length measured.
+- **The sign depends on the regime, and a bare verdict is not one.** Against a stock
+  server, six interleaved passes, paired (2026-09-08):
+
+  ```text
+  1k  / c16 / ko     unreadable        2k  / c16 / ko    +2.29%  0/6 (worse)
+  8k  / c16 / ko     -2.50%  6/6       8k  / c8  / ko    -3.36%  6/6
+  16k / c8  / ko     -4.67%  6/6       16k / c8  / cap2  -6.17%  6/6  <- best measured
+  8k  / c4  / ko     +0.67%  1/6       8k  / c16 / gov   +1.12%  3/6  <- real documents
+  ```
+
+  Three things move it: tokens per forward, queueing share (concurrency), and the domain.
+  **`ko` is 161 concatenated instructions per prompt and concatenation inflates expert
+  stability** (93.3% against `gov`'s 72.4% at 8k), so the 8k result does not transfer to
+  real long documents — `gov` needs 16k to turn, and turns to -2.70%.
+- The old headline here, "net negative on this node: mean TTFT +13% to +29%", was a
+  ~877-tokens-per-forward measurement and is **superseded**, not contradicted.
+- **The cost is host synchronisation, not the transfers**, and at long prompts it
+  amortises: prediction alone costs +13.5% at 1k and **+0.24%** at 8k. See the section
+  below before touching anything.
 
 ## Ticket 13, 2026-08-31: batching the snapshot works, but only from different sources
 

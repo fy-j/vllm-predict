@@ -90,11 +90,49 @@ PYEOF
 # with code, so the intuition that a narrow vocabulary skews more did not hold.
 # `results/domain-search/ranking.txt` carries the table.
 DOMAIN="${DOMAIN:-code}"
-PROMPTS="$HERE/results/prompts-$DOMAIN-p1024.jsonl"
+# Prompt length is a variable now, not a constant in a filename. The feature's cost is
+# per **forward** -- 44 barriers and 44 launches, none of which scale with tokens -- and
+# its benefit is per token, so the tokens a forward carries is a lever on the ratio and
+# nothing had ever moved it. `MAX_BATCHED_TOKENS` is the one that actually does: without
+# it chunked prefill cuts an 8k prompt back into ~1k forwards and the experiment
+# measures nothing but a longer queue.
+PROMPT_LEN="${PROMPT_LEN:-1024}"
+PROMPTS="$HERE/results/prompts-$DOMAIN-p$PROMPT_LEN.jsonl"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-3072}"
+MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
+BATCHED_ARGS=()
+[[ -n "$MAX_BATCHED_TOKENS" ]] && BATCHED_ARGS=(--max-num-batched-tokens "$MAX_BATCHED_TOKENS")
 [[ -s "$PROMPTS" ]] || { echo "[e2e] missing $PROMPTS" >&2; exit 1; }
 echo "[e2e] domain=$DOMAIN"
 
 for repeat in $(seq 1 "$REPEATS"); do
+# The arm label, from the arm string alone. Sets `label`. Two copies of this drifted
+# twice -- the repeat suffix, then the transport and group infixes -- and each time the
+# guard failed a run that was fine. One copy is the fix; the run loop and the guard both
+# call it, so a new field cannot be added to one and forgotten in the other.
+arm_label() {
+  local a="$1" b r g
+  b="${a%%:*}"
+  r="${a#*:}"
+  label="$b"
+  [[ "$a" == *:* ]] && label="${b}-${r%%:*}"
+  if [[ "$r" == *:* ]]; then
+    g="${r#*:}"
+    case "$g" in
+      *:probe)  label="${label}-g${g%%:*}-probe" ;;
+      *:nofuse) label="${label}-g${g%%:*}-nofuse" ;;
+      *:c[0-9]*) label="${label}-g${g%%:*}-c${g#*:c}" ;;
+      *:noag)   label="${label}-g${g%%:*}-noag" ;;
+      *:*)
+        echo "[e2e] ABORT: arm '$a' has unknown suffix ':${g#*:}'" >&2
+        return 2
+        ;;
+      *)        label="${label}-g${g}" ;;
+    esac
+  fi
+}
+
 for arm in $BUDGETS; do
   budget="${arm%%:*}"
   rest="${arm#*:}"
@@ -104,6 +142,8 @@ for arm in $BUDGETS; do
   arm_group="${PRED_GROUP:-0}"
   arm_probe=0
   arm_fuse=1
+  arm_slots=1
+  arm_noag=0
   if [[ "$rest" == *:* ]]; then
     arm_group="${rest#*:}"
     # A trailing `:probe` asks for ticket 14's upper bound: no snapshot collective at
@@ -114,14 +154,20 @@ for arm in $BUDGETS; do
     # another's name, so an unrecognised suffix aborts rather than being ignored.
     #   `:probe`  ticket 14's zero-collective substitute
     #   `:nofuse` ticket 18's reference prediction path
+    #   `:cN`     ticket 19's replica slots per rank, so N replicas per layer
     case "$arm_group" in
       *:*)
         case "${arm_group#*:}" in
           probe)  arm_probe=1 ;;
           nofuse) arm_fuse=0 ;;
+          c[1-9]|c[1-9][0-9]) arm_slots="${arm_group#*:c}" ;;
+          # Ticket 14's isolation: prediction's compute without its 44 barriers. Produces a
+          # per-rank snapshot, so the ranks' plans would diverge and a put would pair with a
+          # peer expecting nothing -- it is only sound at budget 0, which the runner asserts.
+          noag)   arm_noag=1 ;;
           *)
             echo "[e2e] ABORT: arm '$arm' has unknown suffix ':${arm_group#*:}'" >&2
-            echo "[e2e] expected one of: probe, nofuse" >&2
+            echo "[e2e] expected one of: probe, nofuse, cN, noag" >&2
             exit 2
             ;;
         esac
@@ -129,11 +175,12 @@ for arm in $BUDGETS; do
         ;;
     esac
   fi
-  label="$budget"
-  [[ "$arm" == *:* ]] && label="${budget}-${transport}"
-  [[ "$rest" == *:* ]] && label="${label}-g${arm_group}"
-  [[ "$arm_probe" == 1 ]] && label="${label}-probe"
-  [[ "$arm_fuse" == 0 ]] && label="${label}-nofuse"
+  if [[ "$arm_noag" == 1 && "$budget" != "0" ]]; then
+    echo "[e2e] ABORT: arm '$arm' skips the snapshot AllGather at budget $budget. That probe" >&2
+    echo "[e2e] leaves each rank a different snapshot, so placement must be withheld." >&2
+    exit 2
+  fi
+  arm_label "$arm" || exit 2
   # The tag carries the repeat only when there is more than one, so a single-pass run keeps
   # the filenames every existing reader and every recorded result already expects.
   if [[ "$REPEATS" -gt 1 ]]; then tag="b${label}-r${repeat}"; else tag="b$label"; fi
@@ -166,6 +213,7 @@ cfg={'enabled': True, 'cost_profile_path': sys.argv[1],
      'device_issued_transfer': sys.argv[3] == 'device'}
 if int(sys.argv[2]) > 0:
     cfg['max_transfers_per_forward'] = int(sys.argv[2])
+cfg['replica_slots_per_rank'] = int(sys.argv[5])
 if int(sys.argv[4]) > 0:
     group = int(sys.argv[4])
     cfg['prediction_target_group'] = group
@@ -173,7 +221,7 @@ if int(sys.argv[4]) > 0:
     # the window. Equality is the cheapest choice: a longer distance only costs accuracy.
     cfg['prediction_lookahead_layers'] = group
 print(json.dumps({'predictive_expert_replication': cfg}))" \
-      "$PROFILE" "$budget" "$transport" "$arm_group")
+      "$PROFILE" "$budget" "$transport" "$arm_group" "$arm_slots")
     FEATURE_ARGS=(
       --additional-config "$ADDITIONAL"
       --eplb-config '{"log_balancedness":true,"log_balancedness_interval":1,"step_interval":1000000000,"window_size":1000,"use_async":false}'
@@ -189,6 +237,7 @@ print(json.dumps({'predictive_expert_replication': cfg}))" \
       # still producing the line every reader here looks for.
       "VLLM_PREDICTIVE_PLACEMENT_REPORT_EVERY=10"
       "VLLM_PREDICTIVE_DETERMINISTIC_SNAPSHOT=$arm_probe"
+      "VLLM_PREDICTIVE_SKIP_SNAPSHOT_ALLGATHER=$arm_noag"
       "VLLM_PREDICTIVE_FUSED_PREDICT=$arm_fuse"
     )
   fi
@@ -198,8 +247,9 @@ print(json.dumps({'predictive_expert_replication': cfg}))" \
     --model "$MODEL" --port "$PORT" \
     --data-parallel-size "$DP" --enable-expert-parallel \
     --all2all-backend allgather_reducescatter --enforce-eager \
-    --max-model-len 3072 --gpu-memory-utilization 0.88 \
-    --max-num-seqs 64 --seed 0 --uvicorn-log-level warning \
+    --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization 0.88 \
+    --max-num-seqs "$MAX_NUM_SEQS" --seed 0 --uvicorn-log-level warning \
+    "${BATCHED_ARGS[@]}" \
     "${FEATURE_ARGS[@]}" \
     >"$LOG" 2>&1 &
   PID=$!
@@ -295,21 +345,7 @@ for repeat in $(seq 1 "$REPEATS"); do
     # The same construction the run loop uses. It was `${label}-${arm#*:}`, which turns
     # `43:device:4` into `43-device:4` and sends the guard looking for files that do not
     # exist — a guard that cries wolf on a healthy run is a guard that gets deleted.
-    label="${arm%%:*}"
-    rest="${arm#*:}"
-    if [[ "$arm" == *:* ]]; then label="${label}-${rest%%:*}"; fi
-    if [[ "$rest" == *:* ]]; then
-      g="${rest#*:}"
-      case "$g" in
-        *:probe)  label="${label}-g${g%%:*}-probe" ;;
-        *:nofuse) label="${label}-g${g%%:*}-nofuse" ;;
-        *:*)
-          echo "[e2e] ABORT: arm '$arm' has unknown suffix ':${g#*:}'" >&2
-          exit 2
-          ;;
-        *)        label="${label}-g${g}" ;;
-      esac
-    fi
+    arm_label "$arm" || exit 2
     if [[ "$REPEATS" -gt 1 ]]; then guard_arms+=("${label}-r${repeat}"); else guard_arms+=("$label"); fi
   done
 done

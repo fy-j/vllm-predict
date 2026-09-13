@@ -278,7 +278,7 @@ class PlacementCoordinator:
             return []
         remaining = self.budget - self._spent
         if remaining <= 0:
-            return []
+            return self._keep_what_is_resident(target)
         # One layer's row, because that is all that exists yet: when this layer plans
         # for `target`, no later layer's prediction has been computed. So the
         # cross-layer ranking `plan_replicas` implements never has a second candidate
@@ -417,6 +417,49 @@ class PlacementCoordinator:
         if self.stream is None:
             return contextlib.nullcontext()
         return torch.cuda.stream(self.stream)
+
+    def _keep_what_is_resident(self, target: int) -> list[Placement]:
+        """This layer's current replicas, as the plan to publish when nothing is left.
+
+        Ticket 15. Returning `[]` here made `activate_and_publish` publish an empty
+        desired set, and an empty set reverts: a layer that already held a perfectly
+        good replica lost it because a *different* one had become unaffordable. Its
+        weights are still in the row -- reverting never touches weights -- so keeping it
+        costs nothing and charges nothing, while clearing it costs the whole benefit of
+        that layer until the budget ratchets back around.
+
+        At the default `max_transfers_per_forward` of 4 over 44 reachable layers that is
+        not an edge case: one traffic shift re-placed 4 layers and reverted 40.
+
+        The device coordinator does the same thing inside `_plan_and_charge_kernel`, and
+        this path is retained as its oracle -- an oracle that disagrees is worse than
+        none.
+        """
+        active = self._active.get(target)
+        if not active:
+            return []
+        # `moved_load` is 0 because nothing moves: this placement is already installed
+        # and the value only ever described a transfer's expected shed.
+        placements = [
+            Placement(
+                layer,
+                logical_expert,
+                logical_expert // self.canonical_per_rank,
+                target_rank,
+                0.0,
+            )
+            for layer, logical_expert, target_rank in sorted(active)
+        ]
+        # Registered as pending, not merely returned: `activate_and_publish` publishes
+        # whatever `activate` pops, and an unregistered layer pops nothing and publishes
+        # the empty set -- which is the revert this method exists to prevent. The event
+        # is recorded here and waited on there; there is no transfer behind it, so the
+        # wait is free and the shape stays identical to the affordable path rather than
+        # becoming a second one.
+        event = self._event_factory()
+        event.record(self.stream)
+        self._pending[target] = (placements, event)
+        return placements
 
     def pending_activation(self, layer: int) -> list[Placement] | None:
         """Placements waiting to be activated at `layer`, if any."""

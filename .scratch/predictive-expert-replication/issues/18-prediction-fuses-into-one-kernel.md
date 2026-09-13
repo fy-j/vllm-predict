@@ -119,7 +119,7 @@ by the fact that they differed from the unfused ones, which is inference, not ev
 project's rule is that a green run is not a connected run; the log line is what makes the next
 run checkable.
 
-- [x] **The 220 us is attributed before any kernel is written, and the ticket stops here if
+* [x] **The 220 us is attributed before any kernel is written, and the ticket stops here if
       dispatch is not the majority.** 220 us over the roughly 7.1 launches ticket 03 left is
       31 us each, which is three times a plain eager dispatch, so something in the current
       figure is not pure launch overhead — queueing gaps, or an op that is not as cheap as
@@ -127,22 +127,22 @@ run checkable.
       the 220 us is kernel time and how much is gap. If kernel time dominates and it is the
       router's topk rather than dispatch, this design does not apply and a different one is
       needed: report that instead of building.
-- [x] One Triton kernel takes hidden states, the target gate's weight and whatever its router
+* [x] One Triton kernel takes hidden states, the target gate's weight and whatever its router
       needs, and writes the window's count row directly. Launches per source layer drop from
       about 7 to 1, counted in a profile rather than asserted.
-- [x] The kernel is asserted **bit-identical** to the existing gate-plus-router-plus-count
+* [x] The kernel is asserted **bit-identical** to the existing gate-plus-router-plus-count
       path on real weights, which is retained as the oracle — the same discipline the two
       `fused_placement.py` kernels are held to. A mismatch in *selection* silently plans the
       wrong expert and is invisible in every aggregate.
-- [x] Router variants are handled by covering what the kernel implements and **falling back**
+* [x] Router variants are handled by covering what the kernel implements and **falling back**
       to the reference path otherwise, never by silently predicting from a different rule
       than the target layer will use. The fallback is chosen on a static property identical
       on every rank, never on per-rank state.
-- [x] Padding rows are excluded exactly as the current path excludes them, asserted by a
+* [x] Padding rows are excluded exactly as the current path excludes them, asserted by a
       forward whose unpadded count is less than its token count. A padding row that reaches
       the count moves load that does not exist.
-- [x] Mean TTFT re-measured at DP=8 on the knee, three interleaved passes, against stock and
+* [x] Mean TTFT re-measured at DP=8 on the knee, three interleaved passes, against stock and
       against prediction-only in the same run. The share of the 9.67 ms actually recovered is
       recorded, including if it is small.
-- [ ] `peak_hit_rate` and `count_error` are unchanged from the reference path, so that a
+* [ ] `peak_hit_rate` and `count_error` are unchanged from the reference path, so that a
       launch saving is not paid for with accuracy nobody checked.

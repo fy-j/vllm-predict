@@ -16,7 +16,18 @@ prediction is now the entire overhead, 13 removes about half of it and 09 prices
 so a verdict written before them measures a cost that is being removed. **17 — The spec says what
 was measured** should also land first, since this ticket quotes the spec's ceiling.
 
-**Status:** blocked. Do not write the verdict yet.
+**Status: unblocked 2026-09-08 — the curve this ticket was waiting for exists.** The amendment
+below required a curve over tokens per forward before a verdict could be written; `RESULTS.md`
+2026-09-08 now carries four prompt lengths, four concurrencies, five domains and the two
+replica-slot settings, all six interleaved passes and paired. What is still owed is the verdict
+itself: this ticket's job is now to write it against that curve, not to wait for more data.
+
+**Its amendment is also partly wrong and must not be copied forward.** "20.1% against 93.4% is
+what moves the sign" does not survive the 2k point: expert stability is already **88.5%** at 2k
+while the feature is **+2.29%, 0/6 faster** there. Stability is a precondition that saturates
+early; what decides the sign above it is amortisation, and concurrency and domain each move it
+independently. A verdict written on stability alone would be wrong in the same shape the
+single-number stop gate would have been.
 
 ## What changed under this ticket, 2026-08-30
 
@@ -69,3 +80,11 @@ funds it, so the criteria below are amended to require the split.
       policy.
 - [ ] Where the residual cost goes, attributed rather than inferred, with any remaining gap
       named as unexplained rather than absorbed.
+
+**Amendment 2026-09-07: the verdict must name a tokens-per-forward, or it is not a verdict.**
+The same code measures unreadable at ~877 tokens per forward and **-2.50% mean TTFT / +2.80%
+throughput** (6/6 paired, 95% CI excluding zero) at ~4200. A stop gate worded on a single TTFT
+number would have fired on the short-prompt regime and closed a feature that pays in the long
+one. Whatever this ticket concludes has to be a curve over tokens per forward, with expert
+stability reported beside each point -- 20.1% against 93.4% is what moves the sign. See
+`RESULTS.md` 2026-09-07.
